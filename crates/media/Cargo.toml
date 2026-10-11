@@ -1,0 +1,16 @@
+[package]
+name = "opencap-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+opencap-core.workspace = true
+opencap-policy.workspace = true
+opencap-platform.workspace = true
+ffmpeg-next = { version = "=9.0.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }

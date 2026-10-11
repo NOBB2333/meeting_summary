@@ -1,0 +1,16 @@
+[package]
+name = "opencap-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+opencap-core.workspace = true
+opencap-platform.workspace = true
+opencap-media.workspace = true
+opencap-policy.workspace = true
+ctrlc = "3.5"
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }

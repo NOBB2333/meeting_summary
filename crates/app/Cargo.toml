@@ -1,0 +1,23 @@
+[package]
+name = "opencap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+[features]
+ui-smoke = []
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+opencap-core.workspace = true
+opencap-platform.workspace = true
+opencap-media.workspace = true
+crossbeam-channel.workspace = true
+gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+raw-window-handle = "0.6"
+futures-timer = "3"
+image = { version = "0.25", default-features = false }
+
+[build-dependencies]
+embed-resource = "=3.0.12"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

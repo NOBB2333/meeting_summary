@@ -1,0 +1,5 @@
+[env]
+FFMPEG_DIR = { value = ".deps/ffmpeg/ffmpeg-9.0.2-full_build-shared", relative = true }
+
+[build]
+jobs = 4

@@ -1,0 +1,34 @@
+name: Windows
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned FFmpeg development libraries
+        shell: pwsh
+        run: ./scripts/setup.ps1
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Build
+        shell: pwsh
+        run: ./scripts/dev.ps1 build
+      - name: Release build with compiled GPUI shaders
+        shell: pwsh
+        run: ./scripts/dev.ps1 build -Release
+      - name: Verify executable-local runtime dependencies without developer PATH
+        shell: pwsh
+        run: |
+          ./scripts/test-runtime.ps1 -Directory target/debug -CliOnly
+          ./scripts/test-runtime.ps1 -Directory target/release -CliOnly
+      - name: Unit and software-codec integration tests
+        shell: pwsh
+        run: ./scripts/dev.ps1 test
+      - name: Lint
+        shell: pwsh
+        run: cargo clippy --workspace --all-targets -- -D warnings

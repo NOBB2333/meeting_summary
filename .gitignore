@@ -1,0 +1,7 @@
+/target/
+/.deps/
+/artifacts/
+/release/
+*.partial.mp4
+*.recording.json
+.DS_Store
