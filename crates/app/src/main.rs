@@ -47,9 +47,19 @@ struct Recorder {
     monitor: Option<opencap_platform::AudioMonitor>,
     monitor_peaks: (f32, f32),
 }
+#[cfg(target_os = "macos")]
+const UI_FONT: &str = "PingFang SC";
+#[cfg(not(target_os = "macos"))]
+const UI_FONT: &str = "Microsoft YaHei UI";
+#[cfg(target_os = "macos")]
+const MONO_FONT: &str = "Menlo";
+#[cfg(not(target_os = "macos"))]
+const MONO_FONT: &str = "Consolas";
 fn native_handle(window: &Window) -> isize {
     match HasWindowHandle::window_handle(window).map(|w| w.as_raw()) {
         Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+        #[cfg(target_os = "macos")]
+        Ok(RawWindowHandle::AppKit(h)) => h.ns_view.as_ptr() as isize,
         _ => 0,
     }
 }
@@ -395,6 +405,10 @@ impl Recorder {
                 }
             }
             if let Some(monitor) = &self.monitor {
+                if let Some(warning) = monitor.take_warning() {
+                    self.message = warning;
+                    needs_render = true;
+                }
                 let peaks = monitor.peaks();
                 if (peaks.0 - self.monitor_peaks.0).abs() > 0.004
                     || (peaks.1 - self.monitor_peaks.1).abs() > 0.004
@@ -480,7 +494,10 @@ impl Recorder {
     fn refresh_targets(&mut self) {
         self.close_targets();
         match opencap_platform::targets() {
-            Ok(targets) => self.targets = targets,
+            Ok(targets) => {
+                self.targets = targets;
+                self.message.clear();
+            }
             Err(e) => self.message = format!("无法刷新窗口：{e}"),
         }
         if self.mode == 1 {
@@ -702,7 +719,7 @@ impl Render for Recorder {
             .flex_shrink_0()
             .bg(rgb(BG))
             .text_color(rgb(0xeceef1))
-            .font_family("Microsoft YaHei UI")
+            .font_family(UI_FONT)
             .p_6()
             .flex()
             .flex_col()
@@ -825,7 +842,7 @@ impl Render for Recorder {
             .gap_2()
             .bg(rgb(BG))
             .text_color(rgb(0xeceef1))
-            .font_family("Microsoft YaHei UI")
+            .font_family(UI_FONT)
             .border_t_1()
             .border_color(rgb(0x303338))
             .child(
@@ -838,7 +855,7 @@ impl Render for Recorder {
                     .child(
                         div()
                             .text_2xl()
-                            .font_family("Consolas")
+                            .font_family(MONO_FONT)
                             .child(time_text(self.stats.duration_seconds)),
                     )
                     .child(label(format!(
@@ -907,13 +924,27 @@ impl Render for Recorder {
             .or_else(|| self.stats.warnings.last().cloned())
             .unwrap_or_else(|| self.message.clone());
         if !message.is_empty() {
-            controls = controls.child(
-                div()
-                    .text_xs()
-                    .truncate()
-                    .text_color(rgb(0xffb5a9))
-                    .child(message),
-            );
+            #[cfg(target_os = "macos")]
+            if message.contains("权限") || message.contains("ScreenCaptureKit") {
+                let microphone =
+                    message.contains("麦克风") && !message.contains("ScreenCaptureKit");
+                controls = controls.child(
+                    div().flex().gap_2()
+                        .child(button("privacy-settings", "打开权限设置", false).on_click(
+                            cx.listener(move |_, _, _, cx| {
+                                cx.open_url(if microphone {
+                                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                                } else {
+                                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                                });
+                            }),
+                        ))
+                        .child(button("refresh-permissions", "刷新录制目标", false).on_click(
+                            cx.listener(|this, _, _, cx| { this.refresh_targets(); cx.notify(); }),
+                        )),
+                );
+            }
+            controls = controls.child(div().text_xs().text_color(rgb(0xffb5a9)).child(message));
         }
         if !self.recoverables.is_empty() {
             root = root.child(
@@ -1012,7 +1043,11 @@ impl Recorder {
                 } else if matches!(target, CaptureTarget::Window(_)) && preview.is_none() {
                     "此窗口暂不提供预览"
                 } else if matches!(target, CaptureTarget::Window(_)) {
-                    "实时窗口预览"
+                    if cfg!(target_os = "macos") {
+                        "窗口快照 · 刷新窗口可更新"
+                    } else {
+                        "实时窗口预览"
+                    }
                 } else {
                     "整个显示器"
                 };
@@ -1439,6 +1474,9 @@ impl Recorder {
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.config.mic_denoise = !this.config.mic_denoise;
+                    if let Some(session) = &this.session {
+                        session.command(RecordingCommand::SetMicDenoise(this.config.mic_denoise));
+                    }
                     this.monitor = None;
                     this.save();
                     cx.notify();
@@ -1744,7 +1782,7 @@ impl Render for Floating {
             .p_3()
             .bg(rgb(BG))
             .text_color(rgb(0xffffff))
-            .font_family("Microsoft YaHei UI")
+            .font_family(UI_FONT)
             .flex()
             .gap_2()
             .items_center()
@@ -1754,7 +1792,7 @@ impl Render for Floating {
                     .id("move-controls")
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-                    .font_family("Consolas")
+                    .font_family(MONO_FONT)
                     .child(time_text(stats.duration_seconds)),
             )
             .child(
@@ -1824,7 +1862,32 @@ impl Render for Floating {
     }
 }
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    struct StderrLogger;
+    impl log::Log for StderrLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                eprintln!("{}: {}", record.level(), record.args());
+            }
+        }
+        fn flush(&self) {}
+    }
+    static LOGGER: StderrLogger = StderrLogger;
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Warn);
+    let application = Application::new();
+    #[cfg(target_os = "macos")]
+    let reopen_view = Rc::new(std::cell::Cell::new(0isize));
+    #[cfg(target_os = "macos")]
+    {
+        let view = reopen_view.clone();
+        application.on_reopen(move |_| {
+            opencap_platform::show_native_window(view.get(), true);
+        });
+    }
+    application.run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(960.), px(850.)), cx);
         let main = cx
             .open_window(
@@ -1842,6 +1905,8 @@ fn main() {
             )
             .expect("Create recorder window");
         let entity = main.update(cx, |_, _, cx| cx.entity()).unwrap();
+        #[cfg(target_os = "macos")]
+        reopen_view.set(entity.read(cx).hwnd);
         let weak = entity.downgrade();
         let floating = cx
             .open_window(
@@ -1876,9 +1941,12 @@ fn main() {
             // Dispatch outside the App borrow: SetWindowPos synchronously invokes
             // GPUI's resize callback, which must be able to update its window bounds.
             let (toolbar, owner) = (r.floating_hwnd, r.hwnd);
+            #[cfg(windows)]
             std::thread::spawn(move || {
                 let _ = opencap_platform::configure_floating_controls(toolbar, owner);
             });
+            #[cfg(target_os = "macos")]
+            let _ = opencap_platform::configure_floating_controls(toolbar, owner);
             opencap_platform::show_native_window(r.hwnd, true);
         });
         cx.activate(true);

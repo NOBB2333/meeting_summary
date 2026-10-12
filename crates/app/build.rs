@@ -5,16 +5,30 @@
 //! Replace `resources/opencap-idle.jpg` or `resources/opencap-recording.jpg` and rebuild;
 //! there is no `.ico` to keep in sync.
 
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
 /// Size ladder handed to Windows. It covers the tray at 100-250% scaling plus the
 /// window and taskbar icons, so the shell never has to scale a mismatched frame.
+#[cfg(windows)]
 const SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 128];
 /// Frames at or above this size are stored as PNG to keep the resource small.
+#[cfg(windows)]
 const PNG_FROM: u32 = 128;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    if let Ok(dir) = std::env::var("DEP_OPENCAP_NATIVE_LIB_DIR") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
+        let plist = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("resources/Info.plist");
+        println!("cargo:rerun-if-changed={}", plist.display());
+        println!(
+            "cargo:rustc-link-arg=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+            plist.display()
+        );
+    }
     #[cfg(windows)]
     {
         let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());

@@ -1,0 +1,30 @@
+name: macOS
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Native prerequisites
+        run: |
+          brew install ffmpeg pkgconf
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          scripts/setup.sh
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Unit and software-codec integration tests
+        run: scripts/dev.sh test
+      - name: Lint
+        run: scripts/dev.sh lint -- -D warnings
+      - name: Release build and dependency bundle
+        run: |
+          scripts/dev.sh build --release
+          scripts/package.sh
+          codesign --verify --deep --strict release/OpenCap.app

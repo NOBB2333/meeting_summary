@@ -12,6 +12,10 @@ pub use indicator::*;
 pub use preview::*;
 pub use region::*;
 pub use shell::*;
+pub const CAPTURE_PATH: &str = "WGC D3D11 -> CPU BGRA -> FFmpeg";
+pub fn capture_window_id(hwnd: isize) -> isize {
+    hwnd
+}
 
 /// QPC and WGC/WASAPI timestamps use the same monotonic Windows clock.
 pub fn qpc_us() -> i64 {

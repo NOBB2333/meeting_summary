@@ -1,6 +1,6 @@
 # OpenCap
 
-Windows 本地开源录屏工具。Rust + GPUI + Windows Graphics Capture + WASAPI + FFmpeg，完全本地运行，无账号、无云服务、无遥测、无 AI。
+Windows / macOS 本地开源录屏工具。Rust + GPUI + FFmpeg；Windows 使用 Windows Graphics Capture / WASAPI，macOS 使用 ScreenCaptureKit / CoreAudio / VideoToolbox。完全本地运行，无账号、无云服务、无遥测。
 
 目标不是做第二个 OBS，而是一个**点一下就能录**的轻量工具：全屏 / 窗口 / 区域录制，系统声音和麦克风，暂停继续，托盘和全局快捷键，输出 MP4（可选同名 M4A）。针对 PPT、文档、浏览器、IDE 这类桌面内容做了低码率优化，同时支持录制游戏和视频等高动态画面。
 
@@ -16,6 +16,10 @@ FFmpeg 的 DLL 已经放在 `opencap.exe` 旁边，不需要另外安装 FFmpeg�
 
 要求：Windows 11 x64（Windows 10 较新版本也可）。
 
+**macOS**：直接打开 `release/OpenCap.app`，FFmpeg 动态库已放在应用包内，无需安装虚拟声卡。源码后端支持 macOS 13+，应用包的最低版本同时取决于捆绑库；本机 Homebrew 库要求 macOS 26，当前本机包因此要求 macOS 26+。首次使用在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」允许 OpenCap；录制麦克风还需要独立的麦克风权限。macOS 的默认输出位置是 `~/Movies/OpenCap`。
+
+**设置已允许但仍无法获取目标**：开发包使用临时签名，重新构建后系统可能仍保留旧签名的授权。先退出应用，在录屏权限列表移除旧 OpenCap，再添加**当前的** `OpenCap.app` 并重新打开。只关掉再打开权限开关可能无法修复旧签名。应用会显示 ScreenCaptureKit 的实际错误，并提供「打开权限设置」「刷新录制目标」。使用固定 Apple Development / Developer ID 签名可避免每次构建改变授权身份，见下面的 macOS 构建说明。
+
 第一次使用建议：
 
 - 在“设置”里确认录制范围边框选的是「开始显示 3 秒」或「关闭」。
@@ -28,7 +32,7 @@ FFmpeg 的 DLL 已经放在 `opencap.exe` 旁边，不需要另外安装 FFmpeg�
 ### 录制目标
 
 - **全屏**：录制选定显示器的全部画面。
-- **窗口**：列表里显示每个窗口的真实缩略图，可展开/收起，列数随窗口宽度自适应。选中后只录这个窗口，窗口移动、缩放都会跟随；窗口最小化时保留最后画面并给出提示。
+- **窗口**：列表可展开/收起，列数随窗口宽度自适应。Windows 使用实时缩略图；macOS 14+ 使用窗口快照，刷新列表可更新；macOS 13 使用窗口名称。选中后只录这个窗口，窗口移动、缩放都会跟随；不可见时保留最后画面。
 - **区域**：进入后拖动框选，**松开鼠标即可继续调整**，不需要按 Enter：
 
   - 拖动选框内部：移动位置
@@ -60,7 +64,7 @@ OpenCap_2026-10-09_12-44-26.recording.json
 
 ### 托盘
 
-托盘图标是两张卡通图：**未录制是绿色，录制中是橙红色**。鼠标悬停提示始终只显示 `OpenCap`，不会暴露当前是否在录制。
+Windows 托盘图标是两张卡通图：**未录制是绿色，录制中是橙红色**。macOS 使用菜单栏录制图标，颜色随状态改变。鼠标悬停提示只显示 `OpenCap`。
 
 ---
 
@@ -70,14 +74,14 @@ OpenCap_2026-10-09_12-44-26.recording.json
 
 - 两路可以独立开关，**录制中和暂停中都能随时改**，也能换设备，切换时只有改动的那一路会短暂静音。
 - 界面录制始终预留一条 AAC 音轨，所以两路都关着开始录，中途再打开也不影响文件结构。
-- 使用「系统默认设备」时，在开启该路的瞬间解析当前默认设备；换了 Windows 默认输出后，关闭再开启该路即可切换。
+- 使用「系统默认设备」时，在开启该路的瞬间解析当前默认设备；换了 Windows 默认输出后，关闭再开启该路即可切换。macOS 系统声音由 ScreenCaptureKit 采集所有输出设备的声音，麦克风可单独选择。
 
 ### 麦克风降噪
 
 设置里的「麦克风降噪」（默认开启）是一条实时人声链：
 
 - 100 Hz 高通：去掉直流偏移、低频轰鸣和桌面震动
-- 512 点 STFT 频域降噪：按频段学习环境噪声底，再用 Wiener 增益压掉宽带嘶嘶声（风扇、键盘、室内底噪），稳态噪声实测可下降约 12–20 dB，同时保留人声共振峰
+- 512 点 STFT 频域降噪：按频段学习环境噪声底，再用 Wiener 增益压掉宽带嘶嘶声；合成稳态噪声测试下降超过 12 dB，实际效果随环境和设备变化
 - 滑动最小包络噪声门：安静时把残余底噪再压低约 24 dB，说话时立即打开；不会硬切静音，轻声说话不会被切掉
 - 3:1 压缩 + 3 dB 补偿：把人声抬起来，接近会议软件的听感
 - 慢速 AGC（约 2 秒释放 / 100 毫秒压制）：把偏小的麦克风人声拉到稳定电平，同时不会把安静时的环境噪声抽上来
@@ -89,6 +93,8 @@ OpenCap_2026-10-09_12-44-26.recording.json
 2. 在 Windows「声音设置 → 输入设备 → 属性 → 高级」里关闭该麦克风的音频增强，或在「设备属性 → 附加设备属性 → 增强」里禁用全部音效，再重新录一段对比。
 
 不想做降噪时可以在设置里关掉，关掉后写入的是麦克风原始采样。降噪同时用于录制和空闲时的「电平检测」，所以电平条显示的就是实际会写入的声音。
+
+音频按采样数维护连续时间轴，抵消回调时间抖动；暂停继续后重建采集起点。降噪延迟约 10.7 ms，会在暂停和停止时补齐尾部。队列暂时积压时发出告警并继续采集，避免一次拥塞导致后续声音全部丢失。系统声保持原始采样，不经过麦克风降噪。
 
 ### 系统声音录不到时
 
@@ -219,12 +225,26 @@ release/OpenCap-windows-x64.zip     可直接发给别人的压缩包
 
 ## 八、macOS / Linux
 
-当前只交付 Windows 后端。代码按平台分目录（`crates/platform/windows_impl/`），新平台加同级实现即可，上层 `capture` / `audio` / `encoder` 抽象不变。`scripts/setup.sh` 和 `scripts/dev.sh` 是给 POSIX 环境准备的构建入口：
+macOS 后端已实现显示器 / 窗口 / 物理像素区域采集、系统声音、麦克风及设备切换、区域编辑、菜单栏控制、范围提示和 VideoToolbox 编码。采集和系统交互使用一个薄的 Swift C ABI 桥接层，录制状态、时间轴、降噪、混音、编码和文件保存都在 Rust 中。无需 Python 或虚拟音频驱动。
 
-- macOS：ScreenCaptureKit + CoreAudio + VideoToolbox，FFmpeg 用 `.dylib`
-- Linux：PipeWire + VAAPI，FFmpeg 用 `.so`
+构建要求：macOS 13+、Rust、完整 Xcode（含 Metal 编译器）、Homebrew FFmpeg 开发库和 pkgconf：
 
-在补齐平台后端之前，`opencap-platform` 在非 Windows 上会直接编译报错，避免误以为已经支持。
+```bash
+brew install ffmpeg pkgconf
+# 若 xcrun 找不到 metal：
+xcodebuild -downloadComponent MetalToolchain
+scripts/setup.sh
+scripts/dev.sh test
+scripts/dev.sh build --release
+scripts/package.sh
+open release/OpenCap.app
+```
+
+`package.sh` 默认打包 release，递归捆绑 FFmpeg 和其依赖 `.dylib`，重写加载路径并检查签名。`--profile debug` 可打包调试版。默认临时签名供本机评审；有签名证书时使用 `scripts/package.sh --identity "Apple Development: ..."` 或环境变量 `OPENCAP_SIGNING_IDENTITY`。持续使用同一签名身份可以保留跨版本权限。本机打包不会发布或上传，也没有执行 notarization；公开分发还需准备对应源码和第三方许可证（见 `THIRD_PARTY.md`）。
+
+命令行 `target/release/opencap-bench` 支持同样的探测和录制命令。裸命令行进程的系统授权可能与应用包不同，实机操作优先使用 `OpenCap.app`。
+
+Linux / PipeWire 后端尚未实现，当前仍会显式编译失败。
 
 ---
 
@@ -232,10 +252,10 @@ release/OpenCap-windows-x64.zip     可直接发给别人的压缩包
 
 - 单个显示器、单个窗口或单屏区域；不拼接多显示器，不做游戏注入捕获
 - 仅 SDR；HDR 显示器需要先切到 SDR
-- 受保护内容是否允许捕获由 Windows 决定
+- 受保护内容是否允许捕获由操作系统决定
 - 音频设备不可用时给出提示并补静音，不会静默换到别的麦克风
 - 降噪是本地的高通 + STFT 频域降噪 + 噪声门 + 压缩，不做回声消除，也不使用神经网络降噪模型
-- 当前采集路径是 WGC D3D11 → CPU BGRA → FFmpeg，硬件编码器接收 CPU 上传帧，端到端 GPU 零拷贝尚未启用
+- 当前采集路径为原生采集 → CPU BGRA → FFmpeg，硬件编码器接收 CPU 上传帧，端到端 GPU 零拷贝尚未启用
 - 「200–300 MB/小时」是 1080p 低动态桌面场景的优化目标，不是普遍保证；游戏、视频、4K 会明显更大
 - GPU 占用无法采集时报告为 `null`
 

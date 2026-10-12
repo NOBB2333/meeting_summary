@@ -13,7 +13,7 @@ done
 if ! pkg-config --exists libavcodec libavformat libavutil libswscale libswresample 2>/dev/null; then
   echo "Missing FFmpeg development libraries visible through pkg-config." >&2
   case "$platform" in
-    Darwin) echo "Install with: brew install ffmpeg pkg-config llvm" >&2 ;;
+    Darwin) echo "Install with: brew install ffmpeg pkgconf" >&2 ;;
     Linux) echo "Install your distribution's ffmpeg development and pkg-config packages." >&2 ;;
   esac
   missing=1
@@ -21,7 +21,15 @@ fi
 
 case "$platform" in
   Darwin)
-    echo "macOS toolchain detected. ScreenCaptureKit/CoreAudio backend is the next platform implementation step."
+    if ! xcrun --find swiftc >/dev/null 2>&1; then
+      echo "Install Xcode Command Line Tools: xcode-select --install" >&2
+      missing=1
+    fi
+    if ! xcrun --find metal >/dev/null 2>&1; then
+      echo "GPUI requires Xcode's Metal compiler. Run: xcodebuild -downloadComponent MetalToolchain" >&2
+      missing=1
+    fi
+    echo "macOS backend: ScreenCaptureKit + CoreAudio + VideoToolbox (macOS 13+)."
     ;;
   Linux)
     echo "Linux toolchain detected. PipeWire backend is the next platform implementation step."

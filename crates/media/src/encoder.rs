@@ -57,6 +57,10 @@ impl FfmpegVideoEncoder {
             options.insert("preset".into(), "8".into());
             options.insert("crf".into(), (config.quality + 5).to_string());
             options.insert("svtav1-params".into(), "lp=4:pred-struct=1".into());
+        } else if name.ends_with("_videotoolbox") {
+            options.insert("realtime".into(), "1".into());
+            options.insert("allow_sw".into(), "0".into());
+            context.set_bit_rate(config.max_bitrate_kbps as usize * 750);
         } else if name.ends_with("_qsv") {
             options.insert("preset".into(), "medium".into());
             options.insert("async_depth".into(), "1".into());
@@ -287,6 +291,8 @@ pub fn probe_one(name: &str, width: u32, height: u32, config: &RecordingConfig) 
 pub fn probe_encoders() -> Vec<EncoderCapabilities> {
     let _ = super::initialize();
     [
+        "h264_videotoolbox",
+        "hevc_videotoolbox",
         "h264_qsv",
         "hevc_qsv",
         "av1_qsv",

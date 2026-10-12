@@ -8,3 +8,5 @@ pub use config::*;
 pub use denoise::MicDenoiser;
 pub use region::*;
 pub use types::*;
+mod audio;
+pub use audio::*;

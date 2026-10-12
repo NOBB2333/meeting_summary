@@ -2,20 +2,25 @@ use opencap_core::*;
 use opencap_media::{MediaWriter, export_audio, recover_file};
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 fn scratch() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "opencap-test-{}-{}",
+        "opencap-test-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
     ));
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir(&dir).unwrap();
     dir
 }
 #[test]

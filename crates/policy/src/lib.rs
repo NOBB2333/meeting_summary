@@ -84,6 +84,13 @@ pub fn candidates(config: &RecordingConfig) -> Vec<&str> {
     if let Some(name) = &config.encoder {
         return vec![name];
     }
+    #[cfg(target_os = "macos")]
+    return match config.codec {
+        Codec::Auto | Codec::H264 => vec!["h264_videotoolbox", "libx264"],
+        Codec::Hevc => vec!["hevc_videotoolbox", "libx265"],
+        Codec::Av1 => vec!["libsvtav1"],
+    };
+    #[cfg(not(target_os = "macos"))]
     match config.codec {
         Codec::Auto => vec![
             "av1_qsv",
@@ -156,6 +163,7 @@ mod tests {
         assert_eq!(candidates(&c), vec!["libsvtav1"]);
     }
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn adapter_preference_keeps_codec_priority() {
         let c = RecordingConfig::default();
         let ordered = prefer_adapter(candidates(&c), Some(0x10de));

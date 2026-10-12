@@ -3,11 +3,15 @@ name = "opencap-platform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+links = "opencap_native"
 [dependencies]
 anyhow.workspace = true
 opencap-core.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+serde_json.workspace = true
+libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-capture = "=2.0.1"
 wasapi = "=0.25.0"

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use opencap_core::*;
 use std::{
     sync::{
@@ -157,7 +157,14 @@ impl WindowsAudio {
                 device.clone(),
             );
             let thread = thread::spawn(move || {
-                if let Err(e) = audio_loop(kind, worker_device, clock, worker_stop, tx) {
+                if let Err(e) = audio_loop(
+                    kind,
+                    worker_device,
+                    clock,
+                    worker_stop,
+                    tx,
+                    warnings.clone(),
+                ) {
                     let name = if kind == AudioKind::System {
                         "系统声音"
                     } else {
@@ -184,6 +191,9 @@ impl WindowsAudio {
 pub struct AudioMonitor {
     routes: Vec<AudioRoute>,
     state: Arc<Mutex<MonitorState>>,
+    warning_tx: Sender<String>,
+    warning_rx: Receiver<String>,
+    denoise: bool,
 }
 struct MonitorState {
     value: [f32; 2],
@@ -204,6 +214,11 @@ impl Drop for AudioMonitor {
 }
 impl AudioMonitor {
     pub fn set_routing(&mut self, routing: &AudioRouting, denoise: bool) {
+        if self.denoise != denoise {
+            self.routes
+                .retain(|route| route.kind != AudioKind::Microphone);
+            self.denoise = denoise;
+        }
         self.routes.retain(|route| {
             routing.enabled(route.kind) && routing.device(route.kind) == &route.device
         });
@@ -216,8 +231,11 @@ impl AudioMonitor {
             let state = self.state.clone();
             let worker_device = device.clone();
             let worker_stop = stop.clone();
+            let warnings = self.warning_tx.clone();
             let thread = thread::spawn(move || {
-                let _ = monitor_loop(kind, worker_device, worker_stop, state, denoise);
+                if let Err(error) = monitor_loop(kind, worker_device, worker_stop, state, denoise) {
+                    let _ = warnings.try_send(format!("{kind:?} 电平检测失败：{error:#}"));
+                }
             });
             self.routes.push(AudioRoute {
                 kind,
@@ -230,13 +248,22 @@ impl AudioMonitor {
     /// Latest peak level per route in the mixer's own order: system, microphone.
     pub fn peaks(&self) -> (f32, f32) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        (state.value[0], state.value[1])
+        let peak =
+            |i: usize| state.value[i] * (-state.updated[i].elapsed().as_secs_f32() / 0.35).exp();
+        (peak(0), peak(1))
+    }
+    pub fn take_warning(&self) -> Option<String> {
+        self.warning_rx.try_recv().ok()
     }
 }
 pub fn start_audio_monitor(routing: &AudioRouting, denoise: bool) -> Result<AudioMonitor> {
+    let (warning_tx, warning_rx) = unbounded();
     let mut monitor = AudioMonitor {
         routes: Vec::new(),
         state: Arc::new(Mutex::new(MonitorState::default())),
+        warning_tx,
+        warning_rx,
+        denoise,
     };
     if !routing.system_audio && !routing.microphone {
         anyhow::bail!("没有开启任何声音来源");
@@ -251,7 +278,7 @@ fn monitor_loop(
     state: Arc<Mutex<MonitorState>>,
     denoise: bool,
 ) -> Result<()> {
-    let mut denoiser = denoise.then(|| MicDenoiser::new(48_000));
+    let mut denoiser = (denoise && kind == AudioKind::Microphone).then(|| MicDenoiser::new(48_000));
     let index = usize::from(kind == AudioKind::Microphone);
     capture_loop(kind, device_id, stop, move |_latency, samples| {
         let mut filtered;
@@ -282,6 +309,7 @@ fn audio_loop(
     clock: RecordingClock,
     stop: Arc<AtomicBool>,
     tx: Sender<AudioChunk>,
+    warnings: Sender<String>,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let counter = if kind == AudioKind::System {
@@ -289,6 +317,8 @@ fn audio_loop(
     } else {
         &AUDIO_DIAG.packets_mic
     };
+    let mut timeline = AudioTimeline::default();
+    let mut overrun_warned = false;
     let result = capture_loop(kind, device_id, stop, |latency, samples| {
         counter.fetch_add(1, Relaxed);
         let peak = samples
@@ -300,10 +330,9 @@ fn audio_loop(
         }
         let millis = (peak.min(1.0) as f64 * 10_000.0) as u64;
         AUDIO_DIAG.peak_millis.fetch_max(millis, Relaxed);
-        if clock.is_paused() {
+        let Some(pts_us) = timeline.timestamp(&clock, latency, samples.len() / 2) else {
             return Ok(());
-        }
-        let pts_us = (clock.now_us() - latency).max(0);
+        };
         match tx.try_send(AudioChunk {
             kind,
             pts_us,
@@ -312,9 +341,16 @@ fn audio_loop(
             Ok(()) => {
                 AUDIO_DIAG.chunks_sent.fetch_add(1, Relaxed);
             }
-            Err(_) => {
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
                 AUDIO_DIAG.chunks_dropped.fetch_add(1, Relaxed);
-                anyhow::bail!("Audio queue overrun");
+                if !overrun_warned {
+                    let _ = warnings
+                        .try_send(format!("{kind:?} 音频队列积压，部分采样丢失；采集会继续"));
+                    overrun_warned = true;
+                }
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                anyhow::bail!("Audio receiver closed")
             }
         }
         Ok(())

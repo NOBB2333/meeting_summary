@@ -30,6 +30,23 @@ MB = 1,000,000 bytes。低动态 PPT/文档以 ≤300 MB/h 为目标，≤200 MB
 
 实测记录在本文件后续追加，未运行的项目不可标为通过。
 
+## 2026-10-12 macOS 一阶段补齐
+
+本机：Apple M1 / macOS 26.5.2 / FFmpeg 8.0.1 / Rust 1.97.1。新增 ScreenCaptureKit、CoreAudio、VideoToolbox 后端和本地 `.app` 打包。没有修改二阶段 Python 项目或接入转录服务。
+
+- Debug / Release workspace 构建通过，30 项测试通过；全 targets / 全 features Clippy `-D warnings`、Rust 格式检查通过。新增回归覆盖任意设备回调长度、双声道波形重建、末尾非整块采样以及音频时间戳抖动。一次并行测试暴露临时目录名碰撞，改用进程内原子序号后复测通过。
+- H.264 / HEVC VideoToolbox 试编码和解码探测通过。实际 GUI 录制自动选择 `h264_videotoolbox`，不是软件编码。
+- 系统日志明确记录旧授权签名与当前二进制 cdhash 不匹配。仅清理 OpenCap 的旧屏幕录制授权，重新添加当时的应用包后，显示器与窗口列表恢复，实际录制成功。未修改 TCC 数据库、关闭系统保护或扩大其他应用权限。
+- GUI 全屏录制、暂停、继续、停止、独立音频导出通过。连续播放原创 440 Hz / 48 kHz 测试音 50 秒，解码后第 5–54 秒有连续信号，中间没有整秒静音，内部 RMS 最低约 0.0623。MP4 / M4A 完整解码通过；录制媒体时长约 82.0054 秒，轨尾差约 -0.0042 ms。轨尾一致不证明感知声画同步。
+- 窗口列表显示真实快照，19 个目标按 3 列排列；选中系统设置窗口录制和保存通过，文件完整解码通过。
+- 区域选择实际拖出 640×360，再移动选框、拖动右下角，保存选择为 `(150,150,720,420)`，采集文件尺寸为 720×420。测试中强制退出该录制，原 partial 保留，恢复副本完整解码通过，视频与音频 packet DTS 均严格递增。VFR 解码使用 `-fps_mode passthrough -enc_time_base demux`，避免 null 输出端重采样时间基产生假告警。
+- 上述首次采集用于验证录制流程和音频连续性。随后修正 Retina 屏幕为 CGDisplayMode 物理像素尺寸，窗口采用 `SCContentFilter.pointPixelScale`，区域坐标按像素与点转换；最终包的 Retina 尺寸与位置复验仍待桌面可见和当前包授权后完成。
+- Release 应用包递归捆绑 15 个动态库，约 38 MB，签名完整性检查通过。捆绑的 Homebrew 库要求 macOS 26，打包脚本会据实际 dylib 的最低版本设置 `LSMinimumSystemVersion`。后端源码最低为 macOS 13，不能把本机包标作兼容 macOS 13。
+
+待验证：当前包的麦克风实录、长时间声画标记、多屏不同缩放、锁屏、设备拔出、快捷键与菜单栏交互，以及完整 `--ui-smoke` 场景。麦克风首次授权窗口需要用户点击允许；最终阶段电脑操作工具返回 `cgWindowNotFound`，无法继续操作可见窗口。不要将这些项目标为通过。新增 macOS CI，修正 Windows CI 的 FFmpeg 环境传递；远程 CI 和 Windows 实机尚未在本轮执行。Linux 后端仍未实现。
+
+本地声音检查数据在 `target/verify/macos/fullscreen-audio-check.json`，恢复副本在 `target/verify/macos/region-recovered.mp4`。`target`、录制文件和本机应用包不提交到 Git。
+
 ## 2026-10-08 本机实测
 
 Windows 11 / Intel Iris Xe + NVIDIA MX450 / FFmpeg 9.0.2 / Rust 1.97.1。

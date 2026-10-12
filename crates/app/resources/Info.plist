@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>OpenCap</string>
+  <key>CFBundleDisplayName</key><string>OpenCap</string>
+  <key>CFBundleIdentifier</key><string>org.opencap.OpenCap</string>
+  <key>CFBundleExecutable</key><string>opencap</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>OpenCap 使用麦克风录制会议和旁白。声音仅保存在你选择的本地目录。</string>
+  <key>NSScreenCaptureUsageDescription</key><string>OpenCap 使用屏幕与系统音频权限录制你选择的显示器、窗口或区域。</string>
+</dict></plist>

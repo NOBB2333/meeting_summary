@@ -1,6 +1,6 @@
 use crate::MediaWriter;
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use opencap_core::*;
 use opencap_policy::FramePolicy;
 use parking_lot::Mutex;
@@ -20,6 +20,7 @@ pub enum RecordingCommand {
     Resume,
     Stop,
     SetAudio(AudioRouting),
+    SetMicDenoise(bool),
 }
 pub struct RecordingSession {
     commands: Sender<RecordingCommand>,
@@ -31,7 +32,7 @@ impl RecordingSession {
     pub fn start(config: RecordingConfig) -> Result<Self> {
         config.validate()?;
         std::fs::create_dir_all(&config.output_dir)?;
-        let (commands, rx) = bounded(16);
+        let (commands, rx) = unbounded();
         let stats = Arc::new(Mutex::new(RecordingStats {
             state: RecordingState::Starting,
             ..Default::default()
@@ -129,18 +130,36 @@ fn unique_output(dir: &Path) -> Result<(PathBuf, PathBuf)> {
 struct MicChain {
     enabled: bool,
     denoiser: MicDenoiser,
+    last_end_us: Option<i64>,
 }
 impl MicChain {
     fn new(config: &RecordingConfig) -> Self {
         Self {
             enabled: config.mic_denoise,
             denoiser: MicDenoiser::new(48_000),
+            last_end_us: None,
         }
     }
     fn apply(&mut self, chunk: &mut AudioChunk) {
         if self.enabled && chunk.kind == AudioKind::Microphone {
+            self.last_end_us = Some(chunk.pts_us + chunk.samples.len() as i64 / 2 * 1000 / 48);
             self.denoiser.process(&mut chunk.samples);
+            chunk.pts_us -= MicDenoiser::LATENCY_FRAMES as i64 * 1000 / 48;
         }
+    }
+    fn flush(&mut self) -> Option<AudioChunk> {
+        let end = self.last_end_us.take()?;
+        let mut samples = vec![0.0; MicDenoiser::LATENCY_FRAMES * 2];
+        self.denoiser.process(&mut samples);
+        Some(AudioChunk {
+            kind: AudioKind::Microphone,
+            pts_us: end - MicDenoiser::LATENCY_FRAMES as i64 * 1000 / 48,
+            samples,
+        })
+    }
+    fn reset(&mut self) {
+        self.denoiser = MicDenoiser::new(48_000);
+        self.last_end_us = None;
     }
 }
 fn run(
@@ -205,21 +224,42 @@ fn run(
     let mut stop_reason = None;
     let mut last_capture = Instant::now();
     let mut idle_warned = false;
-    let mut silent_audio_since = Instant::now();
-    let mut silent_audio_warned = false;
+    let mut silent_audio_since = [Instant::now(); 2];
+    let mut silent_audio_warned = [false; 2];
     loop {
         let mut stop = false;
         for cmd in commands.try_iter() {
             match cmd {
                 RecordingCommand::Pause => {
                     clock.pause();
+                    // Preserve the last captured syllable before resetting the
+                    // delayed microphone filter on resume.
+                    for mut chunk in audio_rx.try_iter() {
+                        mic.apply(&mut chunk);
+                        rebase_audio(&mut chunk, video_epoch);
+                        writer.audio(chunk);
+                    }
+                    if let Some(mut tail) = mic.flush() {
+                        rebase_audio(&mut tail, video_epoch);
+                        writer.audio(tail);
+                    }
+                    mic.reset();
                     stats.lock().state = RecordingState::Paused;
                 }
                 RecordingCommand::Resume => {
+                    mic.reset();
                     clock.resume();
                     stats.lock().state = RecordingState::Recording;
                 }
                 RecordingCommand::Stop => stop = true,
+                RecordingCommand::SetMicDenoise(enabled) => {
+                    if let Some(mut tail) = mic.flush() {
+                        rebase_audio(&mut tail, video_epoch);
+                        writer.audio(tail);
+                    }
+                    mic.enabled = enabled;
+                    mic.reset();
+                }
                 RecordingCommand::SetAudio(next) => {
                     if writer.audio_cursor_us().is_none() {
                         stats
@@ -241,13 +281,19 @@ fn run(
                     for mut chunk in audio_rx.try_iter() {
                         if !changed.contains(&chunk.kind) {
                             mic.apply(&mut chunk);
-                            chunk.pts_us = (chunk.pts_us - video_epoch).max(0);
+                            rebase_audio(&mut chunk, video_epoch);
                             writer.audio(chunk);
                         }
                     }
                     for kind in changed {
                         writer.clear_audio_route(kind);
-                        peaks[usize::from(kind == AudioKind::Microphone)] = 0.0;
+                        if kind == AudioKind::Microphone {
+                            mic.reset();
+                        }
+                        let index = usize::from(kind == AudioKind::Microphone);
+                        peaks[index] = 0.0;
+                        silent_audio_since[index] = Instant::now();
+                        silent_audio_warned[index] = false;
                     }
                     routing = next;
                     let mut s = stats.lock();
@@ -281,7 +327,7 @@ fn run(
                 .iter()
                 .filter(|v| v.is_finite())
                 .fold(peaks[index], |peak, value| peak.max(value.abs().min(1.0)));
-            chunk.pts_us = (chunk.pts_us - video_epoch).max(0);
+            rebase_audio(&mut chunk, video_epoch);
             writer.audio(chunk);
         }
         if !clock.is_paused() {
@@ -318,34 +364,37 @@ fn run(
             s.dropped_frames = dropped.load(Ordering::Relaxed);
             s.cpu_percent = cpu;
             s.peak_memory_bytes = memory;
-            if routing.system_audio && peaks[0] > 0.0005 {
-                silent_audio_since = Instant::now();
-                silent_audio_warned = false;
-            }
-            if routing.microphone && peaks[1] > 0.0005 {
-                silent_audio_since = Instant::now();
-                silent_audio_warned = false;
-            }
-            if !silent_audio_warned
-                && (routing.system_audio || routing.microphone)
-                && silent_audio_since.elapsed() > Duration::from_secs(12)
+            for (i, kind) in [AudioKind::System, AudioKind::Microphone]
+                .into_iter()
+                .enumerate()
             {
-                let what = match (routing.system_audio, routing.microphone) {
-                    (true, true) => "系统声音和麦克风",
-                    (true, false) => "系统声音",
-                    _ => "麦克风",
-                };
-                s.warnings.push(format!(
-                    "{what}连续 12 秒没有检测到信号；请在设置里确认设备，或点击音频面板旁的实时检测"
-                ));
-                silent_audio_warned = true;
+                if !routing.enabled(kind) || clock.is_paused() || peaks[i] > 0.0005 {
+                    silent_audio_since[i] = Instant::now();
+                    silent_audio_warned[i] = false;
+                } else if !silent_audio_warned[i]
+                    && silent_audio_since[i].elapsed() > Duration::from_secs(12)
+                {
+                    let what = if kind == AudioKind::System {
+                        "系统声音"
+                    } else {
+                        "麦克风"
+                    };
+                    s.warnings.push(format!(
+                        "{what}连续 12 秒没有检测到信号；请确认设备和权限，或打开电平检测"
+                    ));
+                    silent_audio_warned[i] = true;
+                }
             }
             s.system_peak = peaks[0];
             s.microphone_peak = peaks[1];
             peaks = [0.0; 2];
-            if !idle_warned && last_capture.elapsed() > Duration::from_secs(5) {
+            if !idle_warned
+                && !clock.is_paused()
+                && matches!(config.target, CaptureTarget::Window(_))
+                && last_capture.elapsed() > Duration::from_secs(5)
+            {
                 s.warnings
-                    .push("画面未更新；窗口可能已最小化，当前保留最后画面".into());
+                    .push("窗口画面静止或不可见，当前保留最后画面".into());
                 idle_warned = true;
             }
             last_frames = writer.frames;
@@ -363,11 +412,21 @@ fn run(
             .warnings
             .push(format!("采集结束时发生错误：{error}"));
     }
-    audio.stop()?;
+    if let Err(error) = audio.stop() {
+        stats
+            .lock()
+            .warnings
+            .push(format!("音频采集结束时发生错误：{error}"));
+    }
+    stats.lock().warnings.extend(warn_rx.try_iter());
     for mut chunk in audio_rx.try_iter() {
         mic.apply(&mut chunk);
-        chunk.pts_us = (chunk.pts_us - video_epoch).max(0);
+        rebase_audio(&mut chunk, video_epoch);
         writer.audio(chunk);
+    }
+    if let Some(mut tail) = mic.flush() {
+        rebase_audio(&mut tail, video_epoch);
+        writer.audio(tail);
     }
     let encoder_options = writer.video.options.clone();
     let encoder_details = writer.video.details();
@@ -410,7 +469,7 @@ fn run(
     };
     let report = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "config": config, "stats": snapshot, "encoder_options": encoder_options, "encoder_details": encoder_details, "output_media":crate::inspect_output(&output)?,
         "pixel_format": "8-bit 4:2:0 BT.709 SDR", "time_base": "1/90000", "rate_control": if snapshot.encoder.ends_with("_qsv") { "ICQ (no hard VBV cap)" } else { "quality with encoder-specific rate control" },
-        "audio_changes": audio_changes, "gpu_usage": "unavailable", "capture_path": "WGC D3D11 -> CPU BGRA -> FFmpeg", "av_offset_definition": "audio stream end minus video stream end; does not measure perceptual synchronization" });
+        "audio_changes": audio_changes, "gpu_usage": "unavailable", "capture_path": opencap_platform::CAPTURE_PATH, "av_offset_definition": "audio stream end minus video stream end; does not measure perceptual synchronization" });
     std::fs::write(
         output.with_extension("recording.json"),
         serde_json::to_vec_pretty(&report)?,

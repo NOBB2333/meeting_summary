@@ -17,6 +17,10 @@ gpui = { version = "=0.2.2", default-features = false, features = ["windows-mani
 raw-window-handle = "0.6"
 futures-timer = "3"
 image = { version = "0.25", default-features = false }
+log = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
 
 [build-dependencies]
 embed-resource = "=3.0.12"

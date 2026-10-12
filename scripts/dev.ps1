@@ -1,4 +1,4 @@
-param([ValidateSet('build','run','test','check','bench')][string]$Task = 'run', [switch]$Release, [Parameter(ValueFromRemainingArguments=$true)][string[]]$ExtraArgs)
+param([ValidateSet('build','run','test','check','lint','bench')][string]$Task = 'run', [switch]$Release, [Parameter(ValueFromRemainingArguments=$true)][string[]]$ExtraArgs)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
@@ -10,6 +10,7 @@ if (@($requiredFiles | Where-Object { !(Test-Path -LiteralPath (Join-Path $ffmpe
     & "$PSScriptRoot/setup.ps1"
 }
 $env:PATH = "$ffmpegRoot/bin;$env:PATH"
+$env:FFMPEG_DIR = $ffmpegRoot
 . "$PSScriptRoot/toolchain.ps1"
 if ($Release -and (!$env:GPUI_FXC_PATH -or !(Test-Path $env:GPUI_FXC_PATH))) { throw 'GPUI release builds require fxc.exe from the Windows SDK. Set GPUI_FXC_PATH if installed in a custom location.' }
 $arguments = switch ($Task) {
@@ -18,6 +19,7 @@ $arguments = switch ($Task) {
     'build' { @('build','--workspace') }
     'test' { @('test','--workspace') }
     'check' { @('check','--workspace') }
+    'lint' { @('clippy','--workspace','--all-targets','--all-features') }
 }
 if ($Release) { $arguments += '--release' }
 $arguments += '--locked'

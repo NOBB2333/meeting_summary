@@ -1,7 +1,7 @@
 //! Real-time microphone cleanup, shared by the recorder and the idle level meter.
 //!
 //! The chain stays small enough to run inline on every capture buffer without
-//! allocating: a two-section high-pass removes DC offset and low-frequency
+//! allocating: a high-pass removes DC offset and low-frequency
 //! rumble, an adaptive noise-floor tracker drives a smooth downward expander,
 //! and a gentle compressor lifts speech the way conferencing apps do. Nothing is
 //! ever hard muted, so quiet speech is not chopped into silence.
@@ -94,14 +94,14 @@ fn fft_inverse(values: &mut [Complex32]) {
         value.im = -value.im;
     }
     fft(values);
+    let n = values.len() as f32;
+    for value in values {
+        value.re /= n;
+        value.im = -value.im / n;
+    }
 }
 
-/// Hann analysis/synthesis gain applied to every reconstructed output sample.
-///
-/// A Hann window applied on analysis and synthesis with a 50% hop sums to 1.5,
-/// and the unnormalised radix-2 FFT contributes `n/4` on the round trip, so
-/// dividing by `3/2` restores unity gain.
-const OVERLAP_NORM: f32 = 29.52;
+/// Square-root Hann analysis/synthesis, with 50% overlap, has unity gain.
 const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = FFT_SIZE / 2;
 const SPECTRAL_BINS: usize = FFT_SIZE / 2 + 1;
@@ -116,19 +116,21 @@ struct SpectralChannel {
     min_mag: Vec<f32>,
     gain: Vec<f32>,
     frames: u64,
+    overlap: Vec<f32>,
 }
 
 impl SpectralChannel {
     fn new() -> Self {
         Self {
-            input: Vec::with_capacity(FFT_SIZE),
-            output: Vec::with_capacity(FFT_SIZE + FFT_HOP),
+            input: vec![0.0; FFT_HOP],
+            output: vec![0.0; FFT_HOP],
             window: vec![0.0; FFT_SIZE],
             ring: vec![0.0; FFT_SIZE],
             spectrum: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
             min_mag: vec![0.0; SPECTRAL_BINS],
             gain: vec![1.0; SPECTRAL_BINS],
             frames: 0,
+            overlap: vec![0.0; FFT_HOP],
         }
     }
 }
@@ -144,6 +146,7 @@ struct SpectralSuppressor {
     gain_fall: f32,
     floor_gain: f32,
     channels: [SpectralChannel; 2],
+    position: usize,
 }
 
 impl SpectralSuppressor {
@@ -151,17 +154,20 @@ impl SpectralSuppressor {
         let hop_seconds = FFT_HOP as f32 / sample_rate.max(8_000.0);
         Self {
             window: (0..FFT_SIZE)
-                .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT_SIZE as f32).cos())
+                .map(|i| {
+                    (0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT_SIZE as f32).cos()).sqrt()
+                })
                 .collect(),
             // Minimum-statistics tracking: the floor drops quickly onto quiet
             // frames and rises only very slowly, so stationary noise is learned
             // while speech and tones are treated as signal.
-            min_rise: one_pole(hop_seconds * 2.5, 1.0),
-            min_fall: one_pole(hop_seconds * 0.25, 1.0),
-            gain_rise: one_pole(hop_seconds * 4.0, 1.0),
-            gain_fall: one_pole(hop_seconds * 0.8, 1.0),
-            floor_gain: db_to_linear(-22.0),
+            min_rise: 1.0 - (-hop_seconds / 5.0).exp(),
+            min_fall: 1.0 - (-hop_seconds / 0.02).exp(),
+            gain_rise: 1.0 - (-hop_seconds / 0.01).exp(),
+            gain_fall: 1.0 - (-hop_seconds / 0.08).exp(),
+            floor_gain: db_to_linear(-14.0),
             channels: [SpectralChannel::new(), SpectralChannel::new()],
+            position: 0,
         }
     }
 
@@ -169,31 +175,20 @@ impl SpectralSuppressor {
         for channel in 0..2 {
             self.channels[channel].window.copy_from_slice(&self.window);
         }
-        let frames = samples.len() / 2;
-        let mut consumed = 0usize;
-        while consumed < frames {
-            let take = (frames - consumed).min(FFT_HOP);
-            for i in 0..take {
-                let frame = (consumed + i) * 2;
-                for channel in 0..2 {
-                    self.channels[channel].input.push(samples[frame + channel]);
-                }
-            }
-            consumed += take;
-            if self.channels[0].input.len() < FFT_SIZE {
-                break;
-            }
-            self.transform();
-            for channel in 0..2 {
+        // Read and write one stereo frame at a time. No raw samples escape at
+        // packet boundaries, including devices delivering 441 or 480 frames.
+        for frame in samples.chunks_exact_mut(2) {
+            for (channel, sample) in frame.iter_mut().enumerate() {
                 let data = &mut self.channels[channel];
-                for i in 0..take {
-                    samples[(consumed - take + i) * 2 + channel] = data.output[i];
-                }
-                data.output.drain(..take);
+                data.input[self.position] = if sample.is_finite() { *sample } else { 0.0 };
+                *sample = data.output[self.position];
+            }
+            self.position += 1;
+            if self.position == FFT_HOP {
+                self.transform();
+                self.position = 0;
             }
         }
-        // A call length that is not a multiple of the hop leaves the last partial
-        // hop in `input`; it is completed by the next call, so nothing is dropped.
     }
 
     fn transform(&mut self) {
@@ -205,7 +200,6 @@ impl SpectralSuppressor {
             for i in 0..FFT_HOP {
                 data.ring[FFT_HOP + i] = data.input[i];
             }
-            data.input.drain(..FFT_HOP);
 
             for i in 0..FFT_SIZE {
                 data.spectrum[i] = Complex32::new(data.ring[i] * data.window[i], 0.0);
@@ -215,12 +209,10 @@ impl SpectralSuppressor {
             for k in 0..SPECTRAL_BINS {
                 let measured = data.spectrum[k].norm();
                 let magnitude = if measured.is_finite() { measured } else { 0.0 };
-                if data.frames < 24 {
-                    data.min_mag[k] = if data.frames == 0 {
-                        magnitude
-                    } else {
-                        data.min_mag[k].min(magnitude)
-                    };
+                if data.frames == 0 {
+                    // Start conservatively, without learning the first spoken
+                    // syllable as the noise floor.
+                    data.min_mag[k] = magnitude * 0.25;
                 } else if magnitude < data.min_mag[k] {
                     data.min_mag[k] += (magnitude - data.min_mag[k]) * self.min_fall;
                 } else {
@@ -228,10 +220,9 @@ impl SpectralSuppressor {
                 }
                 data.min_mag[k] = data.min_mag[k].max(FLOOR_MIN);
                 let signal = magnitude * magnitude;
-                // Over-subtraction (beta = 5) keeps steady tones and speech
-                // formants above the floor instead of shaving them by the
-                // coherent share of the minimum-statistics estimate.
-                let noise = 5.0 * data.min_mag[k] * data.min_mag[k];
+                // Conservative subtraction protects speech from a noise-floor
+                // estimate that also contains some of the speaker's voice.
+                let noise = 2.0 * data.min_mag[k] * data.min_mag[k];
                 let wiener = if signal <= 1e-14 || !signal.is_finite() {
                     self.floor_gain
                 } else {
@@ -261,12 +252,11 @@ impl SpectralSuppressor {
                 }
             }
             fft_inverse(&mut data.spectrum);
-            // Keep `ring` intact (it is the next analysis window) and write the
-            // synthesised hop into the separate output queue.
+            // Overlap adjacent synthesis windows, never the two halves of
+            // the same window (that folds and corrupts the waveform).
             for i in 0..FFT_HOP {
-                let value = data.spectrum[i].re * data.window[i] / OVERLAP_NORM
-                    + data.spectrum[FFT_HOP + i].re * data.window[FFT_HOP + i] / OVERLAP_NORM;
-                data.output.push(value);
+                data.output[i] = data.overlap[i] + data.spectrum[i].re * data.window[i];
+                data.overlap[i] = data.spectrum[FFT_HOP + i].re * data.window[FFT_HOP + i];
             }
             data.frames += 1;
         }
@@ -346,6 +336,8 @@ impl MicDenoiser {
         }
     }
 
+    pub const LATENCY_FRAMES: usize = FFT_SIZE;
+
     /// Tracked noise floor as a linear amplitude, exposed for diagnostics.
     pub fn floor_amplitude(&self) -> f32 {
         self.floor
@@ -358,16 +350,22 @@ impl MicDenoiser {
 
     /// In-place processing of interleaved stereo frames (`[l, r, l, r, ...]`).
     pub fn process(&mut self, samples: &mut [f32]) {
+        // Remove DC before the spectral tracker, so it cannot learn a large DC
+        // bin and turn a steady offset into a modulated audible signal.
+        for frame in samples.chunks_exact_mut(2) {
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let input = if sample.is_finite() { *sample } else { 0.0 };
+                *sample = self.high_pass[channel].process(input, self.high_pass_a);
+            }
+        }
         self.spectral.process(samples);
         for frame in samples.chunks_exact_mut(2) {
             let mut envelope_input = 0.0f32;
-            for (channel, sample) in frame.iter_mut().enumerate() {
+            for sample in frame.iter_mut() {
                 if !sample.is_finite() {
                     *sample = 0.0;
                 }
-                let filtered = self.high_pass[channel].process(*sample, self.high_pass_a);
-                *sample = filtered;
-                envelope_input = envelope_input.max(filtered.abs());
+                envelope_input = envelope_input.max(sample.abs());
             }
             // Instant attack so transients are never clipped; slow release so
             // natural pauses keep their gain instead of chattering.
@@ -496,6 +494,7 @@ mod tests {
         let source = interleave(std::iter::repeat_n(0.25f32, frames));
         let mut samples = source.clone();
         let mut suppressor = SpectralSuppressor::new(RATE);
+        suppressor.floor_gain = 1.0; // Test reconstruction independently of suppression.
         for block in samples.chunks_mut(960) {
             suppressor.process(block);
         }
@@ -509,6 +508,36 @@ mod tests {
     }
 
     #[test]
+    fn spectral_reconstruction_preserves_both_channels_and_the_final_samples() {
+        let source: Vec<f32> = (0..1031)
+            .flat_map(|i| {
+                let left = (i as f32 * 0.037).sin() * 0.3;
+                let right = if i == 1030 {
+                    0.7
+                } else {
+                    (i as f32 * 0.113).cos() * 0.2
+                };
+                [left, right]
+            })
+            .collect();
+        let mut output = source.clone();
+        output.extend(std::iter::repeat_n(0.0, MicDenoiser::LATENCY_FRAMES * 2));
+        let mut suppressor = SpectralSuppressor::new(RATE);
+        suppressor.floor_gain = 1.0;
+        for packet in output.chunks_mut(441 * 2) {
+            suppressor.process(packet);
+        }
+        let delay = MicDenoiser::LATENCY_FRAMES * 2;
+        assert!(output[..delay].iter().all(|v| v.abs() < 0.00002));
+        for (index, (actual, expected)) in output[delay..].iter().zip(&source).enumerate() {
+            assert!(
+                (actual - expected).abs() < 0.00002,
+                "sample {index} was shifted, folded, or lost: {actual} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn spectral_stage_suppresses_steady_hiss_more_than_a_gate_could() {
         let raw = noise(4.0, 0.03);
         let raw_rms = rms(&raw[raw.len() - 48_000..]);
@@ -518,12 +547,11 @@ mod tests {
         let tail = &samples[samples.len() - 48_000..];
         let measured = 20.0 * (rms(tail) / raw_rms).log10();
         assert!(
-            measured < -14.0,
-            "steady hiss only dropped {measured:.1} dB; expected at least -14 dB"
+            measured < -12.0,
+            "steady hiss only dropped {measured:.1} dB; expected at least -12 dB with conservative speech-preserving suppression"
         );
     }
 
-    #[test]
     #[test]
     fn gate_and_spectral_stage_push_a_quiet_tail_below_the_noise_floor() {
         // Speech, then a genuine silence so the release has something to work on.
@@ -545,6 +573,27 @@ mod tests {
             processed_bed < 0.02,
             "quiet tail leaked at {processed_bed:.5}"
         );
+    }
+    #[test]
+    fn device_packet_sizes_do_not_change_the_recorded_signal() {
+        let source = speech_bursts(1.0, 0.12, 0.004);
+        let mut whole = source.clone();
+        MicDenoiser::new(48_000).process(&mut whole);
+        for frames in [128, 240, 441, 480, 512, 960] {
+            let mut fragmented = source.clone();
+            let mut denoiser = MicDenoiser::new(48_000);
+            for packet in fragmented.chunks_mut(frames * 2) {
+                denoiser.process(packet);
+            }
+            let difference = whole
+                .iter()
+                .zip(&fragmented)
+                .fold(0.0f32, |max, (a, b)| max.max((a - b).abs()));
+            assert!(
+                difference < 1e-5,
+                "packet size {frames} changes signal by {difference}"
+            );
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ impl Render for Sample {
             .p_5()
             .bg(rgb([0x133047, 0x363029, 0x253c30, 0x352741][self.index % 4]))
             .text_color(rgb(0xffffff))
-            .font_family("Microsoft YaHei UI")
+            .font_family(UI_FONT)
             .flex()
             .flex_col()
             .gap_3()
@@ -36,7 +36,11 @@ impl Render for Sample {
     }
 }
 async fn shot(hwnd: isize, path: PathBuf) -> Result<()> {
-    shot_target(CaptureTarget::Window(hwnd), path).await
+    shot_target(
+        CaptureTarget::Window(opencap_platform::capture_window_id(hwnd)),
+        path,
+    )
+    .await
 }
 async fn shot_target(target: CaptureTarget, path: PathBuf) -> Result<()> {
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -49,6 +53,7 @@ async fn shot_target(target: CaptureTarget, path: PathBuf) -> Result<()> {
                 codec: Codec::H264,
                 system_audio: false,
                 microphone: false,
+                exclude_app: false,
                 quality: 18,
                 ..Default::default()
             };
@@ -86,6 +91,10 @@ async fn shot_target(target: CaptureTarget, path: PathBuf) -> Result<()> {
     }
 }
 pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathBuf, cx: &mut App) {
+    #[cfg(windows)]
+    let exercise_microphone = true;
+    #[cfg(target_os = "macos")]
+    let exercise_microphone = opencap_platform::microphone_permission_granted();
     let mut sources = Vec::new();
     let mut sample_windows = Vec::new();
     for index in 0..23 {
@@ -112,7 +121,7 @@ pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathB
         let hwnd = window.update(cx, |_, w, _| native_handle(w)).unwrap();
         sample_windows.push(window);
         sources.push(TargetInfo {
-            target: CaptureTarget::Window(hwnd),
+            target: CaptureTarget::Window(opencap_platform::capture_window_id(hwnd)),
             name: format!("预览样本 {}", index + 1),
             width: 380,
             height: 270,
@@ -164,7 +173,7 @@ pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathB
                 anyhow::ensure!(state!=RecordingState::Failed && start.elapsed()<Duration::from_secs(20),"UI start failed");
                 futures_timer::Delay::new(Duration::from_millis(100)).await;
             }
-            recorder.update(cx,|r,cx| { r.toggle_audio(AudioKind::System); r.toggle_audio(AudioKind::Microphone); cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.toggle_audio(AudioKind::System); if exercise_microphone { r.toggle_audio(AudioKind::Microphone); } cx.notify(); })?;
             futures_timer::Delay::new(Duration::from_secs(2)).await;
             anyhow::ensure!(recorder.read_with(cx,|r,_|r.preview_image.is_some() && r.preview_pts>0)?,"Recording preview did not receive encoder frames");
             anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.as_ref().is_some_and(|i|i.visible()))?,"Always-on border did not appear");
@@ -179,7 +188,7 @@ pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathB
             anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.is_none())?,"Disabled border remained");
             recorder.update(cx,|r,cx| { r.toggle_pause(); cx.notify(); })?;
             futures_timer::Delay::new(Duration::from_millis(500)).await;
-            recorder.update(cx,|r,cx| { r.choose_device(AudioKind::System,r.devices.iter().find(|d|d.kind==AudioKind::System).map(|d|d.id.clone())); r.toggle_audio(AudioKind::Microphone); cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.choose_device(AudioKind::System,r.devices.iter().find(|d|d.kind==AudioKind::System).map(|d|d.id.clone())); if exercise_microphone { r.toggle_audio(AudioKind::Microphone); } cx.notify(); })?;
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             recorder.update(cx,|r,cx| { r.toggle_pause(); cx.notify(); })?;
             futures_timer::Delay::new(Duration::from_secs(1)).await;
@@ -204,7 +213,7 @@ pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathB
             if let CaptureTarget::Region { rect, .. } = region { anyhow::ensure!(rect.width > rect.height * 5 && rect.height <= 250,"Toolbar has incorrect size: {rect:?}"); }
             shot_target(region,path.join("07-floating-controls")).await?;
             let stats=recorder.read_with(cx,|r,_|r.stats.clone())?;
-            std::fs::write(path.join("ui-smoke.json"),serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"stats":stats,"maximized_columns":wide_columns,"scenarios":["23 real HWND previews","responsive expanded grid and last target","compact scrolling","small-window settings","live encoder preview","minimized target hides border","timed and disabled borders","UI start/pause/resume/stop","live audio and device switch"]}))?)?;
+            std::fs::write(path.join("ui-smoke.json"),serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"stats":stats,"microphone_exercised":exercise_microphone,"maximized_columns":wide_columns,"scenarios":["23 real native-window previews","responsive expanded grid and last target","compact scrolling","small-window settings","live encoder preview","minimized target hides border","timed and disabled borders","UI start/pause/resume/stop","live audio and device switch"]}))?)?;
             Ok(())
         }.await;
         if let Err(e)=result { let _=std::fs::write(path.join("ui-smoke-error.txt"),format!("{e:#}")); }

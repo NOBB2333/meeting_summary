@@ -1,12 +1,16 @@
 use anyhow::Result;
 use opencap_core::*;
-use std::{sync::Arc, time::Instant};
+#[cfg(windows)]
+use std::sync::Arc;
+use std::time::Instant;
+#[cfg(windows)]
 use windows::{
     Win32::{Foundation::*, Graphics::Gdi::*},
     core::PCWSTR,
 };
 
 /// Original procedural content. No Office files, fonts or third-party videos are bundled.
+#[cfg(windows)]
 struct Canvas {
     dc: HDC,
     bitmap: HBITMAP,
@@ -15,6 +19,7 @@ struct Canvas {
     width: u32,
     height: u32,
 }
+#[cfg(windows)]
 impl Canvas {
     fn new(width: u32, height: u32) -> Result<Self> {
         unsafe {
@@ -108,6 +113,7 @@ impl Canvas {
         }
     }
 }
+#[cfg(windows)]
 impl Drop for Canvas {
     fn drop(&mut self) {
         unsafe {
@@ -117,6 +123,8 @@ impl Drop for Canvas {
         }
     }
 }
+#[cfg(target_os = "macos")]
+use opencap_platform::FixtureCanvas as Canvas;
 pub fn run(
     mut config: RecordingConfig,
     scene: &str,

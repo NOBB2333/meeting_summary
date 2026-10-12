@@ -11,6 +11,7 @@ struct ClockState {
     epoch: Instant,
     paused_at: Option<Instant>,
     paused: Duration,
+    generation: u64,
 }
 impl Default for RecordingClock {
     fn default() -> Self {
@@ -23,10 +24,21 @@ impl RecordingClock {
             epoch: Instant::now(),
             paused_at: None,
             paused: Duration::ZERO,
+            generation: 0,
         })))
     }
     pub fn now_us(&self) -> i64 {
         self.at_us(Instant::now())
+    }
+    pub fn snapshot(&self) -> (i64, bool, u64) {
+        let s = self.0.lock();
+        let time = s
+            .paused_at
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(s.epoch)
+            .saturating_sub(s.paused)
+            .as_micros() as i64;
+        (time, s.paused_at.is_some(), s.generation)
     }
     pub fn at_us(&self, now: Instant) -> i64 {
         let s = self.0.lock();
@@ -52,6 +64,7 @@ impl RecordingClock {
         let mut s = self.0.lock();
         if let Some(p) = s.paused_at.take() {
             s.paused += now.saturating_duration_since(p);
+            s.generation += 1;
         }
     }
     pub fn is_paused(&self) -> bool {

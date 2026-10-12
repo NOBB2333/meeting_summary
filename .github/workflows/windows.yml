@@ -31,4 +31,4 @@ jobs:
         run: ./scripts/dev.ps1 test
       - name: Lint
         shell: pwsh
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: ./scripts/dev.ps1 lint -- -D warnings

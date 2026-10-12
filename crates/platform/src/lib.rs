@@ -2,7 +2,9 @@
 mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::*;
-#[cfg(not(windows))]
-compile_error!(
-    "OpenCap v0.1 implements Windows only. Add a platform backend before enabling this target."
-);
+#[cfg(target_os = "macos")]
+mod macos_impl;
+#[cfg(target_os = "macos")]
+pub use macos_impl::*;
+#[cfg(not(any(windows, target_os = "macos")))]
+compile_error!("OpenCap supports Windows and macOS. Linux needs a PipeWire backend.");
