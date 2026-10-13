@@ -7,6 +7,75 @@ pub fn output_dir() -> Option<PathBuf> {
     args.find(|arg| arg == "--ui-smoke")?;
     args.next().map(PathBuf::from)
 }
+/// Manual visual review shares the same isolated configuration as the harness.
+pub fn isolated_dir() -> Option<PathBuf> {
+    let mut args = std::env::args();
+    args.find(|arg| arg == "--ui-smoke" || arg == "--ui-preview")?;
+    args.next().map(PathBuf::from)
+}
+pub fn preview_size() -> Option<Size<Pixels>> {
+    let mut args = std::env::args();
+    args.find(|arg| arg == "--ui-size")?;
+    let value = args.next()?;
+    let (width, height) = value.split_once('x')?;
+    Some(size(
+        px(width.parse::<f32>().ok()?.max(620.)),
+        px(height.parse::<f32>().ok()?.max(480.)),
+    ))
+}
+pub fn preview_source() -> Option<PathBuf> {
+    isolated_dir()?;
+    let mut args = std::env::args();
+    args.find(|arg| arg == "--ui-open")?;
+    args.next().map(PathBuf::from)
+}
+
+/// Exercise the actual GPUI list, and record how many different rows it asked
+/// to lay out at each position. This is not an FPS or recording benchmark.
+pub fn scroll_benchmark(
+    main: WindowHandle<gpui::base::Root>,
+    entity: Entity<Recorder>,
+    cx: &mut App,
+) {
+    let Some(path) = isolated_dir().filter(|_| std::env::args().any(|a| a == "--ui-scroll-bench"))
+    else {
+        return;
+    };
+    cx.spawn(async move |cx| {
+        let result = async {
+            for _ in 0..20 {
+                if entity.read_with(cx, |r, cx| r.transcript_view.read(cx).state.viewport_bounds().size.height > px(0.)) { break; }
+                futures_timer::Delay::new(Duration::from_millis(100)).await;
+            }
+            let count = entity.read_with(cx, |r, _| r.transcript.segments.len());
+            anyhow::ensure!(count > 0, "load a transcript with --ui-open first");
+            let mut samples = Vec::new();
+            for width in [1200., 620.] {
+                main.update(cx, |_, window, _| window.resize(size(px(width), px(820.))))?;
+                futures_timer::Delay::new(Duration::from_millis(100)).await;
+                for index in [0, count / 4, count / 2, count.saturating_sub(1)] {
+                    entity.update(cx, |r, cx| {
+                        r.transcript_view.update(cx, |view, cx| {
+                            view.measured_rows.borrow_mut().clear();
+                            view.state.scroll_to(ListOffset { item_ix: index, offset_in_item: px(0.) });
+                            cx.notify();
+                        });
+                    });
+                    for _ in 0..10 {
+                        futures_timer::Delay::new(Duration::from_millis(100)).await;
+                        if entity.read_with(cx, |r, cx| !r.transcript_view.read(cx).measured_rows.borrow().is_empty()) { break; }
+                    }
+                    let measured = entity.read_with(cx, |r, cx| r.transcript_view.read(cx).measured_rows.borrow().len());
+                    anyhow::ensure!(measured > 0 && measured < count.min(100), "list laid out {measured}/{count} rows");
+                    samples.push(serde_json::json!({"width":width,"index":index,"distinct_rows_requested":measured}));
+                }
+            }
+            std::fs::write(path.join("scroll-benchmark.json"), serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"source_rows":count,"samples":samples,"definition":"distinct row layout requests per programmed scroll position; not FPS"}))?)?;
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        if let Err(error) = result { let _ = std::fs::write(path.join("scroll-benchmark-error.txt"), format!("{error:#}")); }
+    }).detach();
+}
 struct Sample {
     index: usize,
 }
@@ -151,12 +220,12 @@ pub fn run(
             shot(hwnd,path.join("02-previews")).await?;
             main.update(cx, |_,w,_| { w.zoom_window(); })?;
             futures_timer::Delay::new(Duration::from_millis(500)).await;
-            let wide_columns = main.update(cx,|_,w,_| widgets::target_columns(f32::from(w.viewport_size().width)-58.))?;
+            let wide_columns = main.update(cx,|_,w,_| widgets::target_columns(ui::content_width(f32::from(w.viewport_size().width))-40.))?;
             anyhow::ensure!(wide_columns > 2,"Maximized picker is still limited to two columns");
             shot(hwnd,path.join("02b-maximized-23-targets")).await?;
             main.update(cx,|_,w,_| { w.zoom_window(); })?;
             futures_timer::Delay::new(Duration::from_millis(300)).await;
-            main.update(cx,|_,w,cx| { w.resize(size(px(510.),px(700.))); recorder.update(cx,|r,cx| { r.page_scroll.set_offset(point(px(0.),px(0.))); cx.notify(); }); })?;
+            main.update(cx,|_,w,cx| { w.resize(size(px(620.),px(700.))); recorder.update(cx,|r,cx| { r.page_scroll.set_offset(point(px(0.),px(0.))); cx.notify(); }); })?;
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             shot(hwnd,path.join("02c-narrow-targets")).await?;
             recorder.update(cx,|r,cx| { r.page_scroll.scroll_to_bottom(); cx.notify(); });
@@ -165,7 +234,7 @@ pub fn run(
             recorder.update(cx,|r,cx| { r.targets_expanded=false; r.page_scroll.set_offset(point(px(0.),px(0.))); r.target_scroll.set_offset(point(px(0.),px(-170.))); cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             shot(hwnd,path.join("03-scrolled-previews")).await?;
-            main.update(cx,|_,w,cx| { w.resize(size(px(510.),px(450.))); recorder.update(cx,|r,cx| { r.close_targets(); r.settings=true; cx.notify(); }); })?;
+            main.update(cx,|_,w,cx| { w.resize(size(px(620.),px(480.))); recorder.update(cx,|r,cx| { r.close_targets(); r.settings=true; r.settings_page=settings::SettingsPage::Recording; cx.notify(); }); })?;
             futures_timer::Delay::new(Duration::from_millis(500)).await;
             recorder.update(cx,|r,cx| { r.page_scroll.scroll_to_bottom(); cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(300)).await;

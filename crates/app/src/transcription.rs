@@ -26,7 +26,12 @@ impl Recorder {
         // Start a new workspace only after recording preflight has succeeded.
         // A recording without ASR must not show the preceding meeting's words.
         self.transcript = Transcript::default();
+        self.transcript_dirty = true;
+        self.transcript_new_document = true;
         self.transcript_output = None;
+        self.transcription_clock = task::TaskClock::default();
+        self.speaker_clock = task::TaskClock::default();
+        self.transcription_progress = 0.;
         self.reset_minutes();
         if !self.config.realtime_transcription {
             self.transcription_status = "本次未开启实时转录；录制保存后可在会议文件中补转".into();
@@ -47,6 +52,7 @@ impl Recorder {
         ) {
             Ok(asr) => {
                 let sender = asr.audio_sender();
+                self.transcription_clock.start();
                 self.asr = Some(asr);
                 self.asr_live = true;
                 self.transcription_status = "正在启动实时识别…".into();
@@ -64,6 +70,7 @@ impl Recorder {
         }
         let (tx, rx) = crossbeam_channel::unbounded();
         let revision = self.config.transcription_context_revision;
+        self.transcription_clock.start();
         self.preparing_model = Some(rx);
         self.transcription_status = "正在下载实时模型…".into();
         std::thread::spawn(move || {
@@ -135,6 +142,10 @@ impl Recorder {
                     self.transcript_output =
                         Some(source.with_file_name(name.trim_end_matches(".transcript.json")));
                     self.transcript = transcript;
+                    self.transcript_dirty = true;
+                    self.transcript_new_document = true;
+                    self.transcription_clock = task::TaskClock::default();
+                    self.speaker_clock = task::TaskClock::default();
                     self.reset_minutes();
                     self.transcription_tab = true;
                     self.settings = false;
@@ -178,9 +189,13 @@ impl Recorder {
             self.config.transcription_context_revision,
         ) {
             Ok(asr) => {
+                self.transcription_clock.start();
+                self.speaker_clock = task::TaskClock::default();
                 self.asr = Some(asr);
                 self.asr_live = false;
                 self.transcript = Transcript::default();
+                self.transcript_dirty = true;
+                self.transcript_new_document = true;
                 self.transcript_output = Some(output);
                 self.reset_minutes();
                 // Re-transcribing a recording must retain previous AI versions.
@@ -214,6 +229,7 @@ impl Recorder {
                 PrepareEvent::Progress(s) => self.transcription_status = s,
                 PrepareEvent::Done(result) => {
                     self.preparing_model = None;
+                    self.transcription_clock.finish();
                     self.transcription_status = match result {
                         Ok(_) => "实时模型已就绪；开启声音后开始录制即可看到文字".into(),
                         Err(e) => format!("下载失败，可重试：{e:#}"),
@@ -231,10 +247,12 @@ impl Recorder {
             match event {
                 AsrEvent::Status(s) => self.transcription_status = s,
                 AsrEvent::Segment(s) => {
-                    self.transcript.apply(s);
-                    self.transcript_scroll.scroll_to_bottom();
+                    self.transcript_dirty |= self.transcript.apply(s);
                 }
-                AsrEvent::Progress(p) => self.transcription_progress = p,
+                AsrEvent::Progress(p) => {
+                    self.transcription_progress = p;
+                    self.transcription_clock.progress(p);
+                }
                 AsrEvent::Gap(start, end) => {
                     self.transcription_status = format!(
                         "实时识别积压，{}–{} 将从保存文件补转",
@@ -243,6 +261,7 @@ impl Recorder {
                     )
                 }
                 AsrEvent::Finished(t) => {
+                    self.transcription_clock.finish();
                     if !t.cancelled && !t.gaps.is_empty() {
                         self.pending_backfill = t.source.clone().filter(|p| p.exists());
                     }
@@ -255,10 +274,12 @@ impl Recorder {
                     }
                     .into();
                     self.transcript = t;
+                    self.transcript_dirty = true;
                     self.transcription_progress = 1.0;
                     self.remember_meeting();
                 }
                 AsrEvent::Error(e) => {
+                    self.transcription_clock.finish();
                     self.transcription_status = format!("转录错误，录制文件保留：{e}")
                 }
             }
@@ -282,6 +303,7 @@ impl Recorder {
             })
         {
             self.summary_task = None;
+            self.ai_clock.finish();
             self.ai.progress = None;
             changed = true;
             match result {
@@ -306,12 +328,14 @@ impl Recorder {
             })
         {
             self.speaker_task = None;
+            self.speaker_clock.finish();
             self.ai.progress = None;
             changed = true;
             match result {
                 Ok(t) => {
-                    let speakers = t.speaker_turns.iter().map(|s| s.speaker).max().unwrap_or(0);
+                    let speakers = t.speaker_count();
                     self.transcript = t;
+                    self.transcript_dirty = true;
                     self.remember_meeting();
                     self.transcription_status = format!(
                         "分为 {speakers} 个说话人组，请核对（自动人数可能偏多，可填写已知人数重试）；编号仅适用于本场会议，多人交替的句子会标注歧义。可重新生成纪要。"
@@ -333,42 +357,6 @@ impl Recorder {
             }
         }
         changed
-    }
-    pub(super) fn transcript_lines(&self) -> Div {
-        let start = if self.transcript.complete {
-            0
-        } else {
-            self.transcript.segments.len().saturating_sub(40)
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(self.transcript.segments[start..].iter().map(|s| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(label(format!(
-                        "{}  ·  {}  ·  {}",
-                        self.transcript.speaker_label(s.start_ms, s.end_ms),
-                        opencap_asr::timestamp(s.start_ms, '.'),
-                        if s.finalized {
-                            "已确认"
-                        } else {
-                            "识别中 · 后续语音可修正"
-                        }
-                    )))
-                    .child(
-                        div()
-                            .text_base()
-                            .text_color(rgb(if s.finalized { 0xeceef1 } else { 0x8cceee }))
-                            .child(s.text.clone()),
-                    )
-            }))
-            .when(self.transcript.segments.is_empty(), |d| {
-                d.child(label("开启系统声音或麦克风后开始录制，或者导入已有文件。"))
-            })
     }
     pub(super) fn start_speakers(&mut self, cx: &App) {
         if self.active() || self.transcription_busy() || !self.transcript.complete {
@@ -402,16 +390,19 @@ impl Recorder {
         self.speaker_cancelled = cancelled.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (progress_tx, progress_rx) = crossbeam_channel::unbounded();
+        self.speaker_clock.start();
+        let threads = self.speaker_threads;
         self.speaker_task = Some(rx);
         self.ai.progress = Some(progress_rx);
         self.transcription_status = "开始会后说话人分析；首次会下载本地模型…".into();
         std::thread::spawn(move || {
-            let _ = tx.send(opencap_asr::distinguish_speakers(
+            let _ = tx.send(opencap_asr::distinguish_speakers_with_threads(
                 transcript,
                 &model_root(),
                 &output,
                 count,
                 threshold,
+                threads,
                 &cancelled,
                 |s| {
                     let _ = progress_tx.send(s);
@@ -420,13 +411,7 @@ impl Recorder {
         });
     }
     pub(super) fn live_transcript_card(&self, cx: &Context<Self>) -> Div {
-        div()
-            .p_4()
-            .rounded_lg()
-            .bg(rgb(SURFACE))
-            .flex()
-            .flex_col()
-            .gap_2()
+        ui::card()
             .child(
                 div()
                     .flex()
@@ -449,105 +434,235 @@ impl Recorder {
                 self.transcript.segments.last().map(|s| {
                     div()
                         .text_base()
-                        .text_color(rgb(if s.finalized { 0xeceef1 } else { 0x8cceee }))
+                        .text_color(rgb(if s.finalized { TEXT } else { ACCENT }))
                         .child(s.text.clone())
                 }),
             ))
     }
-    pub(super) fn transcription_view(&self, cx: &Context<Self>) -> Div {
+    pub(super) fn transcription_view(&self, width: f32, cx: &Context<Self>) -> Div {
         let busy = self.transcription_busy();
         let ready = self.transcript.complete && !self.transcript.cancelled;
-        let speakers = self
-            .transcript
-            .speaker_turns
-            .iter()
-            .map(|s| s.speaker)
-            .max()
-            .unwrap_or(0);
-        let mut view = div().flex().flex_col().gap_4()
-            .child(workspace::heading("逐字稿", "语音识别原文，不经过 AI 改写。识别中的句子会随上下文修正。"))
-            .child(div().flex().flex_wrap().gap_2()
-                .child(button("import-transcription", "导入新的音频 / 视频", false).disabled(self.active() || busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(false,cx))))
-                .child(button("to-minutes", "下一步：生成 AI 纪要 →", true).disabled(!ready).on_click(cx.listener(|this,_,_,cx| { this.meeting_page=workspace::MeetingPage::Minutes; this.page_scroll.set_offset(point(px(0.),px(0.))); cx.notify(); })))
-                .when(self.asr.as_ref().is_some_and(|a| !a.finished()), |d| d.child(button("cancel-asr", "取消转录", false).danger().on_click(cx.listener(|this,_,_,cx| { if let Some(asr)=&mut this.asr { asr.cancel(); } cx.notify(); })))))
-            .child(div().p_3().rounded_lg().bg(rgb(SURFACE)).child(format!("{}{}",self.transcription_status,if self.transcription_progress > 0.0 && self.transcription_progress < 1.0 { format!(" · {:.0}%", self.transcription_progress*100.) } else { String::new() })))
-            .child(div().p_4().rounded_lg().bg(rgb(SURFACE)).h(px(360.)).child(widgets::scrollable("transcript-scroll",self.transcript_lines(),&self.transcript_scroll)))
-            .child(label(format!("{} 句；完成后显示完整逐字稿，识别中显示最近 40 句。也可打开纯文本或 Word。", self.transcript.segments.len())))
-            .child(div().p_4().rounded_lg().border_1().border_color(rgb(0x313640)).flex().flex_col().gap_3()
-                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(if speakers == 0 { "说话人：尚未分析".to_string() } else { format!("说话人：分为 {speakers} 组 · 请核对") }))
-                .child(label("先做本地分析，再生成按说话人整理的纪要。自动人数可能偏多，已知人数时建议填写；编号不等同于姓名，交替或重叠发言会标注歧义。"))
-                .child(div().flex().flex_wrap().gap_2().child(Input::new(&self.speaker_count).w(px(250.))).child(Input::new(&self.speaker_threshold).w(px(100.)))
-                    .child(button("distinguish-speakers", "分析 / 更新说话人", false).disabled(self.active() || busy || !ready).on_click(cx.listener(|this,_,_,cx| { this.start_speakers(cx); cx.notify(); }))))
-                .when(self.speaker_task.is_some(), |d| d.child(button("cancel-speakers", "取消说话人分析", false).danger().on_click(cx.listener(|this,_,_,cx| { this.speaker_cancelled.store(true,std::sync::atomic::Ordering::Relaxed); cx.notify(); })))));
+        let speakers = self.transcript.speaker_count();
+        let mut toolbar = div().flex().flex_wrap().items_center().gap_2();
         if let Some(base) = &self.transcript_output {
             let word = base.with_extension("transcript.docx");
             let plain = base.with_extension("transcript.txt");
             let srt = base.with_extension("srt");
-            view = div()
-                .flex()
-                .flex_col()
-                .gap_4()
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            button("export-transcript-word", "导出逐字稿 Word", true)
-                                .disabled(busy || !ready)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(base) = &this.transcript_output {
-                                        match this.transcript.save(base) {
-                                            Ok(()) => {
-                                                this.transcription_status =
-                                                    "逐字稿已保存，Word 保留原话、时间和说话人标签"
-                                                        .into();
-                                                let _ = opencap_platform::open_path(
-                                                    &base.with_extension("transcript.docx"),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                this.transcription_status =
-                                                    format!("逐字稿导出失败：{e}")
-                                            }
+            toolbar = toolbar.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        primary_button("export-transcript-word", "导出逐字稿 Word")
+                            .disabled(busy || !ready)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(base) = &this.transcript_output {
+                                    match this.transcript.save(base) {
+                                        Ok(()) => {
+                                            this.transcription_status =
+                                                "逐字稿已保存，Word 保留原话、时间和说话人标签"
+                                                    .into();
+                                            let _ = opencap_platform::open_path(
+                                                &base.with_extension("transcript.docx"),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            this.transcription_status =
+                                                format!("逐字稿导出失败：{e}")
                                         }
                                     }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            button("open-transcript-word", "打开逐字稿 Word", false)
-                                .disabled(!word.exists())
-                                .on_click(move |_, _, _| {
-                                    let _ = opencap_platform::open_path(&word);
-                                }),
-                        )
-                        .child(
-                            button("open-transcript", "打开纯文本 TXT", false)
-                                .disabled(!plain.exists())
-                                .on_click(move |_, _, _| {
-                                    let _ = opencap_platform::open_path(&plain);
-                                }),
-                        )
-                        .child(
-                            button("open-subtitles", "打开字幕 SRT", false)
-                                .ghost()
-                                .disabled(!srt.exists())
-                                .on_click(move |_, _, _| {
-                                    let _ = opencap_platform::open_path(&srt);
-                                }),
-                        ),
-                )
-                .child(view);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button("open-transcript-word", "打开逐字稿 Word", false)
+                            .disabled(!word.exists())
+                            .on_click(move |_, _, _| {
+                                let _ = opencap_platform::open_path(&word);
+                            }),
+                    )
+                    .child(
+                        button("open-transcript", "打开纯文本 TXT", false)
+                            .disabled(!plain.exists())
+                            .on_click(move |_, _, _| {
+                                let _ = opencap_platform::open_path(&plain);
+                            }),
+                    )
+                    .child(
+                        button("open-subtitles", "打开字幕 SRT", false)
+                            .ghost()
+                            .disabled(!srt.exists())
+                            .on_click(move |_, _, _| {
+                                let _ = opencap_platform::open_path(&srt);
+                            }),
+                    ),
+            );
         }
-        view
+
+        toolbar =
+            toolbar.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        primary_button("to-minutes", "生成 AI 纪要")
+                            .disabled(!ready || self.active() || busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.meeting_page = workspace::MeetingPage::Minutes;
+                                this.page_scroll.set_offset(point(px(0.), px(0.)));
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.asr.as_ref().is_some_and(|a| !a.finished()), |d| {
+                        d.child(button("cancel-asr", "取消转录", false).danger().on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(asr) = &mut this.asr {
+                                    asr.cancel();
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                    }),
+            );
+        let document = ui::card()
+            .flex_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(ui::section_title(
+                        "逐字稿",
+                        "语音识别原文，保留时间与说话人标记",
+                    ))
+                    .child(ui::badge(
+                        format!("{} 句", self.transcript.segments.len()),
+                        MUTED,
+                        BG,
+                    )),
+            )
+            .child(label(format!(
+                "{}{}",
+                self.transcription_status,
+                if self.transcription_progress > 0.0 && self.transcription_progress < 1.0 {
+                    format!(" · {:.0}%", self.transcription_progress * 100.)
+                } else {
+                    String::new()
+                }
+            )))
+            .when(
+                self.transcription_clock.has_run() || self.transcript.processing_seconds.is_some(),
+                |d| {
+                    let elapsed = if self.transcription_clock.has_run() {
+                        self.transcription_clock.elapsed()
+                    } else {
+                        task::saved_duration(self.transcript.processing_seconds)
+                    };
+                    d.child(label(format!(
+                        "转录已用时 {}",
+                        task::duration_text(elapsed)
+                    )))
+                },
+            )
+            .child(div().h(px(440.)).child(self.transcript_view.clone()));
+        let speaker_panel = ui::card()
+            .child(ui::section_title("说话人分析", "会后在本机完成，可选步骤"))
+            .child(ui::badge(
+                if speakers == 0 {
+                    "尚未分析".into()
+                } else {
+                    format!("已识别 {speakers} 组")
+                },
+                ACCENT,
+                SOFT,
+            ))
+            .child(label(
+                "已知人数时填写人数；0 表示自动判断。编号不代表姓名，结果需要核对。",
+            ))
+            .child(label("实际参会人数 · 已知时请填写"))
+            .child(Input::new(&self.speaker_count).w_full().disabled(busy))
+            .child(label("自动模式合并阈值 · 人数已知时无需调整"))
+            .child(Input::new(&self.speaker_threshold).w_full().disabled(busy))
+            .child(label("CPU 使用方式"))
+            .child(
+                div().flex().flex_wrap().gap_2().children(
+                    [(1, "省资源"), (2, "双线程"), (4, "四线程")]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (threads, title))| {
+                            button(
+                                ("speaker-threads", i),
+                                title,
+                                self.speaker_threads == threads,
+                            )
+                            .disabled(busy)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.speaker_threads = threads;
+                                    cx.notify();
+                                },
+                            ))
+                        }),
+                ),
+            )
+            .when(
+                self.speaker_clock.has_run() || self.transcript.speaker_analysis_seconds.is_some(),
+                |d| {
+                    let elapsed = if self.speaker_clock.has_run() {
+                        self.speaker_clock.elapsed()
+                    } else {
+                        task::saved_duration(self.transcript.speaker_analysis_seconds)
+                    };
+                    d.child(label(format!(
+                        "分析已用时 {}",
+                        task::duration_text(elapsed)
+                    )))
+                },
+            )
+            .child(
+                button("distinguish-speakers", "分析 / 更新说话人", false)
+                    .w_full()
+                    .disabled(self.active() || busy || !ready)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_speakers(cx);
+                        cx.notify();
+                    })),
+            )
+            .when(self.speaker_task.is_some(), |d| {
+                d.child(
+                    button("cancel-speakers", "取消分析", false)
+                        .danger()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.speaker_cancelled
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(label("分析完成后，生成的纪要可按说话人组织。"));
+        div().flex().flex_col().gap_4().child(toolbar).child(
+            div()
+                .flex()
+                .items_start()
+                .gap_5()
+                .when(!ui::two_columns(width), |d| d.flex_col())
+                .child(document)
+                .child(
+                    speaker_panel.when(ui::two_columns(width), |d| d.w(px(280.)).flex_shrink_0()),
+                ),
+        )
     }
     pub(super) fn transcription_settings(&self, cx: &Context<Self>) -> Div {
         let busy = self.active() || self.transcription_busy();
         let ready = ModelKind::Streaming.ready(&model_root())
             && (!self.config.transcription_context_revision
                 || ModelKind::Offline.ready(&model_root()));
-        div().p_4().rounded_lg().bg(rgb(SURFACE)).flex().flex_col().gap_3()
+        ui::card()
             .child(div().text_lg().child("本地语音转录"))
             .child(label("实时转录会自动保存逐字稿，AI 纪要采用手动生成。音频与视频使用同一套转录和导出流程。"))
             .child(div().flex().flex_wrap().gap_2()
@@ -555,7 +670,7 @@ impl Recorder {
                 .child(button("context-revision", if self.config.transcription_context_revision { "上下文校正：开启" } else { "上下文校正：关闭" }, self.config.transcription_context_revision).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_context_revision = !this.config.transcription_context_revision; this.save(); cx.notify(); })))
                 .child(button("download-asr", if ready { "实时模型已就绪" } else { "下载实时模型" }, false).disabled(busy || ready).on_click(cx.listener(|this,_,_,cx| { this.prepare_streaming_model(); cx.notify(); }))))
             .child(label("上下文校正每约 5 秒复核一次，关闭可降低 CPU 和内存。文件转录会在首次使用时下载模型。"))
-            .child(div().flex().gap_2().child(Input::new(&self.hotwords_input).flex_1()).child(button("apply-hotwords", "保存术语", false).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_hotwords=this.hotwords_input.read(cx).value().to_string(); this.save(); cx.notify(); }))))
+            .child(div().flex().flex_wrap().gap_2().child(Input::new(&self.hotwords_input).flex_1()).child(primary_button("apply-hotwords", "保存术语").disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_hotwords=this.hotwords_input.read(cx).value().to_string(); this.save(); cx.notify(); }))))
             .child(button("stream-file-demo", "试播文件，观察实时修正", false).ghost().disabled(busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(true,cx))))
     }
 }

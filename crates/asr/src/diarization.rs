@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const SEGMENTATION: &str = "sherpa-onnx-pyannote-segmentation-3-0";
 const EMBEDDING: &str = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
@@ -86,14 +86,38 @@ pub fn prepare_speakers(root: &Path, mut status: impl FnMut(String)) -> Result<P
 }
 /// Optional, post-record CPU pass. Speaker labels are local to one meeting.
 pub fn distinguish_speakers(
-    mut transcript: Transcript,
+    transcript: Transcript,
     root: &Path,
     output: &Path,
     num_speakers: u32,
     threshold: f32,
     cancelled: &AtomicBool,
+    status: impl FnMut(String),
+) -> Result<Transcript> {
+    distinguish_speakers_with_threads(
+        transcript,
+        root,
+        output,
+        num_speakers,
+        threshold,
+        2,
+        cancelled,
+        status,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn distinguish_speakers_with_threads(
+    mut transcript: Transcript,
+    root: &Path,
+    output: &Path,
+    num_speakers: u32,
+    threshold: f32,
+    threads: usize,
+    cancelled: &AtomicBool,
     mut status: impl FnMut(String),
 ) -> Result<Transcript> {
+    let began = Instant::now();
     anyhow::ensure!(transcript.complete, "请先完整完成转录");
     anyhow::ensure!(num_speakers <= 20, "人数应为 0（自动）或 1–20");
     anyhow::ensure!(
@@ -111,6 +135,11 @@ pub fn distinguish_speakers(
     config.segmentation.pyannote.model =
         Some(model.join("model.int8.onnx").to_string_lossy().into());
     config.embedding.model = Some(model.join(EMBEDDING).to_string_lossy().into());
+    let threads = threads
+        .clamp(1, 4)
+        .min(std::thread::available_parallelism().map_or(1, usize::from));
+    config.segmentation.num_threads = threads as i32;
+    config.embedding.num_threads = threads as i32;
     config.clustering.num_clusters = if num_speakers == 0 {
         -1
     } else {
@@ -138,7 +167,10 @@ pub fn distinguish_speakers(
         Ok(())
     })?;
     anyhow::ensure!(!samples.is_empty(), "音频没有采样");
-    status("本机 CPU 正在区分说话人…".into());
+    status(format!(
+        "本机 CPU 正在区分说话人 · {threads} 线程 · 音频 {:.1} 分钟；当前模型不提供总进度",
+        samples.len() as f64 / 16000. / 60.
+    ));
     let result = diarizer.process(&samples).context("说话人分析失败")?;
     anyhow::ensure!(
         !cancelled.load(Ordering::Relaxed),
@@ -163,6 +195,7 @@ pub fn distinguish_speakers(
         !transcript.speaker_turns.is_empty(),
         "未检测到可区分的说话人；请检查音轨和声音大小"
     );
+    transcript.speaker_analysis_seconds = Some(began.elapsed().as_secs_f64());
     transcript.save(output)?;
     Ok(transcript)
 }

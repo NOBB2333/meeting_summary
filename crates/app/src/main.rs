@@ -1,13 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 extern crate gpui_kit as gpui;
 mod ai;
+mod recording;
+mod settings;
+mod shell;
 #[cfg(feature = "ui-smoke")]
 mod smoke;
+mod task;
+mod transcript_view;
 mod transcription;
+mod ui;
 mod widgets;
 mod workspace;
 use gpui::component::{
-    Disableable, Selectable, Sizable,
+    Disableable, Selectable,
     button::{Button, ButtonVariants},
     input::InputState,
 };
@@ -18,10 +24,7 @@ use opencap_platform::{DesktopControls, ShellEvent};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{collections::HashMap, path::PathBuf, rc::Rc, time::Duration};
 
-const BG: u32 = 0x121316;
-const SURFACE: u32 = 0x202226;
-const MUTED: u32 = 0x92979e;
-const RED: u32 = 0xee5d5d;
+use ui::{ACCENT, BG, BORDER, MUTED, RED, SOFT, SURFACE, TEXT};
 
 struct Recorder {
     config: RecordingConfig,
@@ -36,7 +39,9 @@ struct Recorder {
     mode: usize,
     selecting: Option<opencap_platform::RegionSelection>,
     message: String,
+    message_expanded: bool,
     settings: bool,
+    settings_page: settings::SettingsPage,
     choosing_target: bool,
     quit_pending: bool,
     recoverables: Vec<PathBuf>,
@@ -62,7 +67,14 @@ struct Recorder {
     transcript_output: Option<PathBuf>,
     transcription_status: String,
     transcription_progress: f64,
-    transcript_scroll: ScrollHandle,
+    transcription_clock: task::TaskClock,
+    speaker_clock: task::TaskClock,
+    ai_clock: task::TaskClock,
+    speaker_threads: usize,
+    transcript_view: Entity<transcript_view::TranscriptView>,
+    transcript_dirty: bool,
+    transcript_new_document: bool,
+    task_display_second: u64,
     preparing_model: Option<crossbeam_channel::Receiver<transcription::PrepareEvent>>,
     pending_backfill: Option<PathBuf>,
     summary_task: Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::MinutesHistory>>>,
@@ -99,14 +111,13 @@ fn native_handle(window: &Window) -> isize {
     }
 }
 fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Button {
-    Button::new(id)
-        .label(label)
-        .selected(active)
-        .when(!active, |b| b.outline())
-        .when(active, |b| b.primary())
+    ui::button(id, label, active)
+}
+fn primary_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    ui::primary_button(id, label)
 }
 fn label(text: impl Into<SharedString>) -> Div {
-    div().text_xs().text_color(rgb(MUTED)).child(text.into())
+    ui::label(text)
 }
 /// Map a linear peak onto a bar width with a -60 dBFS floor, so a quiet
 /// noise floor reads as empty instead of a permanently half-full bar.
@@ -134,7 +145,7 @@ impl Recorder {
             config.target = CaptureTarget::Window(0);
         }
         #[cfg(feature = "ui-smoke")]
-        if let Some(path) = smoke::output_dir() {
+        if let Some(path) = smoke::isolated_dir() {
             config = RecordingConfig {
                 output_dir: path.join("recording"),
                 encoder: Some("libx264".into()),
@@ -212,7 +223,7 @@ impl Recorder {
         let meetings = workspace::discover(&config.output_dir);
         let notes = cx.new(|cx| {
             gpui::component::input::TextareaState::new(window, cx)
-                .placeholder("记录自己的备注、补充信息或会后想法。点击保存后生成独立的笔记文档。")
+                .placeholder("记录自己的备注、补充信息或会后想法，内容自动保存到本机。")
                 .auto_grow(10, 20)
         });
         Self {
@@ -228,7 +239,9 @@ impl Recorder {
             mode,
             selecting: None,
             message,
+            message_expanded: false,
             settings: false,
+            settings_page: settings::SettingsPage::Ai,
             choosing_target: false,
             quit_pending: false,
             recoverables,
@@ -254,7 +267,14 @@ impl Recorder {
             transcript_output: None,
             transcription_status: "等待录制或导入文件".into(),
             transcription_progress: 0.0,
-            transcript_scroll: ScrollHandle::new(),
+            transcription_clock: task::TaskClock::default(),
+            speaker_clock: task::TaskClock::default(),
+            ai_clock: task::TaskClock::default(),
+            speaker_threads: 2,
+            transcript_view: cx.new(|_| transcript_view::TranscriptView::new()),
+            transcript_dirty: true,
+            transcript_new_document: true,
+            task_display_second: 0,
             preparing_model: None,
             pending_backfill: None,
             summary_task: None,
@@ -280,7 +300,7 @@ impl Recorder {
     }
     fn save(&mut self) {
         #[cfg(feature = "ui-smoke")]
-        if smoke::output_dir().is_some() {
+        if smoke::isolated_dir().is_some() {
             return;
         }
         if let Err(e) = self.config.save(&config_path()) {
@@ -366,6 +386,17 @@ impl Recorder {
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
         let mut needs_render = false;
+        let task_second = if self.summary_task.is_some() {
+            self.ai_clock.elapsed().as_secs()
+        } else if self.speaker_task.is_some() {
+            self.speaker_clock.elapsed().as_secs()
+        } else {
+            self.transcription_clock.elapsed().as_secs()
+        };
+        if self.transcription_busy() && task_second != self.task_display_second {
+            self.task_display_second = task_second;
+            needs_render = true;
+        }
         self.persist_notes(cx);
         needs_render |= self.poll_transcription();
         let events: Vec<_> = self
@@ -401,6 +432,7 @@ impl Recorder {
             session.enable_preview(
                 self.config.show_recording_preview
                     && !self.settings
+                    && !self.transcription_tab
                     && opencap_platform::native_window_visible(self.hwnd),
             );
             if let Some(preview) = session.take_preview() {
@@ -829,1056 +861,6 @@ fn find_recoverables(dir: &std::path::Path) -> Vec<PathBuf> {
         .collect()
 }
 
-impl Render for Recorder {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content_width = (f32::from(window.viewport_size().width) - 58.).max(1.);
-        self.sync_notes(window, cx);
-        let active = self.active();
-        let status = match self.stats.state {
-            RecordingState::Idle => "准备就绪",
-            RecordingState::Starting => "正在准备编码器…",
-            RecordingState::Recording => "正在录制",
-            RecordingState::Paused => "已暂停",
-            RecordingState::Stopping => "正在保存…",
-            RecordingState::Finished => "录制已保存",
-            RecordingState::Failed => "录制未完成",
-        };
-        let target = if let CaptureTarget::Region { rect, .. } = self.config.target {
-            format!(
-                "区域 {} × {} · ({}, {})",
-                rect.width, rect.height, rect.x, rect.y
-            )
-        } else {
-            self.targets
-                .iter()
-                .find(|t| same_target(&t.target, &self.config.target))
-                .map(|t| format!("{}  ·  {} × {}", t.name, t.width, t.height))
-                .unwrap_or_else(|| "点击选择录制目标".into())
-        };
-        let mut root = div()
-            .w_full()
-            .min_h_full()
-            .flex_shrink_0()
-            .bg(rgb(BG))
-            .text_color(rgb(0xeceef1))
-            .font_family(UI_FONT)
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_5();
-        if self.settings {
-            root = root.child(self.settings_view(cx));
-        } else if self.transcription_tab {
-            root = root.child(self.meeting_workspace(cx));
-        } else {
-            root = root
-                .child(workspace::heading(
-                    "开始录制",
-                    "选择画面和声音来源。实时文字自动保存；录制后到会议文件中生成 AI 纪要。",
-                ))
-                .child(
-                    div().flex().gap_2().children(
-                        ["全屏", "窗口", "区域"]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, text)| {
-                                button(("mode", i), text, self.mode == i).on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.change_mode(i);
-                                        cx.notify();
-                                    },
-                                ))
-                            }),
-                    ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(label("录制目标 · 点击切换"))
-                        .child(
-                            button("target", target, false)
-                                .min_w(px(0.))
-                                .overflow_hidden()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.choose_target();
-                                    cx.notify();
-                                })),
-                        )
-                        .when(self.choosing_target, |d| {
-                            d.child(self.target_picker(content_width, cx))
-                        })
-                        .when(self.mode == 2, |d| {
-                            d.child(
-                                button(
-                                    "region",
-                                    if matches!(self.config.target, CaptureTarget::Region { .. }) {
-                                        "调整区域 · 移动 / 缩放"
-                                    } else {
-                                        "框选录制区域"
-                                    },
-                                    false,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.pick_region();
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                        }),
-                )
-                .when(!self.choosing_target, |d| {
-                    d.child(
-                        div()
-                            .flex()
-                            .gap_5()
-                            .when(content_width < 780., |d| d.flex_col())
-                            .child(self.recording_preview(cx).flex_1().min_w(px(0.)))
-                            .child(
-                                self.recording_options(cx)
-                                    .when(content_width >= 780., |d| d.w(px(300.)).flex_shrink_0()),
-                            ),
-                    )
-                });
-            root = root.child(self.live_transcript_card(cx));
-        }
-        let mut controls = div()
-            .w_full()
-            .flex_shrink_0()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .bg(rgb(BG))
-            .text_color(rgb(0xeceef1))
-            .font_family(UI_FONT)
-            .border_t_1()
-            .border_color(rgb(0x303338))
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .gap_2()
-                    .py_2()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_family(MONO_FONT)
-                            .child(time_text(self.stats.duration_seconds)),
-                    )
-                    .child(label(format!(
-                        "{:.1} FPS     {:.0} kbps     {:.1} MB",
-                        self.stats.fps,
-                        self.stats.bitrate_kbps,
-                        self.stats.bytes as f64 / 1_000_000.0
-                    ))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .items_center()
-                    .child(
-                        button(
-                            "record",
-                            if active {
-                                "■  停止录制"
-                            } else {
-                                "●  开始录制"
-                            },
-                            true,
-                        )
-                        .bg(rgb(RED))
-                        .text_color(rgb(0xffffff))
-                        .large()
-                        .disabled(!active && self.transcription_busy())
-                        .flex_1()
-                        .text_center()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.mode == 2
-                                && !matches!(this.config.target, CaptureTarget::Region { .. })
-                            {
-                                this.pick_region();
-                            } else {
-                                this.toggle_record(cx);
-                            }
-                        })),
-                    )
-                    .when(active, |d| {
-                        d.child(
-                            button(
-                                "pause",
-                                if self.stats.state == RecordingState::Paused {
-                                    "继续"
-                                } else {
-                                    "暂停"
-                                },
-                                false,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_pause();
-                                cx.notify();
-                            })),
-                        )
-                    }),
-            )
-            .child(label(format!(
-                "{}  开始/停止    {}  暂停/继续",
-                self.config.hotkey_record, self.config.hotkey_pause
-            )));
-        let message = self
-            .stats
-            .error
-            .clone()
-            .or_else(|| self.stats.warnings.last().cloned())
-            .unwrap_or_else(|| self.message.clone());
-        if !message.is_empty() {
-            #[cfg(target_os = "macos")]
-            if message.contains("权限") || message.contains("ScreenCaptureKit") {
-                let microphone =
-                    message.contains("麦克风") && !message.contains("ScreenCaptureKit");
-                controls = controls.child(
-                    div().flex().gap_2()
-                        .child(button("privacy-settings", "打开权限设置", false).on_click(
-                            cx.listener(move |_, _, _, cx| {
-                                cx.open_url(if microphone {
-                                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-                                } else {
-                                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
-                                });
-                            }),
-                        ))
-                        .child(button("refresh-permissions", "刷新录制目标", false).on_click(
-                            cx.listener(|this, _, _, cx| { this.refresh_targets(); cx.notify(); }),
-                        )),
-                );
-            }
-            controls = controls.child(div().text_xs().text_color(rgb(0xffb5a9)).child(message));
-        }
-        if !self.recoverables.is_empty() {
-            root = root.child(
-                button(
-                    "recover",
-                    format!("恢复未完成录制（{}）", self.recoverables.len()),
-                    false,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.recover();
-                    cx.notify();
-                })),
-            );
-        }
-        controls = controls.child(
-            div()
-                .flex()
-                .justify_between()
-                .items_center()
-                .mt_auto()
-                .gap_2()
-                .child(
-                    button("folder", "打开录制目录", false).on_click(cx.listener(
-                        |this, _, _, _| {
-                            let _ = std::fs::create_dir_all(&this.config.output_dir);
-                            if let Err(e) = opencap_platform::open_path(&this.config.output_dir) {
-                                this.message = e.to_string();
-                            }
-                        },
-                    )),
-                )
-                .when(self.stats.state == RecordingState::Finished, |d| {
-                    d.child(button("play-last", "播放录制", false).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            if let Some(path) = &this.stats.output
-                                && let Err(e) = opencap_platform::open_path(path)
-                            {
-                                this.message = e.to_string();
-                                cx.notify();
-                            }
-                        },
-                    )))
-                })
-                .child(
-                    button("quit", "退出", false).on_click(cx.listener(|this, _, _, cx| {
-                        this.quit_pending = true;
-                        if let Some(s) = &this.session {
-                            s.command(RecordingCommand::Stop);
-                        }
-                        if !this.active() {
-                            cx.quit();
-                        }
-                    })),
-                ),
-        );
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(BG))
-            .text_color(rgb(0xeceef1))
-            .font_family(UI_FONT)
-            .child(self.workspace_header(status, cx))
-            .child(div().flex_1().min_h(px(0.)).child(widgets::scrollable(
-                "page-scroll",
-                root,
-                &self.page_scroll,
-            )))
-            .when(!self.settings && !self.transcription_tab, |d| {
-                d.child(controls)
-            })
-            .when(active && (self.settings || self.transcription_tab), |d| {
-                d.child(self.active_recording_bar(cx))
-            })
-    }
-}
-impl Recorder {
-    fn target_picker(&self, width: f32, cx: &Context<Self>) -> Div {
-        let targets: Vec<_> = self
-            .targets
-            .iter()
-            .filter(|t| {
-                if self.mode == 1 {
-                    matches!(t.target, CaptureTarget::Window(_))
-                } else {
-                    matches!(t.target, CaptureTarget::Monitor(_))
-                }
-            })
-            .collect();
-        let mut content = div().w_full().flex().flex_col().gap_3();
-        let columns = widgets::target_columns(width - if self.targets_expanded { 0. } else { 10. });
-        for (row, pair) in targets.chunks(columns).enumerate() {
-            let mut line = div().flex().gap_3().w_full().flex_shrink_0();
-            for (column, t) in pair.iter().enumerate() {
-                let target = t.target.clone();
-                let selected = same_target(&target, &self.config.target);
-                let preview = if let CaptureTarget::Window(hwnd) = target {
-                    self.previews.get(&hwnd).cloned()
-                } else {
-                    None
-                };
-                let caption = if preview.as_ref().is_some_and(|p| p.minimized()) {
-                    "已最小化 · 可能显示最后画面"
-                } else if matches!(target, CaptureTarget::Window(_)) && preview.is_none() {
-                    "此窗口暂不提供预览"
-                } else if matches!(target, CaptureTarget::Window(_)) {
-                    if cfg!(target_os = "macos") {
-                        "窗口快照 · 刷新窗口可更新"
-                    } else {
-                        "实时窗口预览"
-                    }
-                } else {
-                    "整个显示器"
-                };
-                line = line.child(
-                    div()
-                        .id(("target-card", row * columns + column))
-                        .flex_1()
-                        .min_w(px(0.))
-                        .p_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(if selected { RED } else { 0x34373d }))
-                        .bg(rgb(SURFACE))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x2b2e33)))
-                        .child(
-                            div()
-                                .h(px(120.))
-                                .w_full()
-                                .overflow_hidden()
-                                .bg(rgb(0x090a0c))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when_some(preview, |d, p| d.child(widgets::preview_view(p)))
-                                .when(matches!(target, CaptureTarget::Monitor(_)), |d| {
-                                    d.child(
-                                        div()
-                                            .text_2xl()
-                                            .child(format!("{} × {}", t.width, t.height)),
-                                    )
-                                }),
-                        )
-                        .child(div().mt_2().text_sm().truncate().child(format!(
-                            "{}{}",
-                            if selected { "✓ " } else { "" },
-                            t.name
-                        )))
-                        .child(label(caption).truncate())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.active() {
-                                this.config.target = target.clone();
-                                this.close_targets();
-                                this.save();
-                            }
-                            cx.notify();
-                        })),
-                );
-            }
-            for _ in pair.len()..columns {
-                line = line.child(div().flex_1());
-            }
-            content = content.child(line);
-        }
-        if targets.is_empty() {
-            content = content.child(label("没有可录制窗口，请打开应用后刷新。"));
-        }
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(label(format!(
-                        "{} 个目标 · 每行 {} 个",
-                        targets.len(),
-                        columns
-                    )))
-                    .child(
-                        button(
-                            "expand-targets",
-                            if self.targets_expanded {
-                                "收起列表"
-                            } else {
-                                "展开全部"
-                            },
-                            self.targets_expanded,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.targets_expanded = !this.targets_expanded;
-                            this.target_scroll.set_offset(point(px(0.), px(0.)));
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        button("refresh-targets", "刷新窗口", false).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.refresh_targets();
-                                cx.notify();
-                            },
-                        )),
-                    ),
-            )
-            .child(if self.targets_expanded {
-                content
-            } else {
-                div()
-                    .h(px(if self.mode == 1 { 345. } else { 195. }))
-                    .flex_shrink_0()
-                    .child(widgets::scrollable(
-                        "target-list",
-                        content,
-                        &self.target_scroll,
-                    ))
-            })
-    }
-    fn recording_options(&self, cx: &Context<Self>) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .gap_3()
-                    .child(label("声音来源 · 录制中可随时切换"))
-                    .when(!self.active(), |d| {
-                        d.child(
-                            button(
-                                "monitor-levels-inline",
-                                if self.config.monitor_levels {
-                                    "电平检测：开"
-                                } else {
-                                    "电平检测：关"
-                                },
-                                self.config.monitor_levels,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.config.monitor_levels = !this.config.monitor_levels;
-                                this.monitor = None;
-                                this.monitor_peaks = (0.0, 0.0);
-                                this.save();
-                                cx.notify();
-                            })),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(self.audio_row(AudioKind::System, cx))
-                    .child(self.audio_row(AudioKind::Microphone, cx)),
-            )
-            .when(!self.active() && !self.config.monitor_levels, |d| {
-                d.child(label(
-                    "打开“电平检测”可在未录制时确认这两路是否真的有声音。",
-                ))
-            })
-            .child(label("画质与体积"))
-            .child(
-                div().flex().gap_2().children(
-                    [
-                        (Preset::Space, "省空间"),
-                        (Preset::Balanced, "平衡"),
-                        (Preset::Quality, "高质量"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (p, t))| {
-                        button(("preset", i), t, self.config.preset == p).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                if !this.active() {
-                                    this.config.apply_preset(p);
-                                    this.save();
-                                }
-                                cx.notify();
-                            },
-                        ))
-                    }),
-                ),
-            )
-            .child(label("省空间适合文档和会议；画面越动态，文件越大。"))
-    }
-    fn recording_preview(&self, cx: &Context<Self>) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(label(if self.stats.state == RecordingState::Paused {
-                        "录制预览 · 已暂停，保留最后画面"
-                    } else if self.active() {
-                        "录制预览 · 正在写入的画面"
-                    } else if self.preview_image.is_some() {
-                        "录制预览 · 最后一帧"
-                    } else {
-                        "录制预览"
-                    }))
-                    .child(
-                        button(
-                            "toggle-preview",
-                            if self.config.show_recording_preview {
-                                "收起预览"
-                            } else {
-                                "显示预览"
-                            },
-                            false,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.config.show_recording_preview =
-                                !this.config.show_recording_preview;
-                            if !this.config.show_recording_preview
-                                && let Some(image) = this.preview_image.take()
-                            {
-                                cx.drop_image(image, None);
-                            }
-                            this.save();
-                            cx.notify();
-                        })),
-                    ),
-            )
-            .when(self.config.show_recording_preview, |d| {
-                d.child(
-                    div()
-                        .w_full()
-                        .h(px(240.))
-                        .bg(rgb(0x090a0c))
-                        .overflow_hidden()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when_some(self.preview_image.clone(), |d, image| {
-                            d.child(img(image).size_full().object_fit(ObjectFit::Contain))
-                        })
-                        .when(self.preview_image.is_none(), |d| {
-                            d.child(label(if self.active() {
-                                "等待首帧…"
-                            } else {
-                                "开始录制后显示实际捕获画面"
-                            }))
-                        }),
-                )
-            })
-    }
-    fn audio_row(&self, kind: AudioKind, cx: &Context<Self>) -> Div {
-        let enabled = if kind == AudioKind::System {
-            self.config.system_audio
-        } else {
-            self.config.microphone
-        };
-        let name = if kind == AudioKind::System {
-            "系统声音"
-        } else {
-            "麦克风"
-        };
-        let index: usize = if kind == AudioKind::System { 0 } else { 1 };
-        let row = div()
-            .flex()
-            .justify_between()
-            .items_center()
-            .gap_3()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(name)
-                    .child(
-                        div()
-                            .id(("device", index))
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .cursor_pointer()
-                            .truncate()
-                            .child(format!("{}  ▾", self.device_name(kind)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.audio_picker == Some(kind) {
-                                    this.audio_picker = None;
-                                } else {
-                                    match opencap_platform::audio_devices() {
-                                        Ok(devices) => this.devices = devices,
-                                        Err(e) => this.message = e.to_string(),
-                                    }
-                                    this.audio_picker = Some(kind);
-                                    this.audio_scroll.set_offset(point(px(0.), px(0.)));
-                                }
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                button(
-                    ("audio", index),
-                    if enabled { "已开启" } else { "已关闭" },
-                    enabled,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_audio(kind);
-                    cx.notify();
-                })),
-            );
-        // While recording the session reports levels; otherwise the optional idle
-        // monitor does, so the bar means the same thing in both states.
-        let peak = if !enabled {
-            0.
-        } else if self.active() {
-            if kind == AudioKind::System {
-                self.stats.system_peak
-            } else {
-                self.stats.microphone_peak
-            }
-        } else if self.config.monitor_levels {
-            if kind == AudioKind::System {
-                self.monitor_peaks.0
-            } else {
-                self.monitor_peaks.1
-            }
-        } else {
-            0.
-        };
-        let mut result = div().flex().flex_col().gap_1().child(row).child(
-            div().h(px(3.)).w_full().bg(rgb(SURFACE)).child(
-                div()
-                    .h_full()
-                    .w(relative(level_bar(peak)))
-                    .bg(rgb(if peak > 0.95 { RED } else { 0x6cc5a2 })),
-            ),
-        );
-        if self.audio_picker == Some(kind) {
-            let selected = self.config.audio_routing().device(kind).clone();
-            let entries = std::iter::once((None, "系统默认设备".to_string())).chain(
-                self.devices
-                    .iter()
-                    .filter(|d| d.kind == kind)
-                    .map(|d| (Some(d.id.clone()), d.name.clone())),
-            );
-            let list = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .children(entries.enumerate().map(|(i, (id, name))| {
-                    button(
-                        ("audio-device", i),
-                        format!("{}{}", if selected == id { "✓ " } else { "" }, name),
-                        selected == id,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.choose_device(kind, id.clone());
-                        cx.notify();
-                    }))
-                }));
-            result = result.child(div().h(px(150.)).child(widgets::scrollable(
-                "audio-devices",
-                list,
-                &self.audio_scroll,
-            )));
-        }
-        result
-    }
-    fn settings_view(&self, cx: &Context<Self>) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(workspace::heading("设置 / AI", "AI 服务、转录模型和录制偏好集中在这里管理。"))
-            .child(self.ai_settings_view(cx))
-            .child(self.transcription_settings(cx))
-            .child(label("录制界面"))
-            .child(
-                button(
-                    "floating-controls",
-                    if self.config.show_floating_controls {
-                        "悬浮控制条：开启"
-                    } else {
-                        "悬浮控制条：关闭"
-                    },
-                    self.config.show_floating_controls,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.config.show_floating_controls = !this.config.show_floating_controls;
-                    let visible = this.config.show_floating_controls
-                        && matches!(
-                            this.stats.state,
-                            RecordingState::Recording | RecordingState::Paused
-                        );
-                    opencap_platform::show_controls_without_activation(this.floating_hwnd, visible);
-                    this.save();
-                    cx.notify();
-                })),
-            )
-            .child(
-                button(
-                    "capture-exclusion",
-                    if self.config.exclude_app {
-                        "录屏中隐藏 OpenCap：开启"
-                    } else {
-                        "录屏中隐藏 OpenCap：关闭"
-                    },
-                    self.config.exclude_app,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let enabled = !this.config.exclude_app;
-                    match opencap_platform::set_capture_exclusion(this.hwnd, enabled).and_then(
-                        |_| opencap_platform::set_capture_exclusion(this.floating_hwnd, enabled),
-                    ) {
-                        Ok(()) => {
-                            this.config.exclude_app = enabled;
-                            this.save();
-                        }
-                        Err(e) => this.message = format!("无法更新窗口捕获设置：{e}"),
-                    }
-                    cx.notify();
-                })),
-            )
-            .child(
-                button(
-                    "mic-denoise",
-                    if self.config.mic_denoise {
-                        "麦克风降噪：开启"
-                    } else {
-                        "麦克风降噪：关闭"
-                    },
-                    self.config.mic_denoise,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.config.mic_denoise = !this.config.mic_denoise;
-                    if let Some(session) = &this.session {
-                        session.command(RecordingCommand::SetMicDenoise(this.config.mic_denoise));
-                    }
-                    this.monitor = None;
-                    this.save();
-                    cx.notify();
-                })),
-            )
-            .child(
-                button(
-                    "monitor-levels",
-                    if self.config.monitor_levels {
-                        "实时电平检测：开启"
-                    } else {
-                        "实时电平检测：关闭"
-                    },
-                    self.config.monitor_levels,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.config.monitor_levels = !this.config.monitor_levels;
-                    this.monitor = None;
-                    this.monitor_peaks = (0.0, 0.0);
-                    this.save();
-                    cx.notify();
-                })),
-            )
-            .child(label(
-                "降噪包含高通、噪声门和轻度压缩；实时电平检测只在未录制时打开所选设备，仅显示电平，不写入文件。",
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(label("录制范围边框"))
-                    .child(
-                        div().flex().gap_2().children(
-                            [
-                                (BorderMode::Always, "常亮"),
-                                (BorderMode::OnStart, "开始显示 3 秒"),
-                                (BorderMode::Never, "关闭"),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (mode, text))| {
-                                button(
-                                    ("border-mode", i),
-                                    text,
-                                    self.config.effective_border_mode() == mode,
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.config.show_capture_border = mode != BorderMode::Never;
-                                        this.config.border_mode = mode;
-                                        this.boundary_started = Some(std::time::Instant::now());
-                                        this.indicator_failed = false;
-                                        this.sync_indicator();
-                                        this.save();
-                                        cx.notify();
-                                    },
-                                ))
-                            }),
-                        ),
-                    ),
-            )
-            .child(label(
-                "红框表示录制，黄框表示暂停；目标窗口最小化后隐藏，边框不录入视频。",
-            ))
-            .child(label(
-                "声音开关和设备可在录制中修改，画面规格在下次录制生效。",
-            ))
-            .child(label("编码格式"))
-            .child(
-                div().flex().gap_2().children(
-                    [
-                        (Codec::Auto, "自动"),
-                        (Codec::H264, "H.264"),
-                        (Codec::Hevc, "HEVC"),
-                        (Codec::Av1, "AV1"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (codec, t))| {
-                        button(("codec", i), t, self.config.codec == codec).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                if !this.active() {
-                                    this.config.codec = codec;
-                                    this.config.encoder = None;
-                                    this.save();
-                                }
-                                cx.notify();
-                            },
-                        ))
-                    }),
-                ),
-            )
-            .child(label("H.264 兼容性最好；HEVC / AV1 需要播放器支持。"))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        button(
-                            "quality-level",
-                            format!("质量值 {}", self.config.quality),
-                            false,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.active() {
-                                this.config.quality = match this.config.quality {
-                                    18 => 22,
-                                    22 => 26,
-                                    26 => 30,
-                                    30 => 34,
-                                    _ => 18,
-                                };
-                                this.config.preset = Preset::Custom;
-                                this.save();
-                            }
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        button(
-                            "bitrate-cap",
-                            format!("码率上限 {} kbps", self.config.max_bitrate_kbps),
-                            false,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.active() {
-                                this.config.max_bitrate_kbps = match this.config.max_bitrate_kbps {
-                                    800 => 1600,
-                                    1600 => 4000,
-                                    4000 => 10000,
-                                    _ => 800,
-                                };
-                                this.config.preset = Preset::Custom;
-                                this.save();
-                            }
-                            cx.notify();
-                        })),
-                    ),
-            )
-            .child(label("质量值越低越清晰；部分编码器不支持硬码率上限。"))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        button("fps", format!("最大 {} FPS", self.config.max_fps), false).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                if !this.active() {
-                                    this.config.max_fps = match this.config.max_fps {
-                                        15 => 30,
-                                        30 => 60,
-                                        _ => 15,
-                                    };
-                                    this.config.preset = Preset::Custom;
-                                    this.save();
-                                }
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        button(
-                            "cursor",
-                            if self.config.cursor {
-                                "鼠标：显示"
-                            } else {
-                                "鼠标：隐藏"
-                            },
-                            false,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.active() {
-                                this.config.cursor = !this.config.cursor;
-                                this.save();
-                            }
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        button(
-                            "adaptive",
-                            if self.config.adaptive {
-                                "自适应帧率"
-                            } else {
-                                "固定帧率"
-                            },
-                            self.config.adaptive,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.active() {
-                                this.config.adaptive = !this.config.adaptive;
-                                this.config.preset = Preset::Custom;
-                                this.save();
-                            }
-                            cx.notify();
-                        })),
-                    ),
-            )
-            .child(
-                button("save-folder", "选择保存目录", false)
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_folder(cx))),
-            )
-            .child(
-                button(
-                    "audio-quality",
-                    format!(
-                        "声音 {} kbps · {} 声道",
-                        self.config.audio_bitrate_kbps, self.config.audio_channels
-                    ),
-                    false,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if !this.active() {
-                        let (b, c) = match this.config.audio_bitrate_kbps {
-                            48 => (96, 2),
-                            96 => (128, 2),
-                            _ => (48, 1),
-                        };
-                        this.config.audio_bitrate_kbps = b;
-                        this.config.audio_channels = c;
-                        this.config.preset = Preset::Custom;
-                        this.save();
-                    }
-                    cx.notify();
-                })),
-            )
-            .child(
-                button(
-                    "separate-audio",
-                    if self.config.separate_audio {
-                        "同时保存独立音频 M4A：开启"
-                    } else {
-                        "同时保存独立音频 M4A：关闭"
-                    },
-                    self.config.separate_audio,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if !this.active() {
-                        this.config.separate_audio = !this.config.separate_audio;
-                        this.save();
-                        cx.notify();
-                    }
-                })),
-            )
-            .child(label(
-                "独立音频与视频同名，停止后保存；开关在下次录制生效。",
-            ))
-            .child(label(self.config.output_dir.to_string_lossy().into_owned()))
-            .child(
-                button("hotkeys", "切换快捷键组合", false).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        if !this.active() {
-                            let alt = this.config.hotkey_record == "Ctrl+Alt+F9";
-                            this.config.hotkey_record =
-                                if alt { "Ctrl+Shift+F9" } else { "Ctrl+Alt+F9" }.into();
-                            this.config.hotkey_pause = if alt {
-                                "Ctrl+Shift+F10"
-                            } else {
-                                "Ctrl+Alt+F10"
-                            }
-                            .into();
-                            this.controls = None;
-                            match opencap_platform::desktop_controls(
-                                &this.config.hotkey_record,
-                                &this.config.hotkey_pause,
-                            ) {
-                                Ok(c) => this.controls = Some(c),
-                                Err(e) => this.message = e.to_string(),
-                            };
-                            this.save();
-                        }
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(label("OpenCap 0.1.0 · GPL-3.0-or-later"))
-    }
-}
 struct Floating {
     recorder: WeakEntity<Recorder>,
 }
@@ -1904,7 +886,7 @@ impl Render for Floating {
             .h(px(66.))
             .p_3()
             .bg(rgb(BG))
-            .text_color(rgb(0xffffff))
+            .text_color(rgb(TEXT))
             .font_family(UI_FONT)
             .flex()
             .gap_2()
@@ -1933,13 +915,15 @@ impl Render for Floating {
                 }),
             )
             .child(
-                button("float-stop", "停止", true).on_click(move |_, _, cx| {
-                    let _ = stop.update(cx, |r, _| {
-                        if let Some(s) = &r.session {
-                            s.command(RecordingCommand::Stop);
-                        }
-                    });
-                }),
+                primary_button("float-stop", "停止")
+                    .danger()
+                    .on_click(move |_, _, cx| {
+                        let _ = stop.update(cx, |r, _| {
+                            if let Some(s) = &r.session {
+                                s.command(RecordingCommand::Stop);
+                            }
+                        });
+                    }),
             )
             .child(
                 button(
@@ -2012,8 +996,11 @@ fn main() {
     }
     application.run(move |cx: &mut App| {
         gpui::init(cx);
-        gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
-        let bounds = Bounds::centered(None, size(px(960.), px(850.)), cx);
+        ui::init_theme(cx);
+        let initial_size = size(px(1200.), px(820.));
+        #[cfg(feature = "ui-smoke")]
+        let initial_size = smoke::preview_size().unwrap_or(initial_size);
+        let bounds = Bounds::centered(None, initial_size, cx);
         let mut main_entity = None;
         let main_window = cx
             .open_window(
@@ -2024,7 +1011,7 @@ fn main() {
                         ..Default::default()
                     }),
                     is_resizable: true,
-                    window_min_size: Some(size(px(500.), px(420.))),
+                    window_min_size: Some(size(px(620.), px(480.))),
                     ..Default::default()
                 },
                 |window, cx| {
@@ -2081,6 +1068,15 @@ fn main() {
             opencap_platform::show_native_window(r.hwnd, true);
         });
         cx.activate(true);
+        #[cfg(feature = "ui-smoke")]
+        if let Some(source) = smoke::preview_source() {
+            entity.update(cx, |r, cx| {
+                r.start_file_transcription(source, false, false);
+                cx.notify();
+            });
+        }
+        #[cfg(feature = "ui-smoke")]
+        smoke::scroll_benchmark(main_window, entity.clone(), cx);
         #[cfg(feature = "ui-smoke")]
         if let Some(path) = smoke::output_dir() {
             smoke::run(main_window, entity, path, cx);

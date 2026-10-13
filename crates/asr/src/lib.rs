@@ -1,12 +1,14 @@
 mod audio;
 mod diarization;
 mod document;
+mod minutes_format;
 mod models;
 mod summary;
 mod transcript;
 mod worker;
 pub use diarization::*;
 pub use document::*;
+pub use minutes_format::*;
 pub use models::*;
 pub use summary::*;
 pub use transcript::*;

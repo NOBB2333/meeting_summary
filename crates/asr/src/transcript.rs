@@ -21,6 +21,10 @@ pub struct Transcript {
     pub segments: Vec<Segment>,
     #[serde(default)]
     pub speaker_turns: Vec<SpeakerTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_analysis_seconds: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeakerTurn {
@@ -29,6 +33,13 @@ pub struct SpeakerTurn {
     pub speaker: u32,
 }
 impl Transcript {
+    pub fn speaker_count(&self) -> usize {
+        self.speaker_turns
+            .iter()
+            .map(|s| s.speaker)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
     pub fn title(&self) -> String {
         self.source
             .as_ref()
@@ -235,6 +246,30 @@ pub fn timestamp(ms: u64, separator: char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn speaker_count_counts_groups_instead_of_the_largest_label() {
+        let transcript = Transcript {
+            speaker_turns: vec![
+                SpeakerTurn {
+                    start_ms: 0,
+                    end_ms: 1000,
+                    speaker: 1,
+                },
+                SpeakerTurn {
+                    start_ms: 1000,
+                    end_ms: 2000,
+                    speaker: 3,
+                },
+                SpeakerTurn {
+                    start_ms: 2000,
+                    end_ms: 3000,
+                    speaker: 3,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(transcript.speaker_count(), 2);
+    }
     fn s(revision: u64, text: &str, finalized: bool) -> Segment {
         Segment {
             id: 1,

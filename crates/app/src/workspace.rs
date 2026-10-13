@@ -17,6 +17,19 @@ pub(super) struct MeetingFile {
     complete: Option<bool>,
 }
 impl MeetingFile {
+    fn age(&self) -> String {
+        let hours = self.modified.elapsed().unwrap_or_default().as_secs() / 3_600;
+        if hours == 0 {
+            return "最近更新".into();
+        }
+        if hours < 24 {
+            return format!("{hours} 小时前");
+        }
+        match hours / 24 {
+            1 => "1 天前".into(),
+            n => format!("{n} 天前"),
+        }
+    }
     fn title(&self) -> String {
         self.media
             .as_ref()
@@ -43,6 +56,10 @@ impl MeetingFile {
     }
 }
 fn index_path() -> PathBuf {
+    #[cfg(feature = "ui-smoke")]
+    if let Some(path) = smoke::isolated_dir() {
+        return path.join("meetings.json");
+    }
     config_path().with_file_name("meetings.json")
 }
 /// Scan only application artifacts, plus explicitly remembered imports. No media decoding.
@@ -109,151 +126,12 @@ pub(super) fn discover(root: &Path) -> Vec<MeetingFile> {
     files
 }
 fn card() -> Div {
-    div()
-        .p_4()
-        .rounded_lg()
-        .bg(rgb(SURFACE))
-        .border_1()
-        .border_color(rgb(0x313640))
-        .flex()
-        .flex_col()
-        .gap_3()
+    ui::card()
 }
 pub(super) fn heading(title: &str, description: &str) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .text_2xl()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title.to_string()),
-        )
-        .child(label(description.to_string()))
+    ui::heading(title, description)
 }
 impl Recorder {
-    pub(super) fn workspace_header(&self, status: &str, cx: &Context<Self>) -> Div {
-        div()
-            .flex_shrink_0()
-            .px_6()
-            .py_4()
-            .bg(rgb(0x191c22))
-            .border_b_1()
-            .border_color(rgb(0x313640))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("OpenCap"),
-                            )
-                            .child(label("录制 · 转写 · 会议纪要")),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(if self.active() { RED } else { 0x84bca8 }))
-                            .child(status.to_string()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        button(
-                            "record-tab",
-                            "●  录制",
-                            !self.settings && !self.transcription_tab,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.transcription_tab = false;
-                            this.settings = false;
-                            if this.targets.is_empty() {
-                                this.refresh_targets();
-                            }
-                            this.page_scroll.set_offset(point(px(0.), px(0.)));
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        button(
-                            "transcription-tab",
-                            "▤  会议文件",
-                            !self.settings && self.transcription_tab,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.transcription_tab = true;
-                            this.settings = false;
-                            this.meeting_page = MeetingPage::Library;
-                            this.refresh_meetings();
-                            this.close_targets();
-                            this.audio_picker = None;
-                            this.page_scroll.set_offset(point(px(0.), px(0.)));
-                            cx.notify();
-                        })),
-                    )
-                    .child(button("settings", "⚙  设置 / AI", self.settings).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.settings = true;
-                            this.close_targets();
-                            this.audio_picker = None;
-                            this.page_scroll.set_offset(point(px(0.), px(0.)));
-                            cx.notify();
-                        }),
-                    )),
-            )
-    }
-    pub(super) fn active_recording_bar(&self, cx: &Context<Self>) -> Div {
-        div()
-            .p_3()
-            .bg(rgb(0x191c22))
-            .border_t_1()
-            .border_color(rgb(0x313640))
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(div().text_color(rgb(RED)).child(format!(
-                "●  录制中  {}",
-                time_text(self.stats.duration_seconds)
-            )))
-            .child(
-                button(
-                    "compact-pause",
-                    if self.stats.state == RecordingState::Paused {
-                        "继续"
-                    } else {
-                        "暂停"
-                    },
-                    false,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_pause();
-                    cx.notify();
-                })),
-            )
-            .child(
-                button("compact-stop", "■ 停止并保存", false)
-                    .danger()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_record(cx);
-                    })),
-            )
-    }
     pub(super) fn refresh_meetings(&mut self) {
         self.meetings = discover(&self.config.output_dir);
         let paths: Vec<_> = self.meetings.iter().map(|m| &m.base).collect();
@@ -292,7 +170,7 @@ impl Recorder {
                 .unwrap_or_default();
             self.notes_saved = text.clone();
             self.notes.update(cx, |s, cx| s.set_value(text, window, cx));
-            self.notes_status = "笔记在本机自动保存；Word 通过下方按钮导出。".into();
+            self.notes_status = "笔记在本机自动保存；点击“导出笔记 Word”更新文档。".into();
         }
     }
     pub(super) fn persist_notes(&mut self, cx: &App) {
@@ -311,29 +189,25 @@ impl Recorder {
             Err(e) => self.notes_status = format!("笔记保存失败：{e}"),
         }
     }
-    pub(super) fn meeting_workspace(&self, cx: &Context<Self>) -> Div {
-        if self.meeting_page == MeetingPage::Library {
-            return self.library_view(cx);
-        }
-        let title = self.transcript.title();
-        let mut view = div()
+    pub(super) fn meeting_header(&self, cx: &Context<Self>) -> Div {
+        let mut header = div()
+            .flex_shrink_0()
+            .px_6()
+            .py_4()
+            .bg(rgb(SURFACE))
+            .border_b_1()
+            .border_color(rgb(BORDER))
             .flex()
             .flex_col()
-            .gap_4()
+            .gap_3()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .gap_3()
                     .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        button("back-meetings", "← 会议文件", false)
+                        button("back-meetings", "返回列表", false)
+                            .icon(gpui::component::IconName::ArrowLeft)
                             .ghost()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.meeting_page = MeetingPage::Library;
@@ -341,13 +215,22 @@ impl Recorder {
                                 this.page_scroll.set_offset(point(px(0.), px(0.)));
                                 cx.notify();
                             })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(self.transcript.title()),
                     ),
             )
             .child(
-                div().flex().flex_wrap().gap_2().children(
+                div().flex().flex_wrap().items_center().gap_2().children(
                     [
                         (MeetingPage::Transcript, "逐字稿"),
-                        (MeetingPage::Minutes, "AI 会议纪要"),
+                        (MeetingPage::Minutes, "AI 纪要"),
                         (MeetingPage::Notes, "个人笔记"),
                     ]
                     .into_iter()
@@ -362,53 +245,140 @@ impl Recorder {
                         )
                     }),
                 ),
-            )
-            .child(label(
-                "逐字稿保留原话；AI 纪要单独生成并保留版本；个人笔记独立保存。",
-            ));
+            );
         if let Some(base) = &self.transcript_output {
             let folder = base.parent().unwrap_or(Path::new(".")).to_path_buf();
             let open = folder.clone();
-            view = view.child(
+            header = header.child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_1()
+                    .items_center()
+                    .gap_2()
                     .child(
-                        div().flex().gap_2().child(
-                            button("meeting-location", "在 Finder / 文件管理器中查看", false)
-                                .ghost()
-                                .on_click(move |_, _, _| {
-                                    let _ = opencap_platform::open_path(&open);
-                                }),
-                        ),
+                        label(format!("保存位置：{}", folder.display()))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate(),
                     )
-                    .child(label(format!("保存位置：{}", folder.display()))),
+                    .child(
+                        button("meeting-location", "查看文件", false)
+                            .icon(gpui::component::IconName::FolderOpen)
+                            .ghost()
+                            .on_click(move |_, _, _| {
+                                let _ = opencap_platform::open_path(&open);
+                            }),
+                    ),
             );
         }
-        view.child(match self.meeting_page {
-            MeetingPage::Transcript => self.transcription_view(cx),
-            MeetingPage::Minutes => self.minutes_view(cx),
+        header
+    }
+    pub(super) fn meeting_workspace(&self, width: f32, cx: &Context<Self>) -> Div {
+        match self.meeting_page {
+            MeetingPage::Library => self.library_view(cx),
+            MeetingPage::Transcript => self.transcription_view(width, cx),
+            MeetingPage::Minutes => self.minutes_view(width, cx),
             MeetingPage::Notes => self.notes_view(cx),
-            MeetingPage::Library => unreachable!(),
-        })
+        }
     }
     fn library_view(&self, cx: &Context<Self>) -> Div {
         let busy = self.active() || self.transcription_busy();
-        let mut view = div().flex().flex_col().gap_4()
-            .child(heading("会议文件", "录制和导入的结果都在这里。选择一场会议，查看逐字稿、生成 AI 纪要或导出 Word。"))
-            .child(div().flex().flex_wrap().gap_2()
-                .child(button("import-meeting", "+ 导入音频 / 视频", true).disabled(busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(false,cx))))
-                .child(button("refresh-meetings", "刷新列表", false).on_click(cx.listener(|this,_,_,cx| { this.refresh_meetings(); cx.notify(); })))
-                .child(button("library-folder", "打开录制目录", false).ghost().on_click(cx.listener(|this,_,_,_| { let _ = opencap_platform::open_path(&this.config.output_dir); }))))
-            .child(card().child(div().text_sm().child("生成方式：本地转录自动保存，AI 纪要需要手动生成。"))
-                .child(label("开启实时转录后，声音和视频的转写流程相同。停止录制 → 查看逐字稿 → 分析说话人（可选）→ 生成 AI 纪要。")))
-            .when(self.transcription_busy(), |d| d.child(card().child(label(self.transcription_status.clone())).child(button("current-task", "查看当前任务", false).on_click(cx.listener(|this,_,_,cx| { this.meeting_page=MeetingPage::Transcript; cx.notify(); })))));
+        let mut view = div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(heading(
+                        "会议文件",
+                        "每一场会议的原文、纪要和笔记，集中在这里。",
+                    ))
+                    .child(
+                        primary_button("import-meeting", "导入音频 / 视频")
+                            .icon(gpui::component::IconName::Plus)
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.choose_transcription_file(false, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(label(format!(
+                        "共 {} 场会议 · 最近更新优先",
+                        self.meetings.len()
+                    )))
+                    .child(
+                        button("refresh-meetings", "刷新", false)
+                            .icon(gpui::component::IconName::RefreshCw)
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_meetings();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(self.transcription_busy(), |d| {
+                d.child(
+                    card()
+                        .bg(rgb(SOFT))
+                        .child(ui::section_title(
+                            "正在处理会议",
+                            &self.transcription_status,
+                        ))
+                        .child(button("current-task", "查看当前任务", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.meeting_page = MeetingPage::Transcript;
+                                cx.notify();
+                            }),
+                        )),
+                )
+            });
         if self.meetings.is_empty() {
             view = view.child(
                 card()
-                    .child("还没有已保存的会议")
-                    .child(label("可以先录制，也可以导入已有的 M4A、WAV、MP3 或视频。")),
+                    .py_8()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        div()
+                            .size(px(64.))
+                            .rounded_xl()
+                            .bg(rgb(SOFT))
+                            .text_color(rgb(ACCENT))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(ui::icon(gpui::component::IconName::FolderOpen).size(px(28.))),
+                    )
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("让下一场会议留下记录"),
+                    )
+                    .child(label("录制一场会议，或导入已有音频和视频。"))
+                    .child(
+                        primary_button("empty-record", "开始一次录制").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.transcription_tab = false;
+                                this.settings = false;
+                                if this.targets.is_empty() {
+                                    this.refresh_targets();
+                                }
+                                this.page_scroll.set_offset(point(px(0.), px(0.)));
+                                cx.notify();
+                            },
+                        )),
+                    ),
             );
         }
         for (i, meeting) in self.meetings.iter().enumerate().take(100) {
@@ -427,11 +397,39 @@ impl Recorder {
                 card()
                     .child(
                         div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(meeting.title()),
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .size(px(40.))
+                                    .flex_shrink_0()
+                                    .rounded_lg()
+                                    .bg(rgb(SOFT))
+                                    .text_color(rgb(ACCENT))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(ui::icon(gpui::component::IconName::FileText)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .truncate()
+                                            .child(meeting.title()),
+                                    )
+                                    .child(label(meeting.status())),
+                            )
+                            .child(label(meeting.age())),
                     )
-                    .child(label(meeting.status()))
                     .child(
                         div()
                             .flex()
@@ -445,8 +443,9 @@ impl Recorder {
                                     } else {
                                         "转录并查看"
                                     },
-                                    true,
+                                    false,
                                 )
+                                .text_color(rgb(ACCENT))
                                 .disabled(busy || (!exists && !playable))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
@@ -493,33 +492,42 @@ impl Recorder {
         )))
     }
     fn notes_view(&self, cx: &Context<Self>) -> Div {
+        let export = primary_button("export-notes-word", "导出笔记 Word")
+            .disabled(self.transcript_output.is_none())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.persist_notes(cx);
+                if let Some(base) = &this.transcript_output {
+                    let md = format!(
+                        "# {} · 个人笔记\n\n{}",
+                        opencap_asr::escape_markdown(&this.transcript.title()),
+                        opencap_asr::escape_markdown(&this.notes.read(cx).value())
+                    );
+                    let path = base.with_extension("notes.docx");
+                    match opencap_asr::export_minutes_docx(&md, &path) {
+                        Ok(()) => {
+                            this.notes_status = format!("笔记 Word 已保存：{}", path.display());
+                            let _ = opencap_platform::open_path(&path);
+                        }
+                        Err(e) => this.notes_status = format!("导出失败：{e}"),
+                    }
+                }
+                cx.notify();
+            }));
         card()
-            .child(heading("个人笔记", "这里的内容由你填写，独立于 AI 纪要。"))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(ui::section_title(
+                        "个人笔记",
+                        "记录自己的观察与补充，内容自动保存到本机。",
+                    ))
+                    .child(export),
+            )
             .child(Textarea::new(&self.notes).disabled(self.transcript_output.is_none()))
             .child(label(self.notes_status.clone()))
-            .child(
-                button("export-notes-word", "导出笔记 Word", true)
-                    .disabled(self.transcript_output.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.persist_notes(cx);
-                        if let Some(base) = &this.transcript_output {
-                            let md = format!(
-                                "# {} · 个人笔记\n\n{}",
-                                opencap_asr::escape_markdown(&this.transcript.title()),
-                                opencap_asr::escape_markdown(&this.notes.read(cx).value())
-                            );
-                            let path = base.with_extension("notes.docx");
-                            match opencap_asr::export_minutes_docx(&md, &path) {
-                                Ok(()) => {
-                                    this.notes_status =
-                                        format!("笔记 Word 已保存：{}", path.display());
-                                    let _ = opencap_platform::open_path(&path);
-                                }
-                                Err(e) => this.notes_status = format!("导出失败：{e}"),
-                            }
-                        }
-                        cx.notify();
-                    })),
-            )
     }
 }

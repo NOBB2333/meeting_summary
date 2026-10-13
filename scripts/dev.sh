@@ -38,4 +38,32 @@ if [[ "$(uname -s)" == Darwin ]]; then
   fi
 fi
 
+if [[ "$task" == run && "$(uname -s)" == Darwin ]]; then
+  build_arguments=()
+  app_arguments=()
+  app_arguments_started=false
+  run_profile=debug
+  for argument in "$@"; do
+    if [[ "$argument" == -- && "$app_arguments_started" == false ]]; then
+      app_arguments_started=true
+    elif [[ "$app_arguments_started" == true ]]; then
+      app_arguments+=("$argument")
+    else
+      build_arguments+=("$argument")
+      if [[ "$argument" == --release ]]; then run_profile=release; fi
+    fi
+  done
+  echo "OpenCap: building $run_profile and launching release/OpenCap.app (macOS permissions belong to the app bundle)."
+  cargo build -p opencap --locked "${build_arguments[@]}"
+  python3 "$root/scripts/package-macos.py" --profile "$run_profile" --no-build
+  exec open "$root/release/OpenCap.app" --args "${app_arguments[@]}"
+fi
+
+if [[ "$task" == run ]]; then
+  if [[ " $* " == *" --release "* ]]; then
+    echo "OpenCap: running the optimized Release build."
+  else
+    echo "OpenCap: running Debug (unoptimized). For performance testing: scripts/dev.sh run --release"
+  fi
+fi
 exec "${command[@]}" "$@"

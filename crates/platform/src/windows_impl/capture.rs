@@ -174,7 +174,6 @@ struct Flags {
 struct Handler {
     flags: Flags,
     last: Option<Instant>,
-    scratch: Vec<u8>,
 }
 impl GraphicsCaptureApiHandler for Handler {
     type Flags = Flags;
@@ -183,7 +182,6 @@ impl GraphicsCaptureApiHandler for Handler {
         Ok(Self {
             flags: ctx.flags,
             last: None,
-            scratch: Vec::new(),
         })
     }
     fn on_frame_arrived(
@@ -205,7 +203,7 @@ impl GraphicsCaptureApiHandler for Handler {
         if width < 2 || height < 2 {
             return Ok(());
         }
-        let (width, height, buffer) = if let Some(r) = self.flags.crop {
+        let (width, height, mut buffer) = if let Some(r) = self.flags.crop {
             if r.x.checked_add(r.width).is_none_or(|x| x > width)
                 || r.y.checked_add(r.height).is_none_or(|y| y > height)
             {
@@ -223,11 +221,14 @@ impl GraphicsCaptureApiHandler for Handler {
         } else {
             (width, height, frame.buffer()?)
         };
-        let data = Arc::new(buffer.as_nopadding_buffer(&mut self.scratch).to_vec());
+        // Preserve the native row stride. De-padding uses the dependency's global
+        // Rayon pool and then requires another full-frame copy for ownership.
+        let stride = buffer.row_pitch() as usize;
+        let data = Arc::new(buffer.as_raw_buffer().to_vec());
         let video = VideoFrame {
             width,
             height,
-            stride: width as usize * 4,
+            stride,
             pts_us,
             data,
         };
@@ -330,6 +331,13 @@ pub fn start_capture(
         crop,
         interval: Duration::from_micros(1_000_000 / config.max_fps as u64),
     };
+    use windows_capture::graphics_capture_api::GraphicsCaptureApi;
+    let update_interval =
+        if GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(false) {
+            MinimumUpdateIntervalSettings::Custom(flags.interval)
+        } else {
+            MinimumUpdateIntervalSettings::Default
+        };
     let settings = Settings::new(
         item,
         if config.cursor {
@@ -339,7 +347,7 @@ pub fn start_capture(
         },
         border,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Default,
+        update_interval,
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         flags,

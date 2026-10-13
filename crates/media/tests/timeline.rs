@@ -25,6 +25,70 @@ fn scratch() -> PathBuf {
 }
 
 #[test]
+fn native_row_padding_does_not_change_encoded_pixels() {
+    use ffmpeg_next as ff;
+    let dir = scratch();
+    let config = RecordingConfig {
+        encoder: Some("libx264".into()),
+        system_audio: false,
+        microphone: false,
+        ..Default::default()
+    };
+    let mut decoded_pixels = Vec::new();
+    for stride in [322 * 4, 1536] {
+        let path = dir.join(format!("stride-{stride}.mp4"));
+        let mut pixels = vec![255; stride * 180];
+        for y in 0..180 {
+            for x in 0..322 {
+                let value = ((x / 16 + y / 16) % 2 * 140 + 30) as u8;
+                pixels[y * stride + x * 4..y * stride + x * 4 + 4]
+                    .copy_from_slice(&[value, value, value, 255]);
+            }
+        }
+        let mut writer = MediaWriter::new(&path, 322, 180, &config).unwrap();
+        writer
+            .video(&VideoFrame {
+                width: 322,
+                height: 180,
+                stride,
+                pts_us: 0,
+                data: Arc::new(pixels),
+            })
+            .unwrap();
+        writer.finish(500_000).unwrap();
+        let mut input = ff::format::input(&path).unwrap();
+        let stream = input.streams().best(ff::media::Type::Video).unwrap();
+        let index = stream.index();
+        let mut decoder = ff::codec::context::Context::from_parameters(stream.parameters())
+            .unwrap()
+            .decoder()
+            .video()
+            .unwrap();
+        for (stream, packet) in input.packets() {
+            if stream.index() == index {
+                decoder.send_packet(&packet).unwrap();
+            }
+        }
+        decoder.send_eof().unwrap();
+        let mut frame = ff::frame::Video::empty();
+        decoder.receive_frame(&mut frame).unwrap();
+        let luma: Vec<u8> = (0..180)
+            .flat_map(|y| {
+                frame.data(0)[y * frame.stride(0)..y * frame.stride(0) + 322]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        decoded_pixels.push(luma);
+    }
+    assert_eq!(
+        decoded_pixels[0], decoded_pixels[1],
+        "native padding leaked into the encoded image"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn transcription_tap_has_mixed_audio_tail_without_stalling_full_queues() {
     for capacity in [1, 128] {
         let dir = scratch();

@@ -40,6 +40,8 @@ enum Command {
         count: u32,
         #[arg(long, default_value = "0.9")]
         threshold: f32,
+        #[arg(long, default_value = "2")]
+        threads: usize,
     },
     ExportWord {
         markdown: PathBuf,
@@ -116,21 +118,20 @@ fn main() -> Result<()> {
             output,
             count,
             threshold,
+            threads,
         } => {
             let t: Transcript = serde_json::from_slice(&std::fs::read(transcript)?)?;
-            let t = distinguish_speakers(
+            let t = distinguish_speakers_with_threads(
                 t,
                 &model_root(),
                 &output,
                 count,
                 threshold,
+                threads,
                 &std::sync::atomic::AtomicBool::new(false),
                 |s| eprintln!("{s}"),
             )?;
-            println!(
-                "speaker_count={}",
-                t.speaker_turns.iter().map(|s| s.speaker).max().unwrap_or(0)
-            );
+            println!("speaker_count={}", t.speaker_count());
         }
     }
     Ok(())

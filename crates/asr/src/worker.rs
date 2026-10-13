@@ -117,6 +117,7 @@ impl AsrSession {
         let worker = thread::Builder::new()
             .name("opencap-asr-cpu".into())
             .spawn(move || {
+                let job_started = Instant::now();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                         let _ = tx.send(AsrEvent::Status("正在准备本地识别模型…".into()));
@@ -273,6 +274,7 @@ impl AsrSession {
                         transcript.complete = read_result.is_ok()
                             && !transcript.cancelled
                             && transcript.gaps.is_empty();
+                        transcript.processing_seconds = Some(job_started.elapsed().as_secs_f64());
                         if let Some(base) = worker_output.lock().unwrap().as_ref() {
                             if transcript.source.is_none() {
                                 transcript.source = Some(base.clone());

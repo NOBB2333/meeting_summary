@@ -35,12 +35,27 @@ def minimum_macos(path):
     return max(versions)
 
 
-def package(profile, identity):
+def package(profile, identity, build=True):
     root = Path(__file__).resolve().parent.parent
+    destination = root / "release" / "OpenCap.app"
+    executable_prefix = str(destination / "Contents/MacOS/opencap")
+    for line in run("ps", "-axo", "pid=,command=").splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2:
+            continue
+        process_command = fields[1]
+        if (process_command == executable_prefix or
+                process_command.startswith(executable_prefix + " ") or
+                process_command.startswith(executable_prefix + ".bin ")):
+            raise SystemExit("OpenCap is still running. Quit it from the app before packaging; replacing a running app leaves its process and macOS permission signature out of sync.")
+    if build:
+        command = [str(root / "scripts/dev.sh"), "build", "-p", "opencap"]
+        if profile == "release":
+            command.append("--release")
+        subprocess.run(command, cwd=root, check=True)
     binary = root / "target" / profile / "opencap"
     if not binary.is_file():
         raise SystemExit(f"Build first: scripts/dev.sh build {'--release' if profile == 'release' else ''}")
-    destination = root / "release" / "OpenCap.app"
     staging = root / "release" / ".OpenCap.app.build"
     if staging.exists():
         shutil.rmtree(staging)
@@ -118,7 +133,8 @@ def package(profile, identity):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=("debug", "release"), default="release")
+    parser.add_argument("--no-build", action="store_true", help="Package an existing binary without compiling; it may be older than the source")
     parser.add_argument("--identity", default=os.environ.get("OPENCAP_SIGNING_IDENTITY", "-"),
                         help="codesign identity; use Apple Development/Developer ID for stable permissions")
     args = parser.parse_args()
-    package(args.profile, args.identity)
+    package(args.profile, args.identity, not args.no_build)
