@@ -90,7 +90,12 @@ async fn shot_target(target: CaptureTarget, path: PathBuf) -> Result<()> {
         }
     }
 }
-pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathBuf, cx: &mut App) {
+pub fn run(
+    main: WindowHandle<gpui::base::Root>,
+    recorder: Entity<Recorder>,
+    path: PathBuf,
+    cx: &mut App,
+) {
     #[cfg(windows)]
     let exercise_microphone = true;
     #[cfg(target_os = "macos")]
@@ -132,7 +137,7 @@ pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathB
         let result: Result<()> = async {
             std::fs::create_dir_all(&path)?;
             futures_timer::Delay::new(Duration::from_secs(1)).await;
-            let hwnd = recorder.read_with(cx,|r,_|r.hwnd)?;
+            let hwnd = recorder.read_with(cx,|r,_|r.hwnd);
             shot(hwnd,path.join("01-main")).await?;
             recorder.update(cx,|r,cx| {
                 r.mode=1; r.targets=sources.clone(); r.choosing_target=true;
@@ -141,7 +146,7 @@ pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathB
                     r.previews.insert(id,Rc::new(opencap_platform::WindowPreview::new(hwnd,id).unwrap()));
                 }}
                 cx.notify();
-            })?;
+            });
             futures_timer::Delay::new(Duration::from_millis(500)).await;
             shot(hwnd,path.join("02-previews")).await?;
             main.update(cx, |_,w,_| { w.zoom_window(); })?;
@@ -151,72 +156,72 @@ pub fn run(main: WindowHandle<Recorder>, recorder: Entity<Recorder>, path: PathB
             shot(hwnd,path.join("02b-maximized-23-targets")).await?;
             main.update(cx,|_,w,_| { w.zoom_window(); })?;
             futures_timer::Delay::new(Duration::from_millis(300)).await;
-            main.update(cx,|r,w,cx| { w.resize(size(px(510.),px(700.))); r.page_scroll.set_offset(point(px(0.),px(0.))); cx.notify(); })?;
+            main.update(cx,|_,w,cx| { w.resize(size(px(510.),px(700.))); recorder.update(cx,|r,cx| { r.page_scroll.set_offset(point(px(0.),px(0.))); cx.notify(); }); })?;
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             shot(hwnd,path.join("02c-narrow-targets")).await?;
-            recorder.update(cx,|r,cx| { r.page_scroll.scroll_to_bottom(); cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.page_scroll.scroll_to_bottom(); cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             shot(hwnd,path.join("02d-last-target")).await?;
-            recorder.update(cx,|r,cx| { r.targets_expanded=false; r.page_scroll.set_offset(point(px(0.),px(0.))); r.target_scroll.set_offset(point(px(0.),px(-170.))); cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.targets_expanded=false; r.page_scroll.set_offset(point(px(0.),px(0.))); r.target_scroll.set_offset(point(px(0.),px(-170.))); cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             shot(hwnd,path.join("03-scrolled-previews")).await?;
-            main.update(cx,|r,w,cx| { r.close_targets(); r.settings=true; w.resize(size(px(510.),px(450.))); cx.notify(); })?;
+            main.update(cx,|_,w,cx| { w.resize(size(px(510.),px(450.))); recorder.update(cx,|r,cx| { r.close_targets(); r.settings=true; cx.notify(); }); })?;
             futures_timer::Delay::new(Duration::from_millis(500)).await;
-            recorder.update(cx,|r,cx| { r.page_scroll.scroll_to_bottom(); cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.page_scroll.scroll_to_bottom(); cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             shot(hwnd,path.join("04-small-settings")).await?;
-            main.update(cx,|r,w,cx| { w.resize(size(px(960.),px(850.))); r.settings=false; r.page_scroll.set_offset(point(px(0.),px(0.))); r.config.target=sources[0].target.clone(); r.config.border_mode=BorderMode::Always; r.toggle_record(cx); })?;
+            main.update(cx,|_,w,cx| { w.resize(size(px(960.),px(850.))); recorder.update(cx,|r,cx| { r.settings=false; r.page_scroll.set_offset(point(px(0.),px(0.))); r.config.target=sources[0].target.clone(); r.config.border_mode=BorderMode::Always; r.toggle_record(cx); }); })?;
             let start=std::time::Instant::now();
             loop {
-                let state=recorder.read_with(cx,|r,_|r.stats.state)?;
+                let state=recorder.read_with(cx,|r,_|r.stats.state);
                 if state==RecordingState::Recording {break;}
                 anyhow::ensure!(state!=RecordingState::Failed && start.elapsed()<Duration::from_secs(20),"UI start failed");
                 futures_timer::Delay::new(Duration::from_millis(100)).await;
             }
-            recorder.update(cx,|r,cx| { r.toggle_audio(AudioKind::System); if exercise_microphone { r.toggle_audio(AudioKind::Microphone); } cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.toggle_audio(AudioKind::System); if exercise_microphone { r.toggle_audio(AudioKind::Microphone); } cx.notify(); });
             futures_timer::Delay::new(Duration::from_secs(2)).await;
-            anyhow::ensure!(recorder.read_with(cx,|r,_|r.preview_image.is_some() && r.preview_pts>0)?,"Recording preview did not receive encoder frames");
-            anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.as_ref().is_some_and(|i|i.visible()))?,"Always-on border did not appear");
+            anyhow::ensure!(recorder.read_with(cx,|r,_|r.preview_image.is_some() && r.preview_pts>0),"Recording preview did not receive encoder frames");
+            anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.as_ref().is_some_and(|i|i.visible())),"Always-on border did not appear");
             sample_windows[0].update(cx, |_,w,_|w.minimize_window())?;
             futures_timer::Delay::new(Duration::from_millis(600)).await;
-            anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.as_ref().is_none_or(|i|!i.visible()))?,"Border remained after minimizing target");
+            anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.as_ref().is_none_or(|i|!i.visible())),"Border remained after minimizing target");
             sample_windows[0].update(cx, |_,w,_|w.activate_window())?;
             main.update(cx,|_,w,_|w.activate_window())?;
-            recorder.update(cx,|r,cx| { r.config.border_mode=BorderMode::OnStart; r.boundary_started=Some(std::time::Instant::now()-Duration::from_secs(4)); r.sync_indicator(); cx.notify(); })?;
-            anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.is_none())?,"Timed border remained after timeout");
-            recorder.update(cx,|r,cx| { r.config.border_mode=BorderMode::Never; r.sync_indicator(); cx.notify(); })?;
-            anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.is_none())?,"Disabled border remained");
-            recorder.update(cx,|r,cx| { r.toggle_pause(); cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.config.border_mode=BorderMode::OnStart; r.boundary_started=Some(std::time::Instant::now()-Duration::from_secs(4)); r.sync_indicator(); cx.notify(); });
+            anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.is_none()),"Timed border remained after timeout");
+            recorder.update(cx,|r,cx| { r.config.border_mode=BorderMode::Never; r.sync_indicator(); cx.notify(); });
+            anyhow::ensure!(recorder.read_with(cx,|r,_|r.indicator.is_none()),"Disabled border remained");
+            recorder.update(cx,|r,cx| { r.toggle_pause(); cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(500)).await;
-            recorder.update(cx,|r,cx| { r.choose_device(AudioKind::System,r.devices.iter().find(|d|d.kind==AudioKind::System).map(|d|d.id.clone())); if exercise_microphone { r.toggle_audio(AudioKind::Microphone); } cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.choose_device(AudioKind::System,r.devices.iter().find(|d|d.kind==AudioKind::System).map(|d|d.id.clone())); if exercise_microphone { r.toggle_audio(AudioKind::Microphone); } cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(300)).await;
-            recorder.update(cx,|r,cx| { r.toggle_pause(); cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.toggle_pause(); cx.notify(); });
             futures_timer::Delay::new(Duration::from_secs(1)).await;
             // Do not run a second capture while recording. Capture the paused UI after stopping.
-            recorder.update(cx,|r,cx| r.toggle_record(cx))?;
+            recorder.update(cx,|r,cx| r.toggle_record(cx));
             let stop=std::time::Instant::now();
             loop {
-                let state=recorder.read_with(cx,|r,_|r.stats.state)?;
+                let state=recorder.read_with(cx,|r,_|r.stats.state);
                 if state==RecordingState::Finished {break;}
                 anyhow::ensure!(state!=RecordingState::Failed && stop.elapsed()<Duration::from_secs(15),"UI stop failed");
                 futures_timer::Delay::new(Duration::from_millis(100)).await;
             }
             shot(hwnd,path.join("05-finished")).await?;
-            recorder.update(cx,|r,cx| { r.audio_picker=Some(AudioKind::System); r.page_scroll.set_offset(point(px(0.),px(-190.))); cx.notify(); })?;
+            recorder.update(cx,|r,cx| { r.audio_picker=Some(AudioKind::System); r.page_scroll.set_offset(point(px(0.),px(-190.))); cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             shot(hwnd,path.join("06-audio-picker")).await?;
-            let float_hwnd=recorder.read_with(cx,|r,_|r.floating_hwnd)?;
+            let float_hwnd=recorder.read_with(cx,|r,_|r.floating_hwnd);
             anyhow::ensure!(!opencap_platform::native_window_visible(float_hwnd),"Floating controls unexpectedly appeared by default");
-            recorder.update(cx,|r,cx| { r.config.show_floating_controls=true; opencap_platform::show_controls_without_activation(r.floating_hwnd,true); if let Some(w)=r.floating { let _=w.update(cx,|_,_,cx|cx.notify()); } })?;
+            recorder.update(cx,|r,cx| { r.config.show_floating_controls=true; opencap_platform::show_controls_without_activation(r.floating_hwnd,true); if let Some(w)=r.floating { let _=w.update(cx,|_,_,cx|cx.notify()); } });
             futures_timer::Delay::new(Duration::from_millis(300)).await;
             let region = opencap_platform::window_region(float_hwnd)?;
             if let CaptureTarget::Region { rect, .. } = region { anyhow::ensure!(rect.width > rect.height * 5 && rect.height <= 250,"Toolbar has incorrect size: {rect:?}"); }
             shot_target(region,path.join("07-floating-controls")).await?;
-            let stats=recorder.read_with(cx,|r,_|r.stats.clone())?;
+            let stats=recorder.read_with(cx,|r,_|r.stats.clone());
             std::fs::write(path.join("ui-smoke.json"),serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"stats":stats,"microphone_exercised":exercise_microphone,"maximized_columns":wide_columns,"scenarios":["23 real native-window previews","responsive expanded grid and last target","compact scrolling","small-window settings","live encoder preview","minimized target hides border","timed and disabled borders","UI start/pause/resume/stop","live audio and device switch"]}))?)?;
             Ok(())
         }.await;
         if let Err(e)=result { let _=std::fs::write(path.join("ui-smoke-error.txt"),format!("{e:#}")); }
-        let _=cx.update(|cx|cx.quit());
+        cx.update(|cx|cx.quit());
     }).detach();
 }

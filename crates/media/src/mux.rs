@@ -17,6 +17,7 @@ pub struct MediaWriter {
     pending: Option<ff::Packet>,
     pub frames: u64,
     pub last_video_us: i64,
+    audio_observer: Option<crossbeam_channel::Sender<PcmAudio>>,
 }
 impl MediaWriter {
     pub fn new(path: &Path, width: u32, height: u32, config: &RecordingConfig) -> Result<Self> {
@@ -97,6 +98,7 @@ impl MediaWriter {
             pending: None,
             frames: 0,
             last_video_us: 0,
+            audio_observer: None,
         })
     }
     fn write_video_packet(&mut self, mut packet: ff::Packet) -> Result<()> {
@@ -127,6 +129,19 @@ impl MediaWriter {
             self.mixer.push(chunk);
         }
     }
+    pub fn observe_audio(&mut self, observer: crossbeam_channel::Sender<PcmAudio>) {
+        self.audio_observer = Some(observer);
+    }
+    pub fn audio_boundary(&self) {
+        if let Some(observer) = &self.audio_observer {
+            let _ = observer.try_send(PcmAudio {
+                pts_us: self.mixer.cursor * 1000 / 48,
+                sample_rate: 48000,
+                channels: 1,
+                samples: Vec::new(),
+            });
+        }
+    }
     pub fn clear_audio_route(&mut self, kind: AudioKind) {
         self.mixer.clear_route(kind);
     }
@@ -147,6 +162,15 @@ impl MediaWriter {
             };
             let pts = self.mixer.cursor;
             let samples = self.mixer.take(count);
+            if let Some(observer) = &self.audio_observer {
+                // Independent bounded ASR queue. Full/closed queues never delay saving.
+                let _ = observer.try_send(PcmAudio {
+                    pts_us: pts * 1000 / 48,
+                    sample_rate: 48000,
+                    channels: 1,
+                    samples: samples.iter().map(|s| (s[0] + s[1]) * 0.5).collect(),
+                });
+            }
             let mut frame = ff::frame::Audio::new(audio.format(), count, audio.channel_layout());
             frame.set_rate(48000);
             frame.set_pts(Some(pts));

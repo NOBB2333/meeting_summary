@@ -1,7 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+extern crate gpui_kit as gpui;
+mod ai;
 #[cfg(feature = "ui-smoke")]
 mod smoke;
+mod transcription;
 mod widgets;
+mod workspace;
+use gpui::component::{
+    Disableable, Selectable, Sizable,
+    button::{Button, ButtonVariants},
+    input::InputState,
+};
 use gpui::{prelude::*, *};
 use opencap_core::*;
 use opencap_media::{RecordingCommand, RecordingSession};
@@ -22,7 +31,7 @@ struct Recorder {
     stats: RecordingStats,
     controls: Option<DesktopControls>,
     hwnd: isize,
-    floating: Option<WindowHandle<Floating>>,
+    floating: Option<WindowHandle<gpui::base::Root>>,
     floating_hwnd: isize,
     mode: usize,
     selecting: Option<opencap_platform::RegionSelection>,
@@ -46,6 +55,32 @@ struct Recorder {
     preview_pts: i64,
     monitor: Option<opencap_platform::AudioMonitor>,
     monitor_peaks: (f32, f32),
+    transcription_tab: bool,
+    asr: Option<opencap_asr::AsrSession>,
+    asr_live: bool,
+    transcript: opencap_asr::Transcript,
+    transcript_output: Option<PathBuf>,
+    transcription_status: String,
+    transcription_progress: f64,
+    transcript_scroll: ScrollHandle,
+    preparing_model: Option<crossbeam_channel::Receiver<transcription::PrepareEvent>>,
+    pending_backfill: Option<PathBuf>,
+    summary_task: Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::MinutesHistory>>>,
+    summary_text: String,
+    ai: ai::AiWorkspace,
+    hotwords_input: Entity<InputState>,
+    speaker_count: Entity<InputState>,
+    speaker_threshold: Entity<InputState>,
+    speaker_task: Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::Transcript>>>,
+    speaker_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    meeting_page: workspace::MeetingPage,
+    meetings: Vec<workspace::MeetingFile>,
+    notes: Entity<gpui::component::input::TextareaState>,
+    notes_status: String,
+    notes_base: Option<PathBuf>,
+    notes_saved: String,
+    minutes_style: usize,
+    recording_registered: bool,
 }
 #[cfg(target_os = "macos")]
 const UI_FONT: &str = "PingFang SC";
@@ -63,18 +98,12 @@ fn native_handle(window: &Window) -> isize {
         _ => 0,
     }
 }
-fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_4()
-        .py_2()
-        .rounded_md()
-        .cursor_pointer()
-        .text_sm()
-        .bg(rgb(if active { 0x3e292b } else { SURFACE }))
-        .text_color(rgb(if active { 0xff9999 } else { 0xe6e7e9 }))
-        .hover(|s| s.bg(rgb(0x34373d)))
-        .child(label.into())
+fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Button {
+    Button::new(id)
+        .label(label)
+        .selected(active)
+        .when(!active, |b| b.outline())
+        .when(active, |b| b.primary())
 }
 fn label(text: impl Into<SharedString>) -> Div {
     div().text_xs().text_color(rgb(MUTED)).child(text.into())
@@ -113,6 +142,7 @@ impl Recorder {
                 system_audio: false,
                 microphone: false,
                 exclude_app: false,
+                realtime_transcription: false,
                 ..Default::default()
             };
         }
@@ -143,10 +173,16 @@ impl Recorder {
             }
         })
         .detach();
-        let targets = opencap_platform::targets().unwrap_or_else(|e| {
-            message = format!("无法枚举录制目标：{e}");
+        // Reading/exporting saved meetings does not need screen capture access.
+        // Enumerate targets when entering recording (or during the UI harness).
+        let targets = if cfg!(feature = "ui-smoke") {
+            opencap_platform::targets().unwrap_or_else(|e| {
+                message = format!("无法枚举录制目标：{e}");
+                Vec::new()
+            })
+        } else {
             Vec::new()
-        });
+        };
         let devices = opencap_platform::audio_devices().unwrap_or_else(|e| {
             message = format!("无法枚举音频设备：{e}");
             Vec::new()
@@ -157,6 +193,28 @@ impl Recorder {
             CaptureTarget::Window(_) => 1,
             CaptureTarget::Region { .. } => 2,
         };
+        let ai = ai::AiWorkspace::new(window, cx);
+        let hotwords_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("中文术语，用逗号分隔")
+                .default_value(config.transcription_hotwords.clone())
+        });
+        let speaker_count = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("人数：0 自动，或填写已知人数")
+                .default_value("0")
+        });
+        let speaker_threshold = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("阈值")
+                .default_value("0.9")
+        });
+        let meetings = workspace::discover(&config.output_dir);
+        let notes = cx.new(|cx| {
+            gpui::component::input::TextareaState::new(window, cx)
+                .placeholder("记录自己的备注、补充信息或会后想法。点击保存后生成独立的笔记文档。")
+                .auto_grow(10, 20)
+        });
         Self {
             config,
             targets,
@@ -189,6 +247,32 @@ impl Recorder {
             preview_pts: 0,
             monitor: None,
             monitor_peaks: (0.0, 0.0),
+            transcription_tab: !cfg!(feature = "ui-smoke"),
+            asr: None,
+            asr_live: false,
+            transcript: opencap_asr::Transcript::default(),
+            transcript_output: None,
+            transcription_status: "等待录制或导入文件".into(),
+            transcription_progress: 0.0,
+            transcript_scroll: ScrollHandle::new(),
+            preparing_model: None,
+            pending_backfill: None,
+            summary_task: None,
+            summary_text: String::new(),
+            ai,
+            hotwords_input,
+            speaker_count,
+            speaker_threshold,
+            speaker_task: None,
+            speaker_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            meeting_page: workspace::MeetingPage::Library,
+            meetings,
+            notes,
+            notes_status: String::new(),
+            notes_base: None,
+            notes_saved: String::new(),
+            minutes_style: 0,
+            recording_registered: false,
         }
     }
     fn active(&self) -> bool {
@@ -213,6 +297,15 @@ impl Recorder {
             }
             self.stats.state = RecordingState::Stopping;
         } else {
+            if self.targets.is_empty() {
+                self.refresh_targets();
+                if self.targets.is_empty() {
+                    // Do not clear the last successful transcript or launch ASR
+                    // when recording is known to be unavailable (e.g. TCC).
+                    cx.notify();
+                    return;
+                }
+            }
             if self.mode == 2 && !matches!(self.config.target, CaptureTarget::Region { .. }) {
                 self.pick_region();
                 return;
@@ -238,13 +331,26 @@ impl Recorder {
             }
             let mut recording = self.config.clone();
             recording.reserve_audio_track = true;
-            match RecordingSession::start(recording) {
+            if self.transcription_busy() {
+                self.message = "请先完成或取消当前转录/纪要任务，再开始录制".into();
+                cx.notify();
+                return;
+            }
+            let observer = self.start_live_asr();
+            match RecordingSession::start_observed(recording, observer) {
                 Ok(session) => {
                     session.enable_preview(self.config.show_recording_preview);
                     self.stats = session.stats();
                     self.session = Some(session);
+                    self.recording_registered = false;
                 }
-                Err(e) => self.message = format!("无法开始录制：{e:#}"),
+                Err(e) => {
+                    self.message = format!("无法开始录制：{e:#}");
+                    if let Some(asr) = &mut self.asr {
+                        asr.cancel();
+                    }
+                    self.asr_live = false;
+                }
             }
         }
         cx.notify();
@@ -260,6 +366,8 @@ impl Recorder {
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
         let mut needs_render = false;
+        self.persist_notes(cx);
+        needs_render |= self.poll_transcription();
         let events: Vec<_> = self
             .controls
             .as_ref()
@@ -319,6 +427,19 @@ impl Recorder {
                 || next_stats.microphone_peak != self.stats.microphone_peak
                 || next_stats.warnings.len() != self.stats.warnings.len();
             self.stats = next_stats;
+            if self.asr_live
+                && let Some(asr) = &mut self.asr
+            {
+                if let Some(path) = &self.stats.output {
+                    let base = transcription::final_recording_path(path);
+                    asr.set_output(base.clone());
+                    self.transcript_output = Some(base);
+                }
+                if session.finished() {
+                    asr.finish_at((self.stats.duration_seconds * 1000.0) as u64);
+                    self.asr_live = false;
+                }
+            }
             needs_render |= stats_changed;
             if previous != self.stats.state {
                 if self.stats.state == RecordingState::Recording
@@ -340,8 +461,22 @@ impl Recorder {
                 ) {
                     opencap_platform::show_native_window(self.hwnd, true);
                     self.recoverables = find_recoverables(&self.config.output_dir);
+                    self.refresh_meetings();
+                    if self.stats.state == RecordingState::Finished {
+                        self.transcription_tab = true;
+                        self.meeting_page = workspace::MeetingPage::Library;
+                        self.page_scroll.set_offset(point(px(0.), px(0.)));
+                    }
                 }
             }
+        }
+        if !self.recording_registered
+            && self.stats.state == RecordingState::Finished
+            && self.session.as_ref().is_some_and(|s| s.finished())
+        {
+            self.recording_registered = true;
+            self.refresh_meetings();
+            needs_render = true;
         }
         let region_events: Vec<_> = self
             .selecting
@@ -384,7 +519,11 @@ impl Recorder {
                 RecordingState::Recording | RecordingState::Paused | RecordingState::Stopping
             ));
         }
-        let wants_monitor = self.config.monitor_levels && !self.active();
+        let wants_monitor = self.config.monitor_levels
+            && !self.settings
+            && !self.transcription_tab
+            && !self.active()
+            && !self.transcription_busy();
         if !wants_monitor {
             if self.monitor.take().is_some() {
                 self.monitor_peaks = (0.0, 0.0);
@@ -658,8 +797,10 @@ impl Recorder {
             {
                 let path = path.clone();
                 let _ = entity.update(cx, |this, cx| {
+                    this.refresh_meetings();
                     this.config.output_dir = path;
                     this.save();
+                    this.refresh_meetings();
                     cx.notify();
                 });
             }
@@ -691,6 +832,7 @@ fn find_recoverables(dir: &std::path::Path) -> Vec<PathBuf> {
 impl Render for Recorder {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content_width = (f32::from(window.viewport_size().width) - 58.).max(1.);
+        self.sync_notes(window, cx);
         let active = self.active();
         let status = match self.stats.state {
             RecordingState::Idle => "准备就绪",
@@ -723,49 +865,17 @@ impl Render for Recorder {
             .p_6()
             .flex()
             .flex_col()
-            .gap_5()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .items_baseline()
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("OpenCap"),
-                            )
-                            .child(label("录制工作台")),
-                    )
-                    .child(
-                        button("settings", "设置", self.settings).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.settings = !this.settings;
-                                this.close_targets();
-                                this.audio_picker = None;
-                                this.page_scroll.set_offset(point(px(0.), px(0.)));
-                                cx.notify();
-                            },
-                        )),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(label(status))
-                    .child(label("离线 · 无水印 · 不限时")),
-            );
+            .gap_5();
         if self.settings {
             root = root.child(self.settings_view(cx));
+        } else if self.transcription_tab {
+            root = root.child(self.meeting_workspace(cx));
         } else {
             root = root
+                .child(workspace::heading(
+                    "开始录制",
+                    "选择画面和声音来源。实时文字自动保存；录制后到会议文件中生成 AI 纪要。",
+                ))
                 .child(
                     div().flex().gap_2().children(
                         ["全屏", "窗口", "区域"]
@@ -832,6 +942,7 @@ impl Render for Recorder {
                             ),
                     )
                 });
+            root = root.child(self.live_transcript_card(cx));
         }
         let mut controls = div()
             .w_full()
@@ -882,7 +993,8 @@ impl Render for Recorder {
                         )
                         .bg(rgb(RED))
                         .text_color(rgb(0xffffff))
-                        .py_3()
+                        .large()
+                        .disabled(!active && self.transcription_busy())
                         .flex_1()
                         .text_center()
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1005,12 +1117,20 @@ impl Render for Recorder {
             .flex()
             .flex_col()
             .bg(rgb(BG))
+            .text_color(rgb(0xeceef1))
+            .font_family(UI_FONT)
+            .child(self.workspace_header(status, cx))
             .child(div().flex_1().min_h(px(0.)).child(widgets::scrollable(
                 "page-scroll",
                 root,
                 &self.page_scroll,
             )))
-            .child(controls)
+            .when(!self.settings && !self.transcription_tab, |d| {
+                d.child(controls)
+            })
+            .when(active && (self.settings || self.transcription_tab), |d| {
+                d.child(self.active_recording_bar(cx))
+            })
     }
 }
 impl Recorder {
@@ -1415,6 +1535,9 @@ impl Recorder {
             .flex()
             .flex_col()
             .gap_3()
+            .child(workspace::heading("设置 / AI", "AI 服务、转录模型和录制偏好集中在这里管理。"))
+            .child(self.ai_settings_view(cx))
+            .child(self.transcription_settings(cx))
             .child(label("录制界面"))
             .child(
                 button(
@@ -1877,7 +2000,7 @@ fn main() {
     static LOGGER: StderrLogger = StderrLogger;
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Warn);
-    let application = Application::new();
+    let application = gpui::application().with_assets(gpui::assets::Assets);
     #[cfg(target_os = "macos")]
     let reopen_view = Rc::new(std::cell::Cell::new(0isize));
     #[cfg(target_os = "macos")]
@@ -1888,8 +2011,11 @@ fn main() {
         });
     }
     application.run(move |cx: &mut App| {
+        gpui::init(cx);
+        gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
         let bounds = Bounds::centered(None, size(px(960.), px(850.)), cx);
-        let main = cx
+        let mut main_entity = None;
+        let main_window = cx
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1901,10 +2027,14 @@ fn main() {
                     window_min_size: Some(size(px(500.), px(420.))),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| Recorder::new(window, cx)),
+                |window, cx| {
+                    let entity = cx.new(|cx| Recorder::new(window, cx));
+                    main_entity = Some(entity.clone());
+                    cx.new(|cx| gpui::base::Root::new(entity, window, cx))
+                },
             )
             .expect("Create recorder window");
-        let entity = main.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let entity = main_entity.expect("recorder entity");
         #[cfg(target_os = "macos")]
         reopen_view.set(entity.read(cx).hwnd);
         let weak = entity.downgrade();
@@ -1932,7 +2062,8 @@ fn main() {
                         false
                     });
                     let _ = weak.update(cx, |r, _| r.floating_hwnd = hwnd);
-                    cx.new(|_| Floating { recorder: weak })
+                    let floating = cx.new(|_| Floating { recorder: weak });
+                    cx.new(|cx| gpui::base::Root::new(floating, window, cx))
                 },
             )
             .expect("Create recording controls");
@@ -1952,7 +2083,9 @@ fn main() {
         cx.activate(true);
         #[cfg(feature = "ui-smoke")]
         if let Some(path) = smoke::output_dir() {
-            smoke::run(main, entity, path, cx);
+            smoke::run(main_window, entity, path, cx);
         }
+        #[cfg(not(feature = "ui-smoke"))]
+        let _ = main_window;
     });
 }

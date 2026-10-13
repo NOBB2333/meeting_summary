@@ -1,6 +1,48 @@
 # OpenCap
 
-Windows / macOS 本地开源录屏工具。Rust + GPUI + FFmpeg；Windows 使用 Windows Graphics Capture / WASAPI，macOS 使用 ScreenCaptureKit / CoreAudio / VideoToolbox。完全本地运行，无账号、无云服务、无遥测。
+Windows / macOS 本地开源录屏、转录与纪要工具。Rust + GPUI Kit + FFmpeg + sherpa-onnx；Windows 使用 Windows Graphics Capture / WASAPI，macOS 使用 ScreenCaptureKit / CoreAudio / VideoToolbox。本地 CPU 转录，无遥测；AI 纪要可选择本机模型或自行配置的远程服务。
+
+## 去哪里看结果、怎样生成会议纪要
+
+顶部固定三个入口：**录制 / 会议文件 / 设置 · AI**。录制停止后自动进入会议文件列表；已有录制和导入任务会被发现，重启后仍可继续查看。选择会议后分别进入 **逐字稿 / AI 会议纪要 / 个人笔记**。每页顶部显示保存位置，并提供对应的 Word 按钮；录制控制条只在录制页显示，跨页录制时显示精简的停止/暂停条。
+
+**生成方式：逐字稿自动保存，AI 纪要手动生成。** 音频和带音轨视频走同一套转录、纪要与导出流程。开启实时转录并准备好模型后，录制中的语音自动识别；关闭实时转录或模型未就绪时，媒体仍正常保存，会议列表显示“待转录”，点击“转录并查看”即可补转。导入已有文件会自动开始本地转录；AI 纪要不会自动发起网络请求。
+
+1. 在“设置 / AI → 本地语音转录”下载实时模型并开启实时转录；也可以在“会议文件”导入 WAV、M4A、MP3、MP4 等音视频或保存的 `.transcript.json`。
+2. 转录完成，在“逐字稿”查看原文、打开 TXT 或导出 Word。需要按人整理时，先点击“分析 / 更新说话人”。
+3. 在“设置 / AI”配置服务；默认 Responses、DeepSeek 官方地址和 `deepseek-flash`，填写 API Key 后保存。密钥保存在 macOS 钥匙串 / Windows 凭据库，不写入设置 JSON。
+4. 进入“AI 会议纪要”，选择正式纪要、阅读摘要或行动清单，填写补充要求后点击“生成 AI 纪要与 Word”。生成后可继续提问、按要求修改，保留旧版本。
+5. “个人笔记”由用户填写，本机自动保存 TXT，点击“导出笔记 Word”生成或更新独立文档。
+
+| 内容 | 文件 | 生成方式 |
+| --- | --- | --- |
+| 原始转写 | `.transcript.txt` / `.transcript.md` / `.transcript.docx` | 转录完成后自动保存；旧稿可点击导出补齐 Word/TXT |
+| 字幕与识别数据 | `.srt` / `.transcript.json` | 自动保存；JSON 支持重新打开 |
+| AI 会议纪要 | `.summary.md` / `.summary.docx` | 手动生成，与原始转写独立 |
+| AI 历史版本与对话 | `.summary.vNNN.md` / `.summary.vNNN.docx` / `.summary.history.json` | 每次生成、修改或提问后保存 |
+| 个人笔记 | `.notes.txt` / `.notes.docx` | TXT 自动保存；Word 手动导出更新 |
+
+实时录制的关联文档与媒体同目录，默认 `~/Movies/OpenCap`（macOS）；外部导入任务在录制目录的 `Transcripts` 内。历史索引 `meetings.json` 只记录本地结果路径；删除或移动原文件后，不会复制、还原或猜测原文件。应用内不执行 AI 生成的脚本，Word 由 Rust 原生生成，接收方只需 Word/WPS/Pages。PDF 导出尚未实现。
+
+“识别中”的整句会随后续语音替换；默认上下文校正每约 5 秒复核，可改写早期错字。关闭校正可降低 CPU 和内存。中文术语在设置中保存，下次流式识别生效；术语是偏置，不保证每个错字都能修好。转录完成后界面显示完整稿，识别中显示最近 40 句。队列积压会在停止后补转，取消不删除媒体或已确认文本。“试播文件，观察实时修正”按原速送入流式引擎，不播放声音。
+
+“分析 / 更新说话人”使用本机单线程 CPU 的 Pyannote INT8 + 中文 3D-Speaker ERes2Net；首次下载约 41 MB 模型。人数 0 自动，或填写已知人数 1–20；阈值默认 0.9。编号进入逐字稿、字幕和 Word；AI 纪要按来源标签整理，并附上程序生成的说话人索引。未分析时明确标注“尚未分析”，不虚构编号或姓名。横跨多人的句子标交替或重叠；实时字幕尚不带说话人，短发言和串音可能误分。最长支持 2 小时。
+
+所有 AI 任务在后台运行，设置随时可打开。使用远程 AI 时，主动生成、修改或提问才发送转录文字，不上传音视频。保留 Chat Completions、Anthropic/Claude、本机 Ollama；支持 Responses 后台轮询与取消（需服务支持）；DeepSeek 使用本机后台任务。只提问不会改写当前 Word；失败和取消保留旧稿。
+
+识别模型在应用配置目录的 `models` 缓存，之后离线使用，可通过 `OPENCAP_MODEL_DIR` 指定缓存目录。默认流式中文模型为 Zipformer Chinese 14M 2023-02-23 INT8，单线程 CPU + modified beam search；它不是英文模型。选型和跨平台边界见 [转录与 UI 选型方案](docs/transcription-selection.md)。GPUI Kit 0.7.3 已替代直接依赖 GPUI 0.2.2；GPUI Fast 本轮未开启。
+
+独立 CLI（也可在 Windows 开发脚本准备 FFmpeg DLL 后使用）：
+
+```bash
+cargo build -p opencap-asr
+target/debug/opencap-transcribe prepare streaming
+target/debug/opencap-transcribe transcribe meeting.m4a --output recordings/meeting --model offline
+target/debug/opencap-transcribe transcribe meeting.wav --output recordings/live-demo --model streaming --realtime
+target/debug/opencap-transcribe summary recordings/meeting.transcript.json --output recordings/meeting --model qwen2.5:7b
+```
+
+首次构建会取得固定版本 sherpa-onnx 原生静态运行库；无需 Python、GPU、Metal 推理或网络转录服务。整个录制应用的 Linux 后端尚未实现，不能把识别运行库的平台支持当作整款应用已支持 Linux。
 
 目标不是做第二个 OBS，而是一个**点一下就能录**的轻量工具：全屏 / 窗口 / 区域录制，系统声音和麦克风，暂停继续，托盘和全局快捷键，输出 MP4（可选同名 M4A）。针对 PPT、文档、浏览器、IDE 这类桌面内容做了低码率优化，同时支持录制游戏和视频等高动态画面。
 
@@ -14,7 +56,7 @@ Windows / macOS 本地开源录屏工具。Rust + GPUI + FFmpeg；Windows 使用
 
 FFmpeg 的 DLL 已经放在 `opencap.exe` 旁边，不需要另外安装 FFmpeg，也不需要装运行库。
 
-要求：Windows 11 x64（Windows 10 较新版本也可）。
+推荐：Windows 11 x64。此轮新版在 Mac 上验证，Windows 的 Kit / ASR / AI 集成仍需实机回归；不将此前录制版测试当作新版已通过。
 
 **macOS**：直接打开 `release/OpenCap.app`，FFmpeg 动态库已放在应用包内，无需安装虚拟声卡。源码后端支持 macOS 13+，应用包的最低版本同时取决于捆绑库；本机 Homebrew 库要求 macOS 26，当前本机包因此要求 macOS 26+。首次使用在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」允许 OpenCap；录制麦克风还需要独立的麦克风权限。macOS 的默认输出位置是 `~/Movies/OpenCap`。
 
@@ -191,7 +233,7 @@ release/OpenCap-windows-x64.zip     可直接发给别人的压缩包
 
 | 目录 | 用途 | 是否提交 |
 | --- | --- | --- |
-| `crates/` | Rust 源码：core / platform / media / policy / app / bench | 是 |
+| `crates/` | Rust 源码：core / platform / media / policy / app / bench / asr | 是 |
 | `scripts/` | 构建、打包、验收脚本 | 是 |
 | `docs/` | 架构与验收说明 | 是 |
 | `.deps/` | 自动下载的 FFmpeg 开发库与 DLL | 否 |

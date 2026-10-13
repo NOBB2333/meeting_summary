@@ -1,0 +1,24 @@
+[package]
+name = "opencap-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+opencap-core.workspace = true
+clap.workspace = true
+sherpa-onnx = "=1.13.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tar = "0.4"
+bzip2 = "0.6"
+ffmpeg-next = { version = "=9.0.0", default-features = false, features = ["codec", "format", "software-resampling"] }
+docx-rs = { version = "0.4", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false }
+
+[[bin]]
+name = "opencap-transcribe"
+path = "src/main.rs"

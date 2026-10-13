@@ -54,6 +54,8 @@ def package(profile, identity):
     for name in ("LICENSE", "THIRD_PARTY.md", "README.md"):
         shutil.copy2(root / name, resources / name)
     shutil.copytree(root / "LICENSES", resources / "LICENSES")
+    (resources / "docs").mkdir()
+    shutil.copy2(root / "docs/transcription-selection.md", resources / "docs/transcription-selection.md")
     copied = {}
     search = rpaths(binary)
 

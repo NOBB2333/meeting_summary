@@ -83,6 +83,15 @@ pub struct AudioChunk {
     pub samples: Vec<f32>, /* interleaved stereo 48 kHz */
 }
 
+/// Owned PCM on the recording media timeline. Observers cannot stall recording.
+#[derive(Debug, Clone)]
+pub struct PcmAudio {
+    pub pts_us: i64,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub samples: Vec<f32>,
+}
+
 /// Future backends may expose owned GPU buffers; CPU frames are the portable v1 path.
 pub trait CaptureBackend: Send {
     fn stop(&mut self) -> Result<()>;

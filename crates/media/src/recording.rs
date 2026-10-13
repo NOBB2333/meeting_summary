@@ -30,6 +30,12 @@ pub struct RecordingSession {
 }
 impl RecordingSession {
     pub fn start(config: RecordingConfig) -> Result<Self> {
+        Self::start_observed(config, None)
+    }
+    pub fn start_observed(
+        config: RecordingConfig,
+        audio_observer: Option<Sender<PcmAudio>>,
+    ) -> Result<Self> {
         config.validate()?;
         std::fs::create_dir_all(&config.output_dir)?;
         let (commands, rx) = unbounded();
@@ -44,7 +50,7 @@ impl RecordingSession {
             .name("opencap-recording".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(config, rx, shared.clone(), worker_preview)
+                    run(config, rx, shared.clone(), worker_preview, audio_observer)
                 }));
                 let error = match result {
                     Ok(Ok(())) => None,
@@ -167,6 +173,7 @@ fn run(
     commands: Receiver<RecordingCommand>,
     stats: Arc<Mutex<RecordingStats>>,
     preview: Arc<crate::preview::PreviewSlot>,
+    audio_observer: Option<Sender<PcmAudio>>,
 ) -> Result<()> {
     let clock = RecordingClock::new();
     let (video_tx, video_rx) = bounded(2);
@@ -192,6 +199,9 @@ fn run(
     let (output, partial) = unique_output(&config.output_dir)?;
     stats.lock().output = Some(partial.clone());
     let mut writer = MediaWriter::new(&partial, first.width, first.height, &config)?;
+    if let Some(observer) = audio_observer {
+        writer.observe_audio(observer);
+    }
     // Encoder probing can take seconds; start the recording timeline only once ready.
     let video_epoch = clock.now_us();
     let mut audio = opencap_platform::start_audio(&config, clock.clone(), audio_tx, warn_tx);
@@ -244,6 +254,8 @@ fn run(
                         writer.audio(tail);
                     }
                     mic.reset();
+                    writer.audio_until((clock.now_us() - video_epoch).max(0), false)?;
+                    writer.audio_boundary();
                     stats.lock().state = RecordingState::Paused;
                 }
                 RecordingCommand::Resume => {

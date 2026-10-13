@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/policy", "crates/platform", "crates/media", "crates/app", "crates/bench"]
+members = ["crates/core", "crates/policy", "crates/platform", "crates/media", "crates/app", "crates/bench", "crates/asr"]
 default-members = ["crates/app", "crates/bench"]
 resolver = "2"
 
@@ -20,6 +20,7 @@ opencap-core = { path = "crates/core" }
 opencap-policy = { path = "crates/policy" }
 opencap-platform = { path = "crates/platform" }
 opencap-media = { path = "crates/media" }
+opencap-asr = { path = "crates/asr" }
 
 [profile.dev]
 debug = 0

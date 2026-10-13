@@ -41,4 +41,27 @@ FFmpeg ABI、GPUI 版本及 Rust 依赖由固定版本与 Cargo.lock 管理。�
 
 ## 后续优化接口
 
+转录使用 `crates/asr` 的独立 CPU 工作线程。`MediaWriter` 在 AAC 编码前通过有界、非阻塞 PCM 观察队列发布混音，`RecordingSession::start_observed` 仅提供可选观察接口。ASR 不属于采集回调、编码器或 GPUI Render 生命周期。实时缺失区间从最终保存文件离线补转；字幕按 utterance id / revision 替换临时整句，只将最终段用于纪要。导入文件由 FFmpeg 增量解码并保持媒体时间戳。详见 `transcription-selection.md`。
+
+应用 UI 已迁移至 GPUI Kit 0.7.3，由 Kit 固定 gpui-pre 0.3.9 并初始化 Root / theme / assets。Button、Input、Markdown 与滚动条复用 Kit 组件；原生窗口采集、句柄与录制线程保留平台边界。GPUI Fast 未启用。
+
 GPU texture 生命周期与硬件编码器互操作、动态重配置、真实设备时钟平滑重采样、GPU 引擎利用率计数器，均须经过独立 Benchmark 后启用。Windows 优先尝试采集显示器所属厂商的编码器，macOS 优先尝试 VideoToolbox，失败后使用软件编码。端到端 GPU 零拷贝及 Linux PipeWire 后端尚未实现。
+
+
+## 2026-10-12 会后说话人分析与可修订纪要
+
+`asr::diarization` 复用本机解码和 sherpa-onnx，独立于实时识别任务，会后向 Transcript 写入说话人时间段。`asr::summary` 适配 Ollama / Responses / Chat Completions / Anthropic，完成分组整理、AI 问答、修订和版本持久化。`app::ai` 管理可见配置、系统凭据、后台状态和对话；录制模块不依赖 AI 服务。录制 / ASR / AI / 说话人分析任务串行调度，避免低资源机器同时加载推理任务；页面导航始终允许打开设置。
+
+稿件、版本、来源和对话保留在本机；密钥进入 macOS 钥匙串或 Windows Credential Manager。远程请求仅由用户主动点击触发，转录文字发送到选定服务；音视频不发送。普通请求不阻塞 UI，Responses 可选服务端 background 轮询与取消。无需 Agent 即可完成标准结构 Markdown 和反复修改；原生 Word 模板渲染已实现，PDF 导出暂未实现。
+
+
+### 默认服务与文档输出
+
+默认 AI 为 DeepSeek 官方 Responses / deepseek-flash，Key 经操作系统凭据库持久保存。DeepSeek 不支持服务端 background，应用使用工作线程执行且主动携带稿件/对话上下文。`asr::document` 以 Markdown 为数据，通过 Rust docx-rs 写入 A4 DOCX，固定字体、标题层级、待办表格、续页表头及整行换页；无 Python 和模型生成脚本依赖。`MinutesHistory` 保存 Word/Markdown 历史版本与 AI 回合，提问只写回合，不重写文档。
+
+
+### 会议结果工作区（2026-10-13）
+
+`app/workspace.rs` 负责本地会议库发现、路径索引、固定主导航、逐字稿/纪要/笔记分区和笔记持久化；`app/transcription.rs` 只负责转录及说话人任务；`app/ai.rs` 管理生成模板、对话和纪要导出。读取历史会议不会发起 AI 调用。
+
+`Transcript::save` 保留 JSON/Markdown/SRT，补充纯文本及最终原稿 Word。文档来源是确认的 ASR 文本而非 LLM。说话人索引由实际轮次生成，既进入原稿也附加到生成/修改后的 AI 稿；标签不等于姓名，自动聚类数量需要核对。笔记单独保存，避免和 AI 对话或纪要互相覆盖。

@@ -23,6 +23,63 @@ fn scratch() -> PathBuf {
     std::fs::create_dir(&dir).unwrap();
     dir
 }
+
+#[test]
+fn transcription_tap_has_mixed_audio_tail_without_stalling_full_queues() {
+    for capacity in [1, 128] {
+        let dir = scratch();
+        let path = dir.join("observed.mp4");
+        let config = RecordingConfig {
+            encoder: Some("libx264".into()),
+            ..Default::default()
+        };
+        let mut writer = MediaWriter::new(&path, 320, 180, &config).unwrap();
+        writer
+            .video(&VideoFrame {
+                width: 320,
+                height: 180,
+                stride: 320 * 4,
+                pts_us: 0,
+                data: Arc::new(vec![90; 320 * 180 * 4]),
+            })
+            .unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(capacity);
+        writer.observe_audio(tx);
+        writer.audio(AudioChunk {
+            kind: AudioKind::System,
+            pts_us: 0,
+            samples: vec![0.1; 48000 * 2],
+        });
+        writer.audio(AudioChunk {
+            kind: AudioKind::Microphone,
+            pts_us: 0,
+            samples: vec![0.2; 48000 * 2],
+        });
+        writer.finish(1_000_000).unwrap();
+        let chunks: Vec<_> = rx.try_iter().collect();
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks
+                .iter()
+                .flat_map(|c| &c.samples)
+                .all(|x| (*x - 0.3).abs() < 1e-6)
+        );
+        if capacity == 128 {
+            assert_eq!(
+                chunks.iter().map(|c| c.samples.len()).sum::<usize>(),
+                48000,
+                "tap lost the non-AAC-aligned tail"
+            );
+            for c in chunks {
+                assert_eq!((c.sample_rate, c.channels), (48000, 1));
+            }
+        }
+        let context = ffmpeg_next::format::input(&path).unwrap();
+        assert!((context.duration() - 1_000_000).abs() < 50000);
+        drop(context);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
 #[test]
 fn vfr_static_tail_audio_and_recovery_preserve_duration() {
     let dir = scratch();
