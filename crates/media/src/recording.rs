@@ -37,6 +37,13 @@ impl RecordingSession {
         audio_observer: Option<Sender<PcmAudio>>,
     ) -> Result<Self> {
         config.validate()?;
+        anyhow::ensure!(
+            !config.audio_only
+                || config.system_audio
+                || config.microphone
+                || config.reserve_audio_track,
+            "仅录音需要开启系统声音或麦克风"
+        );
         std::fs::create_dir_all(&config.output_dir)?;
         let (commands, rx) = unbounded();
         let stats = Arc::new(Mutex::new(RecordingStats {
@@ -102,7 +109,7 @@ impl Drop for RecordingSession {
         self.join();
     }
 }
-fn unique_output(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+fn unique_output(dir: &Path, audio_only: bool) -> Result<(PathBuf, PathBuf)> {
     let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
     for n in 0..100 {
         let suffix = if n == 0 {
@@ -110,9 +117,12 @@ fn unique_output(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         } else {
             format!("_{n:02}")
         };
-        let output = dir.join(format!("OpenCap_{stamp}{suffix}.mp4"));
-        let partial = output.with_extension("partial.mp4");
+        let extension = if audio_only { "m4a" } else { "mp4" };
+        let output = dir.join(format!("OpenCap_{stamp}{suffix}.{extension}"));
+        let partial = output.with_extension(format!("partial.{extension}"));
         if output.exists()
+            || output.with_extension("mp4").exists()
+            || output.with_extension("partial.mp4").exists()
             || output.with_extension("m4a").exists()
             || output.with_extension("partial.m4a").exists()
             || output.with_extension("recording.json").exists()
@@ -181,24 +191,38 @@ fn run(
     let (errors_tx, errors_rx) = bounded(8);
     let (warn_tx, warn_rx) = bounded(16);
     let dropped = Arc::new(AtomicU64::new(0));
-    let mut capture = opencap_platform::start_capture(
-        &config,
-        clock.clone(),
-        video_tx,
-        video_rx.clone(),
-        errors_tx,
-        dropped.clone(),
-    )?;
-    stats
-        .lock()
-        .warnings
-        .extend(capture.warnings().iter().cloned());
-    let first = video_rx
-        .recv_timeout(Duration::from_secs(10))
-        .context("No capture frames received within 10 seconds")?;
-    let (output, partial) = unique_output(&config.output_dir)?;
+    let mut capture = if config.audio_only {
+        None
+    } else {
+        Some(opencap_platform::start_capture(
+            &config,
+            clock.clone(),
+            video_tx,
+            video_rx.clone(),
+            errors_tx,
+            dropped.clone(),
+        )?)
+    };
+    let first = if let Some(capture) = &capture {
+        stats
+            .lock()
+            .warnings
+            .extend(capture.warnings().iter().cloned());
+        Some(
+            video_rx
+                .recv_timeout(Duration::from_secs(10))
+                .context("No capture frames received within 10 seconds")?,
+        )
+    } else {
+        None
+    };
+    let (output, partial) = unique_output(&config.output_dir, config.audio_only)?;
     stats.lock().output = Some(partial.clone());
-    let mut writer = MediaWriter::new(&partial, first.width, first.height, &config)?;
+    let mut writer = if let Some(first) = &first {
+        MediaWriter::new(&partial, first.width, first.height, &config)?
+    } else {
+        MediaWriter::new_audio(&partial, &config)?
+    };
     if let Some(observer) = audio_observer {
         writer.observe_audio(observer);
     }
@@ -210,23 +234,37 @@ fn run(
     let mut audio_changes = Vec::new();
     let mut peaks = [0.0f32; 2];
     let mut latest = first;
-    latest.pts_us = 0;
-    while let Ok(mut frame) = video_rx.try_recv() {
-        frame.pts_us = 0;
-        latest = frame;
+    let mut preview_tick = None;
+    let mut policy = FramePolicy::default();
+    if let Some(latest) = latest.as_mut() {
+        latest.pts_us = 0;
+        while let Ok(mut frame) = video_rx.try_recv() {
+            frame.pts_us = 0;
+            *latest = frame;
+        }
+        writer.video(latest)?;
+        preview.publish(latest, &mut preview_tick);
+        let _ = policy.accept(latest, &config);
     }
     dropped.store(0, Ordering::Relaxed);
-    writer.video(&latest)?;
-    let mut preview_tick = None;
-    preview.publish(&latest, &mut preview_tick);
-    let mut policy = FramePolicy::default();
-    let _ = policy.accept(&latest, &config);
     {
         let mut s = stats.lock();
         s.state = RecordingState::Recording;
-        s.encoder = writer.video.name.clone();
+        s.encoder = writer
+            .video
+            .as_ref()
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| "aac".into());
         s.audio_routing = routing.clone();
     }
+    let began = Instant::now();
+    let mut last_loop = Instant::now();
+    let mut loop_max_ms = 0.0f64;
+    let mut encode_max_ms = 0.0f64;
+    let mut preview_max_ms = 0.0f64;
+    let mut audio_write_max_ms = 0.0f64;
+    // Bounded history in the existing report: no new telemetry files or services.
+    let mut performance_samples = std::collections::VecDeque::new();
     let mut tick = Instant::now();
     let mut last_frames = 0;
     let mut last_bytes = 0;
@@ -237,6 +275,8 @@ fn run(
     let mut silent_audio_since = [Instant::now(); 2];
     let mut silent_audio_warned = [false; 2];
     loop {
+        loop_max_ms = loop_max_ms.max(last_loop.elapsed().as_secs_f64() * 1000.);
+        last_loop = Instant::now();
         let mut stop = false;
         for cmd in commands.try_iter() {
             match cmd {
@@ -323,7 +363,7 @@ fn run(
             stop_reason = Some(reason);
             break;
         }
-        if capture.is_finished() {
+        if capture.as_ref().is_some_and(|c| c.is_finished()) {
             stop_reason = Some("屏幕采集线程已结束，正在保存已录制内容".into());
             break;
         }
@@ -345,18 +385,26 @@ fn run(
         if !clock.is_paused() {
             while let Ok(mut frame) = video_rx.try_recv() {
                 frame.pts_us = (frame.pts_us - video_epoch).max(0);
-                latest = frame;
+                latest = Some(frame);
                 last_capture = Instant::now();
                 idle_warned = false;
             }
-            let mut frame = latest.clone();
-            // Cached frames carry the current media time, including static end tails.
-            frame.pts_us = now;
-            if policy.accept(&frame, &config) {
-                writer.video(&frame)?;
-                preview.publish(&frame, &mut preview_tick);
+            if let Some(latest) = &latest {
+                let mut frame = latest.clone();
+                // Cached frames carry the current media time, including static end tails.
+                frame.pts_us = now;
+                if policy.accept(&frame, &config) {
+                    let measured = Instant::now();
+                    writer.video(&frame)?;
+                    encode_max_ms = encode_max_ms.max(measured.elapsed().as_secs_f64() * 1000.);
+                    let measured = Instant::now();
+                    preview.publish(&frame, &mut preview_tick);
+                    preview_max_ms = preview_max_ms.max(measured.elapsed().as_secs_f64() * 1000.);
+                }
             }
+            let measured = Instant::now();
             writer.audio_until((now - 150_000).max(0), false)?;
+            audio_write_max_ms = audio_write_max_ms.max(measured.elapsed().as_secs_f64() * 1000.);
         }
         if tick.elapsed() >= Duration::from_secs(1) {
             writer.flush_io()?;
@@ -376,6 +424,21 @@ fn run(
             s.dropped_frames = dropped.load(Ordering::Relaxed);
             s.cpu_percent = cpu;
             s.peak_memory_bytes = memory;
+            if performance_samples.len() == 1800 {
+                performance_samples.pop_front();
+            }
+            performance_samples.push_back(serde_json::json!({
+                "wall_seconds": began.elapsed().as_secs_f64(), "media_seconds": s.duration_seconds,
+                "cpu_percent": cpu, "peak_memory_bytes": memory, "fps": s.fps,
+                "dropped_frames": s.dropped_frames, "video_queue": video_rx.len(), "audio_queue": audio_rx.len(),
+                "asr_pending_packets": writer.asr_pending_packets(), "loop_max_ms": loop_max_ms,
+                "encode_max_ms": encode_max_ms, "preview_max_ms": preview_max_ms,
+                "audio_write_max_ms": audio_write_max_ms, "paused": clock.is_paused()
+            }));
+            loop_max_ms = 0.;
+            encode_max_ms = 0.;
+            preview_max_ms = 0.;
+            audio_write_max_ms = 0.;
             for (i, kind) in [AudioKind::System, AudioKind::Microphone]
                 .into_iter()
                 .enumerate()
@@ -400,7 +463,8 @@ fn run(
             s.system_peak = peaks[0];
             s.microphone_peak = peaks[1];
             peaks = [0.0; 2];
-            if !idle_warned
+            if !config.audio_only
+                && !idle_warned
                 && !clock.is_paused()
                 && matches!(config.target, CaptureTarget::Window(_))
                 && last_capture.elapsed() > Duration::from_secs(5)
@@ -418,7 +482,9 @@ fn run(
     stats.lock().state = RecordingState::Stopping;
     clock.pause();
     let stop_us = (clock.now_us() - video_epoch).max(1);
-    if let Err(error) = capture.stop() {
+    if let Some(capture) = capture.as_mut()
+        && let Err(error) = capture.stop()
+    {
         stats
             .lock()
             .warnings
@@ -440,15 +506,21 @@ fn run(
         rebase_audio(&mut tail, video_epoch);
         writer.audio(tail);
     }
-    let encoder_options = writer.video.options.clone();
-    let encoder_details = writer.video.details();
+    let encoder_options = writer
+        .video
+        .as_ref()
+        .map(|v| v.options.clone())
+        .unwrap_or_default();
+    let encoder_details = writer.video.as_ref().map(|v| v.details());
     let frames = writer.frames;
     let has_audio = writer.audio_cursor_us().is_some();
     writer.finish(stop_us)?;
     crate::recover_file(&partial, &output)
-        .context("Recording saved as partial MP4; finalization/recovery failed")?;
+        .context("Recording saved as partial media; finalization/recovery failed")?;
     std::fs::remove_file(&partial)?;
-    if config.separate_audio && has_audio {
+    if config.audio_only {
+        stats.lock().audio_output = Some(output.clone());
+    } else if config.separate_audio && has_audio {
         let audio_output = output.with_extension("m4a");
         match crate::export_audio(&output, &audio_output) {
             Ok(()) => stats.lock().audio_output = Some(audio_output),
@@ -468,7 +540,7 @@ fn run(
         s.fps = frames as f64 / s.duration_seconds;
         s.bytes = final_bytes;
         s.bitrate_kbps = final_bytes as f64 * 8.0 / 1000.0 / s.duration_seconds;
-        s.av_offset_ms = if has_audio {
+        s.av_offset_ms = if has_audio && !config.audio_only {
             container_av_offset(&output).ok()
         } else {
             None
@@ -480,8 +552,8 @@ fn run(
         s.clone()
     };
     let report = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "config": config, "stats": snapshot, "encoder_options": encoder_options, "encoder_details": encoder_details, "output_media":crate::inspect_output(&output)?,
-        "pixel_format": "8-bit 4:2:0 BT.709 SDR", "time_base": "1/90000", "rate_control": if snapshot.encoder.ends_with("_qsv") { "ICQ (no hard VBV cap)" } else { "quality with encoder-specific rate control" },
-        "audio_changes": audio_changes, "gpu_usage": "unavailable", "capture_path": opencap_platform::CAPTURE_PATH, "av_offset_definition": "audio stream end minus video stream end; does not measure perceptual synchronization" });
+        "pixel_format": if config.audio_only { None } else { Some("8-bit 4:2:0 BT.709 SDR") }, "time_base": if config.audio_only { "1/48000" } else { "1/90000" }, "rate_control": if config.audio_only { "AAC bitrate" } else if snapshot.encoder.ends_with("_qsv") { "ICQ (no hard VBV cap)" } else { "quality with encoder-specific rate control" },
+        "audio_changes": audio_changes, "performance_samples": performance_samples, "performance_sample_note": "last 1800 one-second samples; timings are recording-worker maxima, not UI/cursor latency; ASR queue is 1024-sample 48kHz packets", "gpu_usage": "unavailable", "capture_path": if config.audio_only { "native system audio / microphone only; no video capture" } else { opencap_platform::CAPTURE_PATH }, "av_offset_definition": "audio stream end minus video stream end; does not measure perceptual synchronization" });
     std::fs::write(
         output.with_extension("recording.json"),
         serde_json::to_vec_pretty(&report)?,

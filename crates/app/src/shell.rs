@@ -38,13 +38,11 @@ impl Recorder {
         Some(div().flex_shrink_0().px_6().py_3().child(progress))
     }
     fn navigate(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.asr_models = opencap_asr::ModelAvailability::inspect(&opencap_asr::model_root());
         self.close_targets();
         self.audio_picker = None;
         self.settings = page == 2;
         self.transcription_tab = page == 1;
-        if page == 0 && self.targets.is_empty() {
-            self.refresh_targets();
-        }
         if page == 1 {
             self.meeting_page = workspace::MeetingPage::Library;
             self.refresh_meetings();
@@ -336,6 +334,8 @@ impl Recorder {
                                 self.recording_status()
                             } else if active {
                                 "停止并保存"
+                            } else if self.config.audio_only {
+                                "开始录音"
                             } else {
                                 "开始录制"
                             },

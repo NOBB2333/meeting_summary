@@ -63,6 +63,7 @@ struct Recorder {
     transcription_tab: bool,
     asr: Option<opencap_asr::AsrSession>,
     asr_live: bool,
+    asr_models: opencap_asr::ModelAvailability,
     transcript: opencap_asr::Transcript,
     transcript_output: Option<PathBuf>,
     transcription_status: String,
@@ -185,8 +186,8 @@ impl Recorder {
         })
         .detach();
         // Reading/exporting saved meetings does not need screen capture access.
-        // Enumerate targets when entering recording (or during the UI harness).
-        let targets = if cfg!(feature = "ui-smoke") {
+        // Enumerate targets only when choosing/starting video capture (or in the UI harness).
+        let targets = if !config.audio_only && cfg!(feature = "ui-smoke") {
             opencap_platform::targets().unwrap_or_else(|e| {
                 message = format!("无法枚举录制目标：{e}");
                 Vec::new()
@@ -199,10 +200,14 @@ impl Recorder {
             Vec::new()
         });
         let recoverables = find_recoverables(&config.output_dir);
-        let mode = match config.target {
-            CaptureTarget::Monitor(_) => 0,
-            CaptureTarget::Window(_) => 1,
-            CaptureTarget::Region { .. } => 2,
+        let mode = if config.audio_only {
+            3
+        } else {
+            match config.target {
+                CaptureTarget::Monitor(_) => 0,
+                CaptureTarget::Window(_) => 1,
+                CaptureTarget::Region { .. } => 2,
+            }
         };
         let ai = ai::AiWorkspace::new(window, cx);
         let hotwords_input = cx.new(|cx| {
@@ -263,6 +268,7 @@ impl Recorder {
             transcription_tab: !cfg!(feature = "ui-smoke"),
             asr: None,
             asr_live: false,
+            asr_models: opencap_asr::ModelAvailability::inspect(&opencap_asr::model_root()),
             transcript: opencap_asr::Transcript::default(),
             transcript_output: None,
             transcription_status: "等待录制或导入文件".into(),
@@ -317,7 +323,7 @@ impl Recorder {
             }
             self.stats.state = RecordingState::Stopping;
         } else {
-            if self.targets.is_empty() {
+            if !self.config.audio_only && self.targets.is_empty() {
                 self.refresh_targets();
                 if self.targets.is_empty() {
                     // Do not clear the last successful transcript or launch ASR
@@ -335,6 +341,11 @@ impl Recorder {
             {
                 self.message = "请先选择一个窗口".into();
                 self.refresh_targets();
+                cx.notify();
+                return;
+            }
+            if self.config.audio_only && !self.config.system_audio && !self.config.microphone {
+                self.message = "仅录音需要先开启系统声音或麦克风".into();
                 cx.notify();
                 return;
             }
@@ -359,7 +370,9 @@ impl Recorder {
             let observer = self.start_live_asr();
             match RecordingSession::start_observed(recording, observer) {
                 Ok(session) => {
-                    session.enable_preview(self.config.show_recording_preview);
+                    session.enable_preview(
+                        !self.config.audio_only && self.config.show_recording_preview,
+                    );
                     self.stats = session.stats();
                     self.session = Some(session);
                     self.recording_registered = false;
@@ -430,7 +443,8 @@ impl Recorder {
         }
         if let Some(session) = &self.session {
             session.enable_preview(
-                self.config.show_recording_preview
+                !self.config.audio_only
+                    && self.config.show_recording_preview
                     && !self.settings
                     && !self.transcription_tab
                     && opencap_platform::native_window_visible(self.hwnd),
@@ -464,8 +478,10 @@ impl Recorder {
             {
                 if let Some(path) = &self.stats.output {
                     let base = transcription::final_recording_path(path);
-                    asr.set_output(base.clone());
-                    self.transcript_output = Some(base);
+                    if self.transcript_output.as_ref() != Some(&base) {
+                        asr.set_output(base.clone());
+                        self.transcript_output = Some(base);
+                    }
                 }
                 if session.finished() {
                     asr.finish_at((self.stats.duration_seconds * 1000.0) as u64);
@@ -628,7 +644,18 @@ impl Recorder {
         self.selecting = None;
         self.close_targets();
         self.mode = mode;
+        self.config.audio_only = mode == 3;
+        if self.config.audio_only {
+            self.message.clear();
+            self.region_preview = false;
+            self.save();
+            return;
+        }
         self.region_preview = false;
+        if self.targets.is_empty() {
+            self.refresh_targets();
+            self.close_targets();
+        }
         let target = self.targets.iter().find(|t| {
             if mode == 1 {
                 matches!(t.target, CaptureTarget::Window(_))
@@ -747,7 +774,8 @@ impl Recorder {
         let selected_region = self.region_preview
             && !self.active()
             && matches!(self.config.target, CaptureTarget::Region { .. });
-        if self.selecting.is_some()
+        if self.config.audio_only
+            || self.selecting.is_some()
             || !self.config.effective_border_mode().visible(
                 self.boundary_started
                     .map(|v| v.elapsed())
@@ -808,7 +836,8 @@ impl Recorder {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            let output = input.with_file_name(format!("Recovered-{stamp}.mp4"));
+            let extension = input.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+            let output = input.with_file_name(format!("Recovered-{stamp}.{extension}"));
             let result = opencap_media::recover_file(&input, &output).map(|_| output);
             let _ = tx.send(result);
         });
@@ -855,8 +884,10 @@ fn find_recoverables(dir: &std::path::Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().ends_with(".partial.mp4"))
+            p.file_name().is_some_and(|n| {
+                let name = n.to_string_lossy();
+                name.ends_with(".partial.mp4") || name.ends_with(".partial.m4a")
+            })
         })
         .collect()
 }

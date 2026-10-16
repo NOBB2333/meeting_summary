@@ -43,6 +43,53 @@ impl ModelKind {
         })
     }
 }
+/// Reuse installed models without downloading in the recording hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveModelPlan {
+    pub kind: ModelKind,
+    pub context_revision: bool,
+}
+/// Cache this snapshot in the UI; filesystem checks do not belong in rendering.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelAvailability {
+    pub streaming: bool,
+    pub offline: bool,
+}
+impl ModelAvailability {
+    pub fn inspect(root: &Path) -> Self {
+        Self {
+            streaming: ModelKind::Streaming.ready(root),
+            offline: ModelKind::Offline.ready(root),
+        }
+    }
+    pub fn live_plan(self, revision: bool) -> Option<LiveModelPlan> {
+        if self.streaming {
+            Some(LiveModelPlan {
+                kind: ModelKind::Streaming,
+                context_revision: revision && self.offline,
+            })
+        } else if self.offline {
+            Some(LiveModelPlan {
+                kind: ModelKind::Offline,
+                context_revision: false,
+            })
+        } else {
+            None
+        }
+    }
+}
+impl LiveModelPlan {
+    pub fn installed(root: &Path, revision: bool) -> Option<Self> {
+        ModelAvailability::inspect(root).live_plan(revision)
+    }
+    pub fn description(self) -> &'static str {
+        match (self.kind, self.context_revision) {
+            (ModelKind::Offline, _) => "逐句实时文字 · 复用文件转录模型，停顿后出字",
+            (ModelKind::Streaming, true) => "流式实时文字 · 断句后校正",
+            (ModelKind::Streaming, false) => "流式实时文字 · 无二次校正",
+        }
+    }
+}
 pub fn model_root() -> PathBuf {
     std::env::var_os("OPENCAP_MODEL_DIR")
         .map(PathBuf::from)
@@ -160,4 +207,60 @@ pub(crate) fn download(
         }
     }
     Err(error.unwrap().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn live_plan_reuses_offline_and_missing_optional_revision_never_blocks_streaming() {
+        let root = std::env::temp_dir().join(format!(
+            "opencap-model-plan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(LiveModelPlan::installed(&root, true), None);
+        let install = |kind: ModelKind| {
+            fs::create_dir_all(kind.path(&root)).unwrap();
+            for name in kind.files() {
+                fs::write(kind.path(&root).join(name), b"fixture").unwrap();
+            }
+        };
+        install(ModelKind::Offline);
+        assert_eq!(
+            LiveModelPlan::installed(&root, true),
+            Some(LiveModelPlan {
+                kind: ModelKind::Offline,
+                context_revision: false
+            })
+        );
+        install(ModelKind::Streaming);
+        assert_eq!(
+            LiveModelPlan::installed(&root, true),
+            Some(LiveModelPlan {
+                kind: ModelKind::Streaming,
+                context_revision: true
+            })
+        );
+        assert!(
+            !LiveModelPlan::installed(&root, false)
+                .unwrap()
+                .context_revision
+        );
+        fs::remove_file(ModelKind::Offline.path(&root).join("silero_vad.onnx")).unwrap();
+        assert_eq!(
+            LiveModelPlan::installed(&root, true),
+            Some(LiveModelPlan {
+                kind: ModelKind::Streaming,
+                context_revision: false
+            })
+        );
+        fs::write(ModelKind::Streaming.path(&root).join("tokens.txt"), []).unwrap();
+        assert_eq!(LiveModelPlan::installed(&root, false), None);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

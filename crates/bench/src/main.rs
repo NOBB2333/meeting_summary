@@ -45,6 +45,9 @@ enum Command {
         region: Option<String>,
         #[arg(long)]
         no_audio: bool,
+        /// Save M4A without starting screen capture or a video encoder.
+        #[arg(long)]
+        audio_only: bool,
         #[arg(long)]
         microphone: bool,
         /// Automated pause/resume validation: pause at this wall-clock second.
@@ -210,12 +213,14 @@ fn main() -> Result<()> {
             window,
             region,
             no_audio,
+            audio_only,
             microphone,
             pause_at,
             pause_for,
             audio_switch_check,
         } => {
             let mut c = options.config()?;
+            c.audio_only = audio_only || c.audio_only;
             c.target = if let Some(hwnd) = window {
                 CaptureTarget::Window(hwnd)
             } else if let Some(region) = region {

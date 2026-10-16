@@ -9,11 +9,12 @@ use std::path::Path;
 
 pub struct MediaWriter {
     output: ff::format::context::Output,
-    pub video: FfmpegVideoEncoder,
+    pub video: Option<FfmpegVideoEncoder>,
     audio: Option<ff::encoder::audio::Encoder>,
     mixer: AudioMixer,
     video_tb: ff::Rational,
     audio_tb: ff::Rational,
+    audio_stream: usize,
     pending: Option<ff::Packet>,
     pub frames: u64,
     pub last_video_us: i64,
@@ -21,6 +22,9 @@ pub struct MediaWriter {
 }
 impl MediaWriter {
     pub fn new(path: &Path, width: u32, height: u32, config: &RecordingConfig) -> Result<Self> {
+        if config.audio_only {
+            return Self::new_audio(path, config);
+        }
         super::initialize()?;
         config.validate()?;
         let mut failures = Vec::new();
@@ -42,19 +46,37 @@ impl MediaWriter {
         }
         let video =
             chosen.with_context(|| format!("No usable encoder: {}", failures.join("; ")))?;
+        Self::open(path, config, Some(video))
+    }
+    pub fn new_audio(path: &Path, config: &RecordingConfig) -> Result<Self> {
+        super::initialize()?;
+        config.validate()?;
+        anyhow::ensure!(
+            config.system_audio || config.microphone || config.reserve_audio_track,
+            "仅录音需要开启系统声音或麦克风"
+        );
+        Self::open(path, config, None)
+    }
+    fn open(
+        path: &Path,
+        config: &RecordingConfig,
+        video: Option<FfmpegVideoEncoder>,
+    ) -> Result<Self> {
         let mut output = ff::format::output_as(path, "mp4")?;
-        // Flush fragments regularly even when static video emits only one frame/second.
         unsafe {
             (*output.as_mut_ptr()).max_interleave_delta = 500_000;
         }
-        let mut stream = output.add_stream(ff::encoder::find(video.inner.id()))?;
-        stream.set_parameters(&video.inner);
-        stream.set_time_base(VIDEO_TIME_BASE);
-        if video.inner.id() == ff::codec::Id::HEVC {
-            unsafe {
-                (*stream.parameters().as_mut_ptr()).codec_tag = u32::from_le_bytes(*b"hvc1");
+        if let Some(video) = &video {
+            let mut stream = output.add_stream(ff::encoder::find(video.inner.id()))?;
+            stream.set_parameters(&video.inner);
+            stream.set_time_base(VIDEO_TIME_BASE);
+            if video.inner.id() == ff::codec::Id::HEVC {
+                unsafe {
+                    (*stream.parameters().as_mut_ptr()).codec_tag = u32::from_le_bytes(*b"hvc1");
+                }
             }
         }
+        let audio_stream = usize::from(video.is_some());
         let audio = if config.system_audio || config.microphone || config.reserve_audio_track {
             let codec = ff::encoder::find(ff::codec::Id::AAC).context("AAC encoder missing")?;
             let mut encoder = ff::codec::context::Context::new_with_codec(codec)
@@ -83,9 +105,13 @@ impl MediaWriter {
         opts.set("frag_duration", "1000000");
         opts.set("flush_packets", "1");
         output.write_header_with(opts)?;
-        let video_tb = output.stream(0).unwrap().time_base();
+        let video_tb = if video.is_some() {
+            output.stream(0).unwrap().time_base()
+        } else {
+            VIDEO_TIME_BASE
+        };
         let audio_tb = output
-            .stream(1)
+            .stream(audio_stream)
             .map(|s| s.time_base())
             .unwrap_or((1, 48000).into());
         Ok(Self {
@@ -95,6 +121,7 @@ impl MediaWriter {
             mixer: AudioMixer::new(),
             video_tb,
             audio_tb,
+            audio_stream,
             pending: None,
             frames: 0,
             last_video_us: 0,
@@ -117,7 +144,11 @@ impl MediaWriter {
         if self.frames > 0 && frame.pts_us <= self.last_video_us {
             return Ok(());
         }
-        for p in self.video.encode(frame)? {
+        let encoder = self
+            .video
+            .as_mut()
+            .context("Audio-only output cannot accept video frames")?;
+        for p in encoder.encode(frame)? {
             self.write_video_packet(p)?;
         }
         self.frames += 1;
@@ -186,14 +217,16 @@ impl MediaWriter {
                 }
             }
             audio.send_frame(&frame)?;
-            drain_audio(audio, &mut self.output, self.audio_tb)?;
+            drain_audio(audio, &mut self.output, self.audio_tb, self.audio_stream)?;
         }
         Ok(())
     }
     pub fn finish(mut self, stop_us: i64) -> Result<()> {
         self.audio_until(stop_us, true)?;
-        for packet in self.video.flush()? {
-            self.write_video_packet(packet)?;
+        if let Some(video) = self.video.as_mut() {
+            for packet in video.flush()? {
+                self.write_video_packet(packet)?;
+            }
         }
         if let Some(mut packet) = self.pending.take() {
             let end = ff::Rescale::rescale(&stop_us, (1, 1_000_000), self.video_tb);
@@ -202,10 +235,13 @@ impl MediaWriter {
         }
         if let Some(audio) = self.audio.as_mut() {
             audio.send_eof()?;
-            drain_audio(audio, &mut self.output, self.audio_tb)?;
+            drain_audio(audio, &mut self.output, self.audio_tb, self.audio_stream)?;
         }
         self.output.write_trailer()?;
         Ok(())
+    }
+    pub fn asr_pending_packets(&self) -> Option<usize> {
+        self.audio_observer.as_ref().map(|tx| tx.len())
     }
     pub fn audio_cursor_us(&self) -> Option<i64> {
         self.audio.as_ref().map(|_| self.mixer.cursor * 1000 / 48)
@@ -229,12 +265,13 @@ fn drain_audio(
     audio: &mut ff::encoder::audio::Encoder,
     output: &mut ff::format::context::Output,
     tb: ff::Rational,
+    stream_index: usize,
 ) -> Result<()> {
     loop {
         let mut packet = ff::Packet::empty();
         match audio.receive_packet(&mut packet) {
             Ok(()) => {
-                packet.set_stream(1);
+                packet.set_stream(stream_index);
                 packet.rescale_ts((1, 48000), tb);
                 packet.write_interleaved(output)?;
             }
@@ -276,37 +313,68 @@ pub fn recover_file(input: &Path, output: &Path) -> Result<()> {
     anyhow::ensure!(count > 0, "No recoverable packets");
     dest.write_trailer()?;
     drop(dest);
-    // Ensure at least one video frame decodes before declaring recovery successful.
+    // Verify an actual decoded frame, including recordings with no video stream.
     let mut check = ff::format::input(output)?;
-    let stream = check
-        .streams()
-        .best(ff::media::Type::Video)
-        .context("Recovered file has no video")?;
-    let index = stream.index();
-    let mut decoder = ff::codec::context::Context::from_parameters(stream.parameters())?
-        .decoder()
-        .video()?;
-    let mut decoded = false;
-    for (stream, packet) in check.packets() {
-        if stream.index() != index {
-            continue;
+    if check.streams().best(ff::media::Type::Video).is_some() {
+        let stream = check
+            .streams()
+            .best(ff::media::Type::Video)
+            .context("Recovered file has no video")?;
+        let index = stream.index();
+        let mut decoder = ff::codec::context::Context::from_parameters(stream.parameters())?
+            .decoder()
+            .video()?;
+        let mut decoded = false;
+        for (stream, packet) in check.packets() {
+            if stream.index() != index {
+                continue;
+            }
+            decoder.send_packet(&packet)?;
+            if decoder
+                .receive_frame(&mut ff::frame::Video::empty())
+                .is_ok()
+            {
+                decoded = true;
+                break;
+            }
         }
-        decoder.send_packet(&packet)?;
-        if decoder
-            .receive_frame(&mut ff::frame::Video::empty())
-            .is_ok()
-        {
-            decoded = true;
-            break;
+        if !decoded {
+            decoder.send_eof()?;
+            decoded = decoder
+                .receive_frame(&mut ff::frame::Video::empty())
+                .is_ok();
         }
+        anyhow::ensure!(decoded, "Recovered video could not be decoded");
+    } else {
+        let stream = check
+            .streams()
+            .best(ff::media::Type::Audio)
+            .context("Recovered file has no audio or video")?;
+        let index = stream.index();
+        let mut decoder = ff::codec::context::Context::from_parameters(stream.parameters())?
+            .decoder()
+            .audio()?;
+        let mut decoded = false;
+        for (stream, packet) in check.packets() {
+            if stream.index() == index {
+                decoder.send_packet(&packet)?;
+                if decoder
+                    .receive_frame(&mut ff::frame::Audio::empty())
+                    .is_ok()
+                {
+                    decoded = true;
+                    break;
+                }
+            }
+        }
+        if !decoded {
+            decoder.send_eof()?;
+            decoded = decoder
+                .receive_frame(&mut ff::frame::Audio::empty())
+                .is_ok();
+        }
+        anyhow::ensure!(decoded, "Recovered audio could not be decoded");
     }
-    if !decoded {
-        decoder.send_eof()?;
-        decoded = decoder
-            .receive_frame(&mut ff::frame::Video::empty())
-            .is_ok();
-    }
-    anyhow::ensure!(decoded, "Recovered video could not be decoded");
     Ok(())
 }
 

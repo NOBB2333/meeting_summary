@@ -25,14 +25,20 @@ pub fn encode_reference(input: &Path, output: &Path, config: &RecordingConfig) -
         .decoder()
         .video()?;
     let mut cfg = config.clone();
+    cfg.audio_only = false;
     cfg.system_audio = false;
     cfg.microphone = false;
     cfg.reserve_audio_track = false;
     let partial = output.with_extension("partial.mp4");
     anyhow::ensure!(!partial.exists(), "Partial output exists");
     let mut writer = crate::MediaWriter::new(&partial, decoder.width(), decoder.height(), &cfg)?;
-    let name = writer.video.name.clone();
-    let options = writer.video.options.clone();
+    let name = writer.video.as_ref().expect("video encoder").name.clone();
+    let options = writer
+        .video
+        .as_ref()
+        .expect("video encoder")
+        .options
+        .clone();
     let mut scaler = ff::software::scaling::Context::get(
         decoder.format(),
         decoder.width(),

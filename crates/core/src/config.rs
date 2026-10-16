@@ -42,6 +42,8 @@ impl BorderMode {
 #[serde(default)]
 pub struct RecordingConfig {
     pub target: CaptureTarget,
+    /// Capture audio only; never create a screen capture or video encoder.
+    pub audio_only: bool,
     pub output_dir: PathBuf,
     pub preset: Preset,
     pub codec: Codec,
@@ -85,6 +87,7 @@ impl Default for RecordingConfig {
             .unwrap_or_else(|| PathBuf::from("recordings"));
         Self {
             target: CaptureTarget::Monitor(0),
+            audio_only: false,
             output_dir,
             preset: Preset::Space,
             codec: Codec::Auto,
@@ -99,7 +102,7 @@ impl Default for RecordingConfig {
             monitor_levels: false,
             realtime_transcription: true,
             transcription_hotwords: "录屏,语音转录,会议纪要,实时字幕".into(),
-            transcription_context_revision: true,
+            transcription_context_revision: false,
             show_floating_controls: false,
             show_capture_border: true,
             border_mode: BorderMode::OnStart,
@@ -191,6 +194,7 @@ impl RecordingConfig {
             rect: Rect { width, height, .. },
             ..
         } = self.target
+            && !self.audio_only
         {
             anyhow::ensure!(
                 width >= 2 && height >= 2,
@@ -227,6 +231,7 @@ mod border_tests {
     fn legacy_switch_and_timed_border() {
         let old: RecordingConfig =
             serde_json::from_str(r#"{"show_capture_border":false}"#).unwrap();
+        assert!(!old.audio_only);
         assert_eq!(old.effective_border_mode(), BorderMode::Never);
         assert!(
             !old.effective_border_mode()

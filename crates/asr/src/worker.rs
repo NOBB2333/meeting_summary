@@ -52,6 +52,23 @@ impl AsrSession {
             revision,
         )
     }
+    /// The caller selects only installed models; sentence mode uses the same VAD
+    /// engine as file transcription, with live PCM instead of a source file.
+    pub fn live_with_plan(
+        root: PathBuf,
+        hotwords: String,
+        plan: crate::LiveModelPlan,
+    ) -> Result<Self> {
+        Self::spawn(
+            root,
+            plan.kind,
+            None,
+            None,
+            false,
+            hotwords,
+            plan.context_revision,
+        )
+    }
     pub fn file(
         root: PathBuf,
         kind: ModelKind,
@@ -148,9 +165,23 @@ impl AsrSession {
                         } else {
                             None
                         };
-                        let mut engine =
-                            Engine::new(kind, &kind.path(&root), &hotwords, revision.as_deref())?;
-                        let _ = tx.send(AsrEvent::Status("CPU 识别已就绪 · 当前句可修正".into()));
+                        let mut engine = Engine::new(
+                            kind,
+                            &kind.path(&root),
+                            &hotwords,
+                            revision.as_deref(),
+                            source.is_some(),
+                        )?;
+                        let _ = tx.send(AsrEvent::Status(
+                            if source.is_some() {
+                                "文件识别已就绪 · 正在处理音频"
+                            } else if kind == ModelKind::Offline {
+                                "逐句实时识别已就绪 · 复用文件模型，停顿后显示文字"
+                            } else {
+                                "流式识别已就绪 · 当前句可修正"
+                            }
+                            .into(),
+                        ));
                         let mut transcript = Transcript {
                             source: source.clone(),
                             model: kind.directory().into(),
@@ -160,6 +191,8 @@ impl AsrSession {
                         let mut expected_us: Option<i64> = None;
                         let began = Instant::now();
                         let mut last_progress = Instant::now();
+                        let mut last_checkpoint = Instant::now();
+                        let mut checkpoint_dirty = false;
                         let read_result = {
                             let mut consume = |audio: PcmAudio,
                                                duration: Option<f64>|
@@ -220,13 +253,19 @@ impl AsrSession {
                                         thread::sleep(remaining.min(Duration::from_millis(200)));
                                     }
                                 }
-                                // Checkpoint only finalized utterances, outside the recording thread.
-                                if let Some(base) = worker_output.lock().unwrap().as_ref() {
-                                    if transcript.source.is_none() {
-                                        transcript.source = Some(base.clone());
-                                    }
-                                    if engine.take_committed() {
-                                        transcript.save(base)?;
+                                checkpoint_dirty |= engine.take_committed();
+                                // Never hold the UI-shared path mutex while serializing or writing.
+                                if checkpoint_dirty
+                                    && last_checkpoint.elapsed() >= Duration::from_secs(5)
+                                {
+                                    let base = worker_output.lock().unwrap().clone();
+                                    if let Some(base) = base {
+                                        if transcript.source.is_none() {
+                                            transcript.source = Some(base.clone());
+                                        }
+                                        transcript.checkpoint(&base)?;
+                                        checkpoint_dirty = false;
+                                        last_checkpoint = Instant::now();
                                     }
                                 }
                                 Ok(())
@@ -275,11 +314,12 @@ impl AsrSession {
                             && !transcript.cancelled
                             && transcript.gaps.is_empty();
                         transcript.processing_seconds = Some(job_started.elapsed().as_secs_f64());
-                        if let Some(base) = worker_output.lock().unwrap().as_ref() {
+                        let base = worker_output.lock().unwrap().clone();
+                        if let Some(base) = base {
                             if transcript.source.is_none() {
                                 transcript.source = Some(base.clone());
                             }
-                            transcript.save(base)?;
+                            transcript.save(&base)?;
                         }
                         let _ = tx.send(AsrEvent::Finished(transcript));
                         if !worker_cancelled.load(Ordering::Relaxed) {
@@ -358,6 +398,7 @@ enum Engine {
         correction: Option<OfflineRecognizer>,
         utterance_audio: Vec<f32>,
         last_correction: usize,
+        partial_revision: bool,
         corrected_prefix: Option<(String, String)>,
     },
     Offline {
@@ -375,6 +416,7 @@ impl Engine {
         dir: &Path,
         hotwords: &str,
         revision_dir: Option<&Path>,
+        partial_revision: bool,
     ) -> Result<Self> {
         let file = |name: &str| Some(dir.join(name).to_string_lossy().into_owned());
         match kind {
@@ -432,6 +474,7 @@ impl Engine {
                     correction: revision_dir.map(sense_voice).transpose()?,
                     utterance_audio: Vec::new(),
                     last_correction: 0,
+                    partial_revision,
                     corrected_prefix: None,
                 })
             }
@@ -525,6 +568,7 @@ impl Engine {
                 correction,
                 utterance_audio,
                 last_correction,
+                partial_revision,
                 corrected_prefix,
             } => {
                 while recognizer.is_ready(stream) {
@@ -543,14 +587,15 @@ impl Engine {
                 } else {
                     native_text.clone()
                 };
-                // Re-decode bounded utterance audio every 5 seconds and once at
-                // finalization. The streaming model keeps immediate first text;
-                // the offline model may revise earlier characters using context.
+                // Live recording corrects only at endpoints, avoiding repeated 5/10/15/20s
+                // offline decodes of the same audio. File playback may revise partials.
+                // Streaming hypotheses remain immediate in either mode.
                 if let Some(correction) = correction
                     && !native_text.is_empty()
                     && !utterance_audio.is_empty()
                     && (final_now
-                        || utterance_audio.len().saturating_sub(*last_correction) >= 5 * 16000)
+                        || (*partial_revision
+                            && utterance_audio.len().saturating_sub(*last_correction) >= 5 * 16000))
                 {
                     let correction_stream = correction.create_stream();
                     correction_stream.accept_waveform(16000, utterance_audio);
@@ -708,5 +753,95 @@ mod revision_tests {
             bounded_revision("预算是两万元", "预算是2万元。"),
             "预算是2万元"
         );
+    }
+}
+
+#[cfg(test)]
+mod live_integration_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires already installed local models and OPENCAP_LIVE_TEST_AUDIO (synthetic speech)"]
+    fn installed_models_emit_live_segments_before_input_closes() {
+        let input = PathBuf::from(
+            std::env::var_os("OPENCAP_LIVE_TEST_AUDIO").expect("synthetic test audio required"),
+        );
+        let root = crate::model_root();
+        assert!(
+            ModelKind::Offline.ready(&root),
+            "install models explicitly before this check"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "opencap-live-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for kind in [ModelKind::Offline, ModelKind::Streaming] {
+            if !kind.ready(&root) {
+                continue;
+            }
+            let mut session = AsrSession::live_with_plan(
+                root.clone(),
+                String::new(),
+                crate::LiveModelPlan {
+                    kind,
+                    context_revision: kind == ModelKind::Streaming,
+                },
+            )
+            .unwrap();
+            let base = dir.join(format!("{kind:?}.m4a"));
+            session.set_output(base.clone());
+            let sender = session.audio_sender();
+            let mut end_ms = 0;
+            decode_file(&input, |audio, _| {
+                end_ms = (audio.pts_us.max(0) as u64
+                    + audio.samples.len() as u64 * 1_000_000
+                        / audio.channels as u64
+                        / audio.sample_rate as u64)
+                    / 1000;
+                sender.send(audio)?;
+                Ok(())
+            })
+            .unwrap();
+            drop(sender);
+            // Own input remains open: a segment must be visible before EOF/finalization.
+            let mut emitted = false;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                match session
+                    .events
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                {
+                    AsrEvent::Segment(s) if !s.text.is_empty() => {
+                        emitted = true;
+                        break;
+                    }
+                    AsrEvent::Error(e) => panic!("{kind:?}: {e}"),
+                    _ => {}
+                }
+            }
+            assert!(emitted, "{kind:?} did not emit live text");
+            session.finish_at(end_ms);
+            loop {
+                match session
+                    .events
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap()
+                {
+                    AsrEvent::Finished(t) => {
+                        assert!(t.complete, "{t:?}");
+                        assert!(!t.text().is_empty());
+                        assert!(base.with_extension("transcript.docx").exists());
+                        break;
+                    }
+                    AsrEvent::Error(e) => panic!("{kind:?}: {e}"),
+                    _ => {}
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

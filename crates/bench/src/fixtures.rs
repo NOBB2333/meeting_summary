@@ -134,6 +134,7 @@ pub fn run(
     fast: bool,
 ) -> Result<()> {
     use opencap_media::MediaWriter;
+    config.audio_only = false;
     config.system_audio = true;
     config.microphone = false; // Include a known audio marker track in size/timing comparisons.
     std::fs::create_dir_all(&config.output_dir)?;
@@ -152,9 +153,14 @@ pub fn run(
     );
     let canvas = Canvas::new(width, height)?;
     let mut writer = MediaWriter::new(&partial, width, height, &config)?;
-    let encoder = writer.video.name.clone();
-    let options = writer.video.options.clone();
-    let details = writer.video.details();
+    let encoder = writer.video.as_ref().expect("video encoder").name.clone();
+    let options = writer
+        .video
+        .as_ref()
+        .expect("video encoder")
+        .options
+        .clone();
+    let details = writer.video.as_ref().expect("video encoder").details();
     let start = Instant::now();
     let mut meter = opencap_platform::ProcessMeter::default();
     let mut peak_cpu: f64 = 0.0;

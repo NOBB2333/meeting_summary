@@ -10,6 +10,8 @@ pub(super) fn final_recording_path(path: &std::path::Path) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     if let Some(stem) = name.strip_suffix(".partial.mp4") {
         path.with_file_name(format!("{stem}.mp4"))
+    } else if let Some(stem) = name.strip_suffix(".partial.m4a") {
+        path.with_file_name(format!("{stem}.m4a"))
     } else {
         path.to_path_buf()
     }
@@ -37,25 +39,26 @@ impl Recorder {
             self.transcription_status = "本次未开启实时转录；录制保存后可在会议文件中补转".into();
             return None;
         }
-        if !ModelKind::Streaming.ready(&model_root())
-            || (self.config.transcription_context_revision
-                && !ModelKind::Offline.ready(&model_root()))
-        {
+        self.asr_models = opencap_asr::ModelAvailability::inspect(&model_root());
+        let Some(plan) = self
+            .asr_models
+            .live_plan(self.config.transcription_context_revision)
+        else {
             self.transcription_status =
-                "实时模型尚未下载；本次先保存录制，可在转录页导入文件".into();
+                "未找到本地语音模型；请在设置下载。录制文件会正常保存".into();
             return None;
-        }
-        match AsrSession::live_with_revision(
+        };
+        match AsrSession::live_with_plan(
             model_root(),
             self.config.transcription_hotwords.clone(),
-            self.config.transcription_context_revision,
+            plan,
         ) {
             Ok(asr) => {
                 let sender = asr.audio_sender();
                 self.transcription_clock.start();
                 self.asr = Some(asr);
                 self.asr_live = true;
-                self.transcription_status = "正在启动实时识别…".into();
+                self.transcription_status = format!("正在启动：{}", plan.description());
                 Some(sender)
             }
             Err(e) => {
@@ -228,6 +231,7 @@ impl Recorder {
             match event {
                 PrepareEvent::Progress(s) => self.transcription_status = s,
                 PrepareEvent::Done(result) => {
+                    self.asr_models = opencap_asr::ModelAvailability::inspect(&model_root());
                     self.preparing_model = None;
                     self.transcription_clock.finish();
                     self.transcription_status = match result {
@@ -429,6 +433,56 @@ impl Recorder {
                         )),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        button(
+                            "recording-live-toggle",
+                            if self.config.realtime_transcription {
+                                "实时转录：开"
+                            } else {
+                                "实时转录：关"
+                            },
+                            self.config.realtime_transcription,
+                        )
+                        .disabled(self.active() || self.transcription_busy())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.config.realtime_transcription =
+                                !this.config.realtime_transcription;
+                            this.save();
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        button(
+                            "recording-revision-toggle",
+                            if self.config.transcription_context_revision {
+                                "断句校正：开"
+                            } else {
+                                "断句校正：关"
+                            },
+                            self.config.transcription_context_revision,
+                        )
+                        .disabled(self.active() || self.transcription_busy())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.config.transcription_context_revision =
+                                !this.config.transcription_context_revision;
+                            this.save();
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .when(!self.active(), |d| {
+                d.child(label(
+                    self.asr_models
+                        .live_plan(self.config.transcription_context_revision)
+                        .map(|p| p.description())
+                        .unwrap_or("未安装语音模型，请前往设置下载"),
+                ))
+            })
             .child(label(self.transcription_status.clone()))
             .child(div().max_h(px(130.)).overflow_hidden().children(
                 self.transcript.segments.last().map(|s| {
@@ -659,17 +713,22 @@ impl Recorder {
     }
     pub(super) fn transcription_settings(&self, cx: &Context<Self>) -> Div {
         let busy = self.active() || self.transcription_busy();
-        let ready = ModelKind::Streaming.ready(&model_root())
-            && (!self.config.transcription_context_revision
-                || ModelKind::Offline.ready(&model_root()));
+        let streaming = self.asr_models.streaming;
+        let offline = self.asr_models.offline;
+        let ready = streaming && (!self.config.transcription_context_revision || offline);
+        let plan = self
+            .asr_models
+            .live_plan(self.config.transcription_context_revision);
         ui::card()
             .child(div().text_lg().child("本地语音转录"))
             .child(label("实时转录会自动保存逐字稿，AI 纪要采用手动生成。音频与视频使用同一套转录和导出流程。"))
             .child(div().flex().flex_wrap().gap_2()
                 .child(button("live-asr-toggle", if self.config.realtime_transcription { "实时转录：开启" } else { "实时转录：关闭" }, self.config.realtime_transcription).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.realtime_transcription = !this.config.realtime_transcription; this.save(); cx.notify(); })))
-                .child(button("context-revision", if self.config.transcription_context_revision { "上下文校正：开启" } else { "上下文校正：关闭" }, self.config.transcription_context_revision).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_context_revision = !this.config.transcription_context_revision; this.save(); cx.notify(); })))
-                .child(button("download-asr", if ready { "实时模型已就绪" } else { "下载实时模型" }, false).disabled(busy || ready).on_click(cx.listener(|this,_,_,cx| { this.prepare_streaming_model(); cx.notify(); }))))
-            .child(label("上下文校正每约 5 秒复核一次，关闭可降低 CPU 和内存。文件转录会在首次使用时下载模型。"))
+                .child(button("context-revision", if self.config.transcription_context_revision { "断句校正：开启" } else { "断句校正：关闭" }, self.config.transcription_context_revision).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_context_revision = !this.config.transcription_context_revision; this.save(); cx.notify(); })))
+                .child(button("download-asr", if ready { "流式模型已就绪" } else { "下载流式 / 校正模型" }, false).disabled(busy || ready).on_click(cx.listener(|this,_,_,cx| { this.prepare_streaming_model(); cx.notify(); }))))
+            .child(label(plan.map(|p| p.description()).unwrap_or("尚未安装语音模型")))
+            .child(label(format!("流式模型：{} · 文件转录模型：{}", if streaming { "已安装" } else { "未安装" }, if offline { "已安装，可逐句实时识别" } else { "未安装" })))
+            .child(label("录制时只在断句后校正，关闭可降低 CPU 和内存。仅文件模型时停顿后显示文字，最长约 15 秒断句。"))
             .child(div().flex().flex_wrap().gap_2().child(Input::new(&self.hotwords_input).flex_1()).child(primary_button("apply-hotwords", "保存术语").disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_hotwords=this.hotwords_input.read(cx).value().to_string(); this.save(); cx.notify(); }))))
             .child(button("stream-file-demo", "试播文件，观察实时修正", false).ghost().disabled(busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(true,cx))))
     }

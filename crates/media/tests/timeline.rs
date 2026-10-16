@@ -391,3 +391,129 @@ fn initially_muted_recording_can_add_audio_without_restarting_mp4() {
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(dir).unwrap();
 }
+
+#[test]
+fn audio_only_encodes_real_aac_without_probing_video_and_recovers_without_video() {
+    use ffmpeg_next as ff;
+    let dir = scratch();
+    let partial = dir.join("sound.partial.m4a");
+    let output = dir.join("sound.m4a");
+    let config = RecordingConfig {
+        audio_only: true,
+        encoder: Some("deliberately-not-a-video-encoder".into()),
+        ..Default::default()
+    };
+    let mut writer = MediaWriter::new(&partial, 0, 0, &config).unwrap();
+    assert!(writer.video.is_none());
+    let (tx, rx) = crossbeam_channel::unbounded();
+    writer.observe_audio(tx);
+    for packet in 0..60 {
+        writer.audio(AudioChunk {
+            kind: AudioKind::System,
+            pts_us: packet * 20_000,
+            samples: (0..960)
+                .flat_map(|i| {
+                    let x = ((packet * 960 + i) as f32 * 440. * std::f32::consts::TAU / 48000.)
+                        .sin()
+                        * 0.25;
+                    [x, x]
+                })
+                .collect(),
+        });
+        writer.audio_until((packet + 1) * 20_000, false).unwrap();
+    }
+    writer.finish(1_200_000).unwrap();
+    assert_eq!(
+        rx.try_iter().map(|p| p.samples.len()).sum::<usize>(),
+        57_600
+    );
+    recover_file(&partial, &output).unwrap();
+    assert!(partial.exists());
+    assert!(recover_file(&partial, &output).is_err());
+    let mut input = ff::format::input(&output).unwrap();
+    assert_eq!(input.streams().len(), 1);
+    assert!(input.streams().best(ff::media::Type::Video).is_none());
+    let stream = input.streams().best(ff::media::Type::Audio).unwrap();
+    assert_eq!(stream.parameters().id(), ff::codec::Id::AAC);
+    let duration = stream.duration() as f64 * f64::from(stream.time_base());
+    assert!((duration - 1.2).abs() < 0.05, "duration={duration}");
+    let mut decoder = ff::codec::context::Context::from_parameters(stream.parameters())
+        .unwrap()
+        .decoder()
+        .audio()
+        .unwrap();
+    let mut energy = 0.0f64;
+    let mut count = 0;
+    let mut last_dts = None;
+    for (_, packet) in input.packets() {
+        if let (Some(previous), Some(dts)) = (last_dts, packet.dts()) {
+            assert!(dts > previous);
+        }
+        last_dts = packet.dts();
+        decoder.send_packet(&packet).unwrap();
+        let mut frame = ff::frame::Audio::empty();
+        while decoder.receive_frame(&mut frame).is_ok() {
+            for sample in &frame.plane::<f32>(0)[..frame.samples()] {
+                energy += (*sample as f64).powi(2);
+                count += 1;
+            }
+        }
+    }
+    assert!(count > 50_000);
+    assert!((energy / count as f64).sqrt() > 0.1);
+    drop(input);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn audio_only_session_pauses_and_finalizes_without_screen_or_audio_devices() {
+    use opencap_media::{RecordingCommand, RecordingSession};
+    use std::time::{Duration, Instant};
+    let dir = scratch();
+    // Both routes muted: no desktop permission or user audio is accessed by this test.
+    let config = RecordingConfig {
+        audio_only: true,
+        output_dir: dir.clone(),
+        target: CaptureTarget::Window(0),
+        system_audio: false,
+        microphone: false,
+        reserve_audio_track: true,
+        encoder: Some("not-a-video-encoder".into()),
+        ..Default::default()
+    };
+    let mut session = RecordingSession::start(config).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.stats().state == RecordingState::Starting && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        session.stats().state,
+        RecordingState::Recording,
+        "{:?}",
+        session.stats()
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    session.command(RecordingCommand::Pause);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while session.stats().state != RecordingState::Paused && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(session.stats().state, RecordingState::Paused);
+    std::thread::sleep(Duration::from_millis(300));
+    session.command(RecordingCommand::Resume);
+    std::thread::sleep(Duration::from_millis(100));
+    session.command(RecordingCommand::Stop);
+    session.join();
+    let stats = session.stats();
+    assert_eq!(stats.state, RecordingState::Finished, "{stats:?}");
+    assert!((0.15..0.45).contains(&stats.duration_seconds), "{stats:?}");
+    assert_eq!(stats.encoded_frames, 0);
+    assert_eq!(stats.encoder, "aac");
+    assert!(session.take_preview().is_none());
+    let output = stats.output.unwrap();
+    assert_eq!(output.extension().unwrap(), "m4a");
+    assert_eq!(stats.audio_output.as_ref(), Some(&output));
+    assert!(!output.with_extension("mp4").exists());
+    assert!(!output.with_extension("partial.m4a").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}

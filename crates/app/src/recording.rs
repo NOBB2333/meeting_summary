@@ -13,10 +13,13 @@ impl Recorder {
         };
         let screen = ui::card()
             .flex_1()
-            .child(ui::section_title("录制画面", "选择屏幕、窗口或指定区域"))
+            .child(ui::section_title(
+                "录制方式",
+                "选择画面录制，或只保存会议声音",
+            ))
             .child(
                 div().flex().flex_wrap().gap_2().children(
-                    ["整个屏幕", "应用窗口", "指定区域"]
+                    ["整个屏幕", "应用窗口", "指定区域", "仅录音"]
                         .into_iter()
                         .enumerate()
                         .map(|(i, text)| {
@@ -29,19 +32,38 @@ impl Recorder {
                         }),
                 ),
             )
-            .child(
-                button("target", target, false)
-                    .w_full()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .justify_start()
-                    .h(px(42.))
-                    .disabled(self.active())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.choose_target();
-                        cx.notify();
-                    })),
-            )
+            .when(!self.config.audio_only, |d| {
+                d.child(
+                    button("target", target, false)
+                        .w_full()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .justify_start()
+                        .h(px(42.))
+                        .disabled(self.active())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.choose_target();
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(self.config.audio_only, |d| {
+                d.child(
+                    div()
+                        .py_6()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(div().text_lg().child("只记录会议声音"))
+                        .child(label("保存为 M4A，可同时录制系统声音和麦克风。"))
+                        .child(label("开启实时转录后，文字会在下方显示。"))
+                        .when(cfg!(target_os = "macos"), |d| {
+                            d.child(label(
+                                "录系统声音仍需系统音频权限；只录麦克风无需屏幕权限。",
+                            ))
+                        }),
+                )
+            })
             .when(self.mode == 2, |d| {
                 d.child(
                     button(
@@ -63,7 +85,7 @@ impl Recorder {
             .when(self.choosing_target, |d| {
                 d.child(self.target_picker(width - 40., cx))
             })
-            .when(!self.choosing_target, |d| {
+            .when(!self.choosing_target && !self.config.audio_only, |d| {
                 d.child(self.recording_preview(cx))
             });
         div()
@@ -261,7 +283,14 @@ impl Recorder {
     }
     fn recording_options(&self, cx: &Context<Self>) -> Div {
         ui::card()
-            .child(ui::section_title("声音与画质", "录制前确认声音来源"))
+            .child(ui::section_title(
+                if self.config.audio_only {
+                    "录音声音"
+                } else {
+                    "声音与画质"
+                },
+                "录制前确认声音来源",
+            ))
             .child(
                 div()
                     .flex()
@@ -304,30 +333,35 @@ impl Recorder {
                     "打开“电平检测”可在未录制时确认这两路是否真的有声音。",
                 ))
             })
-            .child(label("画质与体积"))
-            .child(
-                div().flex().flex_wrap().gap_2().children(
-                    [
-                        (Preset::Space, "省空间"),
-                        (Preset::Balanced, "平衡"),
-                        (Preset::Quality, "高质量"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (p, t))| {
-                        button(("preset", i), t, self.config.preset == p)
-                            .disabled(self.active())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.active() {
-                                    this.config.apply_preset(p);
-                                    this.save();
-                                }
-                                cx.notify();
-                            }))
-                    }),
-                ),
-            )
-            .child(label("省空间适合文档和会议；画面越动态，文件越大。"))
+            .when(!self.config.audio_only, |d| {
+                d.child(label("画质与体积"))
+                    .child(
+                        div().flex().flex_wrap().gap_2().children(
+                            [
+                                (Preset::Space, "省空间"),
+                                (Preset::Balanced, "平衡"),
+                                (Preset::Quality, "高质量"),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (p, t))| {
+                                button(("preset", i), t, self.config.preset == p)
+                                    .disabled(self.active())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.active() {
+                                            this.config.apply_preset(p);
+                                            this.save();
+                                        }
+                                        cx.notify();
+                                    }))
+                            }),
+                        ),
+                    )
+                    .child(label("省空间适合文档和会议；画面越动态，文件越大。"))
+            })
+            .when(self.config.audio_only, |d| {
+                d.child(label("无需采集或编码画面，适合长时间会议录音。"))
+            })
     }
     fn recording_preview(&self, cx: &Context<Self>) -> Div {
         div()

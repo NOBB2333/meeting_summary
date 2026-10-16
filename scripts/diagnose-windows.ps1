@@ -1,6 +1,6 @@
 param(
-    [ValidateSet('closed','idle','recording','no-asr','no-preview','minimized')][string]$Scenario = 'idle',
-    [ValidateRange(5,120)][int]$Seconds = 20,
+    [ValidateSet('closed','idle','recording','no-asr','no-preview','no-asr-preview','audio-only','minimized')][string]$Scenario = 'idle',
+    [ValidateRange(5,1800)][int]$Seconds = 660,
     [string]$Output = '',
     [string]$RecordingReport = ''
 )
@@ -55,9 +55,17 @@ if ($RecordingReport) {
         ContextRevision = $saved.config.transcription_context_revision
         RecordingPreview = $saved.config.show_recording_preview
         MaxFps = $saved.config.max_fps
+        AudioOnly = $saved.config.audio_only
+        PerformanceSamples = $saved.performance_samples
     }
 }
+$platformInfo = [pscustomobject]@{
+    Os = [Environment]::OSVersion.VersionString
+    Cpu = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object Name,NumberOfLogicalProcessors)
+    Gpu = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name,DriverVersion)
+}
 $data = [pscustomobject]@{
+    Platform = $platformInfo
     Scenario = $Scenario; LogicalProcessors = $cores; CpuDefinition = 'percent of all logical processors'
     GpuDefinition = 'raw nonzero per-engine counters; do not sum as whole-GPU percent'
     Recording = $report; Samples = $samples

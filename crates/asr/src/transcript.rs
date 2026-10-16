@@ -159,12 +159,18 @@ impl Transcript {
             .collect::<Vec<_>>()
             .join("\n")
     }
-    pub fn save(&self, base: &Path) -> Result<()> {
+    /// Lightweight recovery data. Full document generation belongs at completion/export.
+    pub fn checkpoint(&self, base: &Path) -> Result<()> {
         if let Some(parent) = base.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = base.with_extension("transcript.json");
-        atomic_write(&json, &serde_json::to_vec_pretty(self)?)?;
+        atomic_write(
+            &base.with_extension("transcript.json"),
+            &serde_json::to_vec_pretty(self)?,
+        )
+    }
+    pub fn save(&self, base: &Path) -> Result<()> {
+        self.checkpoint(base)?;
         let mut md = String::from("# 转录\n\n");
         if !self.complete {
             md.push_str("转录尚未完整完成；原媒体保留，可重新转录。\n\n");
@@ -338,6 +344,15 @@ mod tests {
         let base = dir.join("meeting");
         let mut transcript = Transcript::default();
         transcript.apply(s(1, "不能上线，预算 2 万元。", true));
+        transcript.checkpoint(&base).unwrap();
+        let restored: Transcript =
+            serde_json::from_slice(&std::fs::read(base.with_extension("transcript.json")).unwrap())
+                .unwrap();
+        assert_eq!(restored.text(), transcript.text());
+        assert!(!restored.complete);
+        for extension in ["transcript.md", "transcript.txt", "srt", "transcript.docx"] {
+            assert!(!base.with_extension(extension).exists());
+        }
         transcript.save(&base).unwrap();
         assert!(!base.with_extension("transcript.docx").exists());
         transcript.complete = true;
