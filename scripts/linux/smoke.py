@@ -20,8 +20,8 @@ os.environ["PULSE_SERVER"] = "unix:" + str(output / "pulse.sock")
 processes = []
 
 
-def run(*args):
-    return subprocess.check_output([str(v) for v in args], text=True).strip()
+def run(*args, **kwargs):
+    return subprocess.check_output([str(v) for v in args], text=True, timeout=60, **kwargs).strip()
 
 
 def start(*args):
@@ -60,29 +60,37 @@ try:
                 raise RuntimeError("Synthetic desktop/audio services did not start")
             time.sleep(0.1)
     tone = output / "tone.wav"
-    run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "40", "-ac", "2", tone)
+    run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "60", "-ac", "2", tone)
     start("paplay", "--device=opencap_test", tone)
     print(run(build / "opencap-bench", "sources"), flush=True)
     print(run(build / "opencap-bench", "audio-probe", "--seconds", "4"), flush=True)
     results = []
     for name, arguments, audio in (
         ("screen", ["--no-audio", "--seconds", "4"], False),
+        ("screen-audio", ["--seconds", "4"], False),
         ("pause", ["--no-audio", "--seconds", "6", "--pause-at", "1", "--pause-for", "2"], False),
         ("audio", ["--audio-only", "--seconds", "4"], True),
+        ("audio-pause", ["--audio-only", "--seconds", "6", "--pause-at", "1", "--pause-for", "2"], True),
     ):
         destination = output / name
         destination.mkdir(exist_ok=True)
         for old in destination.glob("*.mp4" if not audio else "*.m4a"):
             old.unlink()
-        text = run(build / "opencap-bench", "record", "--region", "0,0,640,360", "--codec", "h264", "--encoder", "libx264", "--fps", "10", "--output", destination, *arguments)
+        recording_env = os.environ.copy()
+        if audio:
+            recording_env.pop("DISPLAY", None)
+            recording_env.pop("WAYLAND_DISPLAY", None)
+        text = run(build / "opencap-bench", "record", "--region", "0,0,640,360", "--codec", "h264", "--encoder", "libx264", "--fps", "10", "--output", destination, *arguments, env=recording_env)
         (destination / "stats.json").write_text(text + "\n")
         stats = json.loads(text)
         assert stats["state"] == "Finished", stats
-        if name == "pause":
+        if "pause" in name:
             assert 2.5 <= stats["duration_seconds"] < 5, stats
         paths = list(destination.glob("*.m4a" if audio else "*.mp4"))
         assert len(paths) == 1 and ".partial." not in paths[0].name, paths
         results.append(inspect(paths[0], audio))
+        if name == "screen-audio":
+            results.append(inspect(paths[0], audio=True))
     # Run the actual application against an isolated home, then capture its
     # rendered X11 window. CLI-only checks cannot detect graphics startup errors.
     gui_env = os.environ.copy()

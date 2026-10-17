@@ -103,12 +103,18 @@ fn start_route(
             "error",
             "-fflags",
             "nobuffer",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "1",
             "-f",
             "pulse",
             "-sample_rate",
             "48000",
             "-channels",
             "2",
+            "-fragment_size",
+            "3840",
             "-i",
         ])
         .arg(source)

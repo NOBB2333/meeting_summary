@@ -710,7 +710,7 @@ impl Recorder {
             })))
             .child(label("服务地址（填写根地址，自动追加协议路径）")).child(Input::new(&self.ai.url))
             .child(label("模型名")).child(Input::new(&self.ai.model))
-            .child(label("API Key（保存到 macOS 钥匙串 / Windows 凭据库）")).child(Input::new(&self.ai.key).mask_toggle().disabled(busy))
+            .child(label("API Key（保存到系统安全凭据库）")).child(Input::new(&self.ai.key).mask_toggle().disabled(busy))
             .child(label(self.ai.credential_status.clone()))
             .child(button("reload-ai-key", "载入已存密钥", false).ghost().disabled(busy).on_click(cx.listener(|this, _, _, cx| this.load_ai_key(cx))))
             .when(self.ai.config.provider == AiProvider::Responses && !self.ai.config.is_deepseek(), |d| d.child(

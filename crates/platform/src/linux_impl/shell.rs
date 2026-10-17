@@ -4,7 +4,7 @@ use crossbeam_channel::{Receiver, unbounded};
 use opencap_core::*;
 use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{
         Arc,
@@ -15,7 +15,11 @@ use std::{
 };
 use x11rb::{
     connection::Connection,
-    protocol::{Event, xproto::*},
+    protocol::{
+        Event,
+        xkb::{self, ConnectionExt as _},
+        xproto::*,
+    },
     wrapper::ConnectionExt as _,
 };
 
@@ -94,6 +98,25 @@ fn hotkey(c: &x11rb::rust_connection::RustConnection, text: &str) -> Result<(u8,
 pub fn desktop_controls(record: &str, pause: &str) -> Result<DesktopControls> {
     let (c, screen) = connect()?;
     let root = c.setup().roots[screen].root;
+    anyhow::ensure!(
+        c.xkb_use_extension(1, 0)?.reply()?.supported,
+        "X11 会话不支持 XKB 快捷键"
+    );
+    let repeat = xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT;
+    let flags = c
+        .xkb_per_client_flags(
+            u16::from(xkb::ID::USE_CORE_KBD),
+            repeat,
+            repeat,
+            xkb::BoolCtrl::default(),
+            xkb::BoolCtrl::default(),
+            xkb::BoolCtrl::default(),
+        )?
+        .reply()?;
+    anyhow::ensure!(
+        flags.value & repeat == repeat,
+        "X11 会话无法区分快捷键长按，请使用界面控制录制"
+    );
     let keys = [hotkey(&c, record)?, hotkey(&c, pause)?];
     for (code, mask) in keys {
         for lock in [
@@ -119,14 +142,25 @@ pub fn desktop_controls(record: &str, pause: &str) -> Result<DesktopControls> {
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = stop.clone();
     let worker = thread::spawn(move || {
+        let mut held = HashSet::new();
         while !worker_stop.load(Ordering::Acquire) {
             match c.poll_for_event() {
                 Ok(Some(Event::KeyPress(e))) => {
-                    let _ = tx.try_send(if e.detail == keys[0].0 {
-                        ShellEvent::Record
-                    } else {
-                        ShellEvent::Pause
-                    });
+                    if !held.insert(e.detail) {
+                        continue;
+                    }
+                    let modifiers =
+                        u16::from(e.state) & 0xff & !u16::from(ModMask::LOCK | ModMask::M2);
+                    let _ = tx.try_send(
+                        if e.detail == keys[0].0 && modifiers == u16::from(keys[0].1) {
+                            ShellEvent::Record
+                        } else {
+                            ShellEvent::Pause
+                        },
+                    );
+                }
+                Ok(Some(Event::KeyRelease(e))) => {
+                    held.remove(&e.detail);
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(30)),
                 Ok(Some(_)) => (),
