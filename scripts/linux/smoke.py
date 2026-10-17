@@ -119,6 +119,9 @@ try:
     if "--skip-gui" not in sys.argv:
         # Run the actual application against an isolated home, then capture its
         # rendered X11 window. CLI-only checks cannot detect graphics startup errors.
+        manager = start("openbox", "--sm-disable")
+        time.sleep(0.5)
+        assert manager.poll() is None, "The virtual desktop window manager did not start"
         gui_env = os.environ.copy()
         for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
             directory = output / name
@@ -147,8 +150,10 @@ try:
             text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
             (destination / "stats.json").write_text(text + "\n")
             path = Path(json.loads(text)["output"])
-            _, _, raw = decoded_frame(path)
-            assert len({raw[i:i + 3] for i in range(0, len(raw) - 2, 30)}) > 16, "GUI window did not render its contents"
+            width, height, raw = decoded_frame(path)
+            red = sum(1 for i in range(0, len(raw), 3) if raw[i + 2] > 180 and raw[i + 1] < 70 and raw[i] < 70)
+            assert red < width * height * 0.5, "GUI window still contains the synthetic desktop background"
+            assert len({raw[i:i + 3] for i in range(0, len(raw) - 2, 30)}) > 64, "GUI window did not render its contents"
             run("ffmpeg", "-v", "error", "-y", "-i", path, "-frames:v", "1", output / "gui.png")
             results.append({"gui_started": True, "gui_rendered": True})
     (output / "report.json").write_text(json.dumps(results, indent=2) + "\n")
