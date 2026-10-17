@@ -13,6 +13,10 @@ on:
         type: choice
         options: [auto, immediate]
         default: auto
+      window_probe:
+        description: "Build the minimal native window for framework diagnostics"
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -152,6 +156,33 @@ jobs:
           mkdir -p target/runtime-package
           tar -xzf target/runtime-download/OpenCap-linux-x64.tar.gz -C target/runtime-package
       - uses: docker/setup-buildx-action@v4.4.1
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.window_probe
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        if: inputs.window_probe
+        with:
+          shared-key: linux-glibc228-build
+          cache-on-failure: true
+          cache-all-crates: true
+      - name: Load compiler for the minimal window
+        if: inputs.window_probe
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: scripts/linux/Dockerfile
+          load: true
+          tags: opencap-build:glibc228
+          cache-from: type=gha,scope=opencap-linux-toolchain
+      - name: Build isolated window probe
+        if: inputs.window_probe
+        run: |
+          docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 bash -euc '
+            cargo build --locked -p opencap --example linux-window-probe
+            cp target/debug/examples/linux-window-probe target/runtime-package/OpenCap/usr/bin/opencap
+            patchelf --set-rpath "\$ORIGIN/../lib" target/runtime-package/OpenCap/usr/bin/opencap
+          '
       - uses: docker/build-push-action@v7.4.0
         with:
           context: .
@@ -169,6 +200,9 @@ jobs:
             export FONTCONFIG_FILE="$PWD/target/runtime-package/OpenCap/fonts.conf"
             dbus-run-session -- python3 scripts/linux/smoke.py target/runtime-package/OpenCap/usr/bin --gui-only
           '
+      - name: Restore probe cache ownership
+        if: always() && inputs.window_probe
+        run: sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo/registry" 2>/dev/null || true
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:

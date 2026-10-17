@@ -126,7 +126,6 @@ try:
         assert manager.poll() is None, "The virtual desktop window manager did not start"
         gui_env = os.environ.copy()
         gui_env["OPENCAP_LOG"] = "info"
-        gui_env["LD_LIBRARY_PATH"] = str(build.parent / "lib")
         if os.environ.get("OPENCAP_TEST_PRESENT_MODE") == "immediate":
             gui_env["MESA_VK_WSI_PRESENT_MODE"] = "immediate"
         for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
