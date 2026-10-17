@@ -126,6 +126,8 @@ try:
         assert manager.poll() is None, "The virtual desktop window manager did not start"
         gui_env = os.environ.copy()
         gui_env["OPENCAP_LOG"] = "info"
+        if os.environ.get("OPENCAP_TEST_PRESENT_MODE") == "immediate":
+            gui_env["MESA_VK_WSI_PRESENT_MODE"] = "immediate"
         for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
             directory = output / name
             directory.mkdir(exist_ok=True)
@@ -183,7 +185,8 @@ try:
                 run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-remapped.png")
                 text = run(build / "opencap-bench", "record", "--region", "0,0,1920,1080", "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
                 run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-desktop.png")
-                run("xdotool", "key", "--window", window, "F13")
+                run("xdotool", "windowactivate", "--sync", window)
+                run("xdotool", "key", "F13")
                 time.sleep(1)
                 text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
                 run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-key-event.png")

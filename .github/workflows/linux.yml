@@ -8,11 +8,16 @@ on:
         description: "Optional failed build run ID for GUI diagnostics without recompiling"
         type: string
         default: ""
+      present_mode:
+        description: "Software-GPU presentation mode for the virtual display"
+        type: choice
+        options: [auto, immediate]
+        default: auto
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: linux-${{ github.ref }}
+  group: linux-${{ github.ref }}-${{ inputs.artifact_run || 'build' }}
   cancel-in-progress: true
 jobs:
   build:
@@ -156,8 +161,10 @@ jobs:
           cache-from: type=gha,scope=opencap-linux-runtime
           cache-to: type=gha,mode=max,scope=opencap-linux-runtime,ignore-error=true
       - name: Inspect GUI from the existing package
+        env:
+          OPENCAP_TEST_PRESENT_MODE: ${{ inputs.present_mode }}
         run: |
-          docker run --rm --cap-add=SYS_PTRACE -v "$PWD:/workspace" opencap-runtime:check bash -euc '
+          docker run --rm --cap-add=SYS_PTRACE --env OPENCAP_TEST_PRESENT_MODE -v "$PWD:/workspace" opencap-runtime:check bash -euc '
             export PATH="$PWD/target/runtime-package/OpenCap/usr/bin:/usr/bin:/bin"
             export FONTCONFIG_FILE="$PWD/target/runtime-package/OpenCap/fonts.conf"
             dbus-run-session -- python3 scripts/linux/smoke.py target/runtime-package/OpenCap/usr/bin --gui-only
