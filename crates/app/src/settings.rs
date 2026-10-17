@@ -98,7 +98,7 @@ impl Recorder {
                     },
                     self.config.exclude_app,
                 )
-                .disabled(cfg!(target_os = "linux"))
+                .disabled(cfg!(target_os = "linux") && !self.config.exclude_app)
                 .on_click(cx.listener(|this, _, _, cx| {
                     let enabled = !this.config.exclude_app;
                     match opencap_platform::set_capture_exclusion(this.hwnd, enabled).and_then(
@@ -134,7 +134,7 @@ impl Recorder {
                                     text,
                                     self.config.effective_border_mode() == mode,
                                 )
-                                .disabled(cfg!(target_os = "linux"))
+                                .disabled(cfg!(target_os = "linux") && mode != BorderMode::Never)
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.config.show_capture_border = mode != BorderMode::Never;

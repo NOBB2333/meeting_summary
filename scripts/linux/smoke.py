@@ -86,11 +86,12 @@ try:
         assert stats["state"] == "Finished", stats
         if "pause" in name:
             assert 2.5 <= stats["duration_seconds"] < 5, stats
-        paths = list(destination.glob("*.m4a" if audio else "*.mp4"))
-        assert len(paths) == 1 and ".partial." not in paths[0].name, paths
-        results.append(inspect(paths[0], audio))
+        path = Path(stats["output"])
+        assert path.is_file() and ".partial." not in path.name, path
+        assert path.suffix == (".m4a" if audio else ".mp4"), path
+        results.append(inspect(path, audio))
         if name == "screen-audio":
-            results.append(inspect(paths[0], audio=True))
+            results.append(inspect(path, audio=True))
     # Run the actual application against an isolated home, then capture its
     # rendered X11 window. CLI-only checks cannot detect graphics startup errors.
     gui_env = os.environ.copy()
@@ -120,7 +121,7 @@ try:
         destination.mkdir(exist_ok=True)
         text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
         (destination / "stats.json").write_text(text + "\n")
-        path = max(destination.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+        path = Path(json.loads(text)["output"])
         raw = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
         assert len({raw[i:i + 3] for i in range(0, len(raw) - 2, 30)}) > 16, "GUI window did not render its contents"
         run("ffmpeg", "-v", "error", "-y", "-i", path, "-frames:v", "1", output / "gui.png")
