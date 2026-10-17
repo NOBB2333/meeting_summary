@@ -28,7 +28,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh 
 RUN apt-get update && apt-get install -y --no-install-recommends x11-xserver-utils \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/linux/cxx-runtime.sh /opt/cxx-runtime.sh
-RUN bash /opt/cxx-runtime.sh
+ADD --chmod=644 https://conda.anaconda.org/conda-forge/linux-64/libstdcxx-ng-12.2.0-h46fd767_19.tar.bz2 /opt/compat/downloads/libstdcxx-ng-12.2.0-h46fd767_19.tar.bz2
+ADD --chmod=644 https://conda.anaconda.org/conda-forge/linux-aarch64/libstdcxx-ng-12.2.0-hc13a102_19.tar.bz2 /opt/compat/downloads/libstdcxx-ng-12.2.0-hc13a102_19.tar.bz2
+RUN bash /opt/cxx-runtime.sh && rm -rf /opt/compat/downloads
 ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig LD_LIBRARY_PATH=/opt/compat/lib:/opt/ffmpeg/lib
 ENV LIBRARY_PATH=/opt/compat/lib
 ENV CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0

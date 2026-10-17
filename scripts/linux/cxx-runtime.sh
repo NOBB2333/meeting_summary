@@ -16,6 +16,10 @@ case "$(uname -m)" in
   *) echo "Unsupported C++ runtime architecture" >&2; exit 1 ;;
 esac
 mkdir -p /opt/compat/source
-curl -fL --retry 4 "https://conda.anaconda.org/conda-forge/$subdir/$name" -o "/opt/compat/source/$name"
+if [[ -f "/opt/compat/downloads/$name" ]]; then
+  cp "/opt/compat/downloads/$name" "/opt/compat/source/$name"
+else
+  curl -fL --retry 4 "https://conda.anaconda.org/conda-forge/$subdir/$name" -o "/opt/compat/source/$name"
+fi
 echo "$digest  /opt/compat/source/$name" | sha256sum --check
 tar -xjf "/opt/compat/source/$name" -C /opt/compat

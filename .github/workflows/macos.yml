@@ -17,7 +17,7 @@ jobs:
             arch: x64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
@@ -43,7 +43,7 @@ jobs:
           codesign --verify --deep --strict release/OpenCap.app
           iconutil -c iconset release/OpenCap.app/Contents/Resources/OpenCap.icns -o /tmp/OpenCap.iconset
           ditto -c -k --sequesterRsrc --keepParent release/OpenCap.app release/OpenCap-macos-${{ matrix.arch }}.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: OpenCap-macos-${{ matrix.arch }}
           path: release/OpenCap-macos-${{ matrix.arch }}.zip
