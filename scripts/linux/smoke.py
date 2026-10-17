@@ -93,7 +93,8 @@ try:
         tone = output / "tone.wav"
         run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "60", "-ac", "2", tone)
         start("paplay", "--device=opencap_test", tone)
-    print(run(build / "opencap-bench", "sources"), flush=True)
+    if not gui_only:
+        print(run(build / "opencap-bench", "sources"), flush=True)
     if not gui_only:
         print(run(build / "opencap-bench", "audio-probe", "--seconds", "4"), flush=True)
     results = []
@@ -154,10 +155,11 @@ try:
             while time.monotonic() < deadline:
                 if gui.poll() is not None:
                     raise RuntimeError("GUI exited during startup; see target/verify/linux-smoke/gui.log")
-                sources = run(build / "opencap-bench", "sources")
-                for line in sources.splitlines():
-                    if line.startswith("Window(") and "\tOpenCap\t" in line:
-                        window = line.split(")", 1)[0][7:]
+                search = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "^OpenCap$"], capture_output=True, text=True, timeout=5)
+                for candidate in search.stdout.splitlines():
+                    owner = subprocess.run(["xdotool", "getwindowpid", candidate], capture_output=True, text=True, timeout=5)
+                    if owner.returncode == 0 and owner.stdout.strip() == str(gui.pid):
+                        window = candidate
                         break
                 if window:
                     break
