@@ -135,6 +135,7 @@ jobs:
             target/verify/linux-smoke/report.json
             target/verify/linux-smoke/*/stats.json
             target/verify/linux-smoke/gui.log
+            target/verify/linux-smoke/services.log
             target/verify/linux-smoke/gui-threads.log
             target/verify/linux-smoke/gui-window.log
             target/verify/linux-smoke/gui.png

@@ -6,17 +6,23 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 build = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release").resolve()
 output = Path("target/verify/linux-smoke").resolve()
 output.mkdir(parents=True, exist_ok=True)
+gui_only = "--gui-only" in sys.argv
+runtime = tempfile.TemporaryDirectory(prefix="opencap-smoke-")
+for pattern in ("gui*.png", "gui*.log", "report.json"):
+    for stale in output.glob(pattern):
+        stale.unlink()
+(output / "services.log").write_text("")
 os.environ["DISPLAY"] = ":91"
 os.environ["XDG_SESSION_TYPE"] = "x11"
-os.environ["XDG_RUNTIME_DIR"] = str(output / "runtime")
-Path(os.environ["XDG_RUNTIME_DIR"]).mkdir(mode=0o700, exist_ok=True)
-os.environ["PULSE_SERVER"] = "unix:" + str(output / "pulse.sock")
+os.environ["XDG_RUNTIME_DIR"] = runtime.name
+os.environ["PULSE_SERVER"] = "unix:" + str(Path(runtime.name) / "pulse.sock")
 processes = []
 
 
@@ -30,7 +36,8 @@ def start(*args):
     environment = os.environ.copy()
     environment.pop("LD_LIBRARY_PATH", None)
     environment.pop("FONTCONFIG_FILE", None)
-    process = subprocess.Popen([str(v) for v in args], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with (output / "services.log").open("a") as diagnostic:
+        process = subprocess.Popen([str(v) for v in args], env=environment, stdout=diagnostic, stderr=diagnostic)
     processes.append(process)
     return process
 
@@ -67,24 +74,28 @@ def inspect(path, audio=False):
 
 try:
     desktop = start("Xvfb", ":91", "-screen", "0", "1920x1080x24", "-nolisten", "tcp", "-ac", "-noreset")
-    start("pulseaudio", "-n", "--daemonize=no", "--exit-idle-time=-1", "--disable-shm=yes", "--load=module-native-protocol-unix socket=" + str(output / "pulse.sock") + " auth-anonymous=1", "--load=module-null-sink sink_name=opencap_test rate=48000 channels=2")
+    if not gui_only:
+        start("pulseaudio", "-n", "--daemonize=no", "--exit-idle-time=-1", "--disable-shm=yes", "--load=module-native-protocol-unix socket=" + str(Path(runtime.name) / "pulse.sock") + " auth-anonymous=1", "--load=module-null-sink sink_name=opencap_test rate=48000 channels=2")
     deadline = time.monotonic() + 15
     while True:
         if desktop.poll() is not None:
             raise RuntimeError("Cannot start the dedicated virtual desktop; refusing to use another display")
         try:
-            run("pactl", "info")
+            if not gui_only:
+                run("pactl", "info")
             run("xsetroot", "-solid", "#f00000")
             break
         except subprocess.CalledProcessError:
             if time.monotonic() > deadline:
                 raise RuntimeError("Synthetic desktop/audio services did not start")
             time.sleep(0.1)
-    tone = output / "tone.wav"
-    run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "60", "-ac", "2", tone)
-    start("paplay", "--device=opencap_test", tone)
+    if not gui_only:
+        tone = output / "tone.wav"
+        run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "60", "-ac", "2", tone)
+        start("paplay", "--device=opencap_test", tone)
     print(run(build / "opencap-bench", "sources"), flush=True)
-    print(run(build / "opencap-bench", "audio-probe", "--seconds", "4"), flush=True)
+    if not gui_only:
+        print(run(build / "opencap-bench", "audio-probe", "--seconds", "4"), flush=True)
     results = []
     cases = (
         ("screen", ["--no-audio", "--seconds", "4"], False),
@@ -93,7 +104,7 @@ try:
         ("audio", ["--audio-only", "--seconds", "4"], True),
         ("audio-pause", ["--audio-only", "--seconds", "6", "--pause-at", "1", "--pause-for", "2"], True),
     )
-    for name, arguments, audio in (() if "--gui-only" in sys.argv else cases):
+    for name, arguments, audio in (() if gui_only else cases):
         destination = output / name
         destination.mkdir(exist_ok=True)
         for old in destination.glob("*.mp4" if not audio else "*.m4a"):
@@ -125,13 +136,14 @@ try:
         time.sleep(0.5)
         assert manager.poll() is None, "The virtual desktop window manager did not start"
         gui_env = os.environ.copy()
-        gui_env["OPENCAP_LOG"] = "debug"
+        if gui_only:
+            gui_env["OPENCAP_LOG"] = "debug"
         if os.environ.get("OPENCAP_TEST_PRESENT_MODE") == "immediate":
             gui_env["MESA_VK_WSI_PRESENT_MODE"] = "immediate"
         elif os.environ.get("OPENCAP_TEST_PRESENT_MODE") == "opengl":
             gui_env["VK_ICD_FILENAMES"] = "/nonexistent/opencap-no-vulkan.json"
         for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
-            directory = output / name
+            directory = Path(runtime.name) / name
             directory.mkdir(exist_ok=True)
             gui_env[variable] = str(directory)
         with (output / "gui.log").open("w") as log:
@@ -209,3 +221,4 @@ finally:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+    runtime.cleanup()
