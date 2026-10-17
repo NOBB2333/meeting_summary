@@ -30,6 +30,19 @@ def start(*args):
     return process
 
 
+def decoded_frame(path):
+    # The distributed FFmpeg deliberately enables a small set of encoders.
+    # BMP is included; rawvideo is not needed by the application.
+    data = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-c:v", "bmp", "-pix_fmt", "bgr24", "-f", "image2pipe", "-"])
+    assert data[:2] == b"BM"
+    offset = struct.unpack_from("<I", data, 10)[0]
+    width, height = struct.unpack_from("<ii", data, 18)
+    assert struct.unpack_from("<H", data, 28)[0] == 24
+    stride = (width * 3 + 3) // 4 * 4
+    pixels = b"".join(data[offset + row * stride:offset + row * stride + width * 3] for row in range(abs(height)))
+    return width, abs(height), pixels
+
+
 def inspect(path, audio=False):
     if audio:
         raw = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "1", "-ar", "16000", "-"])
@@ -38,10 +51,10 @@ def inspect(path, audio=False):
         rms = math.sqrt(sum(s * s for s in samples) / len(samples))
         assert rms > 0.01, f"Audio is silent (RMS {rms}): {path}"
         return {"file": str(path), "seconds": len(samples) / 16000, "rms": rms}
-    raw = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
-    assert len(raw) == 640 * 360 * 3, "Unexpected captured dimensions"
+    width, height, raw = decoded_frame(path)
+    assert (width, height, len(raw)) == (640, 360, 640 * 360 * 3), "Unexpected captured dimensions"
     # xsetroot paints the virtual root red; verify real pixels were captured.
-    red = sum(1 for i in range(0, len(raw), 3) if raw[i] > 180 and raw[i + 1] < 70 and raw[i + 2] < 70)
+    red = sum(1 for i in range(0, len(raw), 3) if raw[i + 2] > 180 and raw[i + 1] < 70 and raw[i] < 70)
     assert red > 640 * 360 * 0.8, "X11 capture did not contain the synthetic desktop"
     return {"file": str(path), "red_pixels": red}
 
@@ -122,7 +135,7 @@ try:
         text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
         (destination / "stats.json").write_text(text + "\n")
         path = Path(json.loads(text)["output"])
-        raw = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        _, _, raw = decoded_frame(path)
         assert len({raw[i:i + 3] for i in range(0, len(raw) - 2, 30)}) > 16, "GUI window did not render its contents"
         run("ffmpeg", "-v", "error", "-y", "-i", path, "-frames:v", "1", output / "gui.png")
         results.append({"gui_started": True, "gui_rendered": True})
