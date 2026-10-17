@@ -70,10 +70,9 @@ jobs:
       - name: Packaged application without developer library paths
         run: |
           docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 bash -euc '
-            export LD_LIBRARY_PATH="$PWD/release/OpenCap-linux-x64/usr/lib"
             export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
             export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
-            unset LIBRARY_PATH PKG_CONFIG_PATH
+            unset LIBRARY_PATH PKG_CONFIG_PATH LD_LIBRARY_PATH
             dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin --skip-gui
           '
       - name: Graphics runtime with software Vulkan
@@ -88,7 +87,6 @@ jobs:
       - name: Packaged GUI and media on a clean runtime
         run: |
           docker run --rm -v "$PWD:/workspace" opencap-runtime:check bash -euc '
-            export LD_LIBRARY_PATH="$PWD/release/OpenCap-linux-x64/usr/lib"
             export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
             export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
             dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin

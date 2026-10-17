@@ -128,7 +128,6 @@ def package(build_dir, output):
     launcher.write_text('''#!/bin/sh
 set -eu
 app_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-export LD_LIBRARY_PATH="$app_dir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PATH="$app_dir/usr/bin:$PATH"
 export FONTCONFIG_FILE="$app_dir/fonts.conf"
 exec "$app_dir/usr/bin/opencap" "$@"
