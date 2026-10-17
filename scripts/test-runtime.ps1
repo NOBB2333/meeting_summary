@@ -85,8 +85,8 @@ $samples = [Collections.Generic.List[object]]::new()
 $report = [ordered]@{ directory = $directoryPath; clean_path = $true; cli_passed = $false; gui_passed = $null; recording_passed = $null; runtime_modules = @(); passed = $false }
 try {
     Invoke-CleanBench 'version' @('--version')
-    Invoke-CleanBench 'transcribe-version' @('--version') -Executable 'opencap-transcribe.exe'
-    Invoke-CleanBench 'runtime-fixture' @('fixture', '--seconds', '1', '--width', '160', '--height', '90', '--codec', 'h264', '--encoder', 'libx264', '--output', (Join-Path $outputPath ('fixture-' + [Guid]::NewGuid().ToString('N'))))
+    Invoke-CleanBench 'transcribe-help' @('--help') -Executable 'opencap-transcribe.exe'
+    Invoke-CleanBench 'runtime-fixture' @('fixture', '--seconds', '5', '--width', '160', '--height', '90', '--codec', 'h264', '--encoder', 'libx264', '--output', (Join-Path $outputPath ('fixture-' + [Guid]::NewGuid().ToString('N'))))
     $report.cli_passed = $true
     if (!$CliOnly) {
         $gui = Start-CleanProcess 'opencap.exe'

@@ -4,8 +4,9 @@ ARG TARGETARCH
 # Bootstrap HTTPS for the archived base image; APT still verifies Debian signatures.
 ADD --chmod=644 https://curl.se/ca/cacert.pem /etc/ssl/certs/ca-certificates.crt
 # Build against glibc 2.28 for UOS 20 / Debian 10. Use signed archived repositories.
-RUN printf 'deb https://archive.debian.org/debian buster main\ndeb https://archive.debian.org/debian-security buster/updates main\n' > /etc/apt/sources.list \
-    && printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "4";\nAcquire::https::Pipeline-Depth "0";\n' > /etc/apt/apt.conf.d/99archive \
+RUN chmod 755 /etc/ssl /etc/ssl/certs && chmod 644 /etc/ssl/certs/ca-certificates.crt \
+    && printf 'deb https://archive.debian.org/debian buster main\ndeb https://archive.debian.org/debian-security buster/updates main\n' > /etc/apt/sources.list \
+    && printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "4";\nAcquire::https::Pipeline-Depth "0";\nAcquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";\n' > /etc/apt/apt.conf.d/99archive \
     && rm /etc/apt/apt.conf.d/docker-clean
 RUN --mount=type=cache,id=opencap-buster-apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
