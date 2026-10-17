@@ -223,8 +223,10 @@ fixture v2 的 3600 秒 PPT 与文档 HEVC QSV 已编码完成，分别 8.79 MB 
 ## 三端构建、图标与 Linux 兼容复查（2026-10-17）
 
 - 本机 Mac 70 项常规测试通过，1 项实际模型测试保持按条件忽略；严格 Clippy、Release 打包与完整签名检查通过。只更新规范路径 `release/OpenCap.app`，15 个 dylib 随包，最低系统版本按本机依赖计算为 26.0；没有新增应用副本或证书、重置 TCC。
-- Windows Actions 完成 Debug / Release、测试、Clippy、软件编码及干净 PATH 运行库检查；下载的 ZIP 通过 CRC 检查，包含 3 个 EXE、5 个 FFmpeg DLL 和 2 个私有 C++ 运行库。构建记录：[39042254915](https://github.com/NOBB2333/meeting_summary/actions/runs/39042254915)。
-- Mac Actions 的 ARM / Intel 两项均完成测试、Clippy、Release、签名与 ICNS 解码检查；下载的 ZIP 通过 CRC / plist / 两个 ICNS 检查，最低系统版本分别为 14.0 / 15.0。构建记录：[39042254854](https://github.com/NOBB2333/meeting_summary/actions/runs/39042254854)。
+- Windows Actions 完成 Debug / Release、测试、Clippy、软件编码及干净 PATH 运行库检查；下载的 ZIP 通过 CRC 检查，包含 3 个 EXE、5 个 FFmpeg DLL 和 2 个私有 C++ 运行库。构建记录：[39043623537](https://github.com/NOBB2333/meeting_summary/actions/runs/39043623537)。
+- Mac Actions 的 ARM / Intel 两项均完成测试、Clippy、Release、签名与 ICNS 解码检查；下载的 ZIP 通过 CRC / plist / 两个 ICNS 检查，最低系统版本分别为 14.0 / 15.0。构建记录：[39043623588](https://github.com/NOBB2333/meeting_summary/actions/runs/39043623588)。
 - Linux 的 glibc 2.28 媒体验收与图形验收分离；便携包使用私有 RUNPATH，不给宿主服务设置全局 LD_LIBRARY_PATH。图形测试通过 AppRun 启动，校验实际窗口截图中的内容；进程存活、鼠标指针或单色窗口不算通过。
 - 软件 Vulkan 空白窗口问题在最小 GPUI 窗口也可复现；相同环境 OpenGL 能绘制完整应用。CPU 窗口优先 GL 的补丁通过最小窗口截图验证，本地 Linux 容器中四项适配器排序回归通过，覆盖 CPU 窗口、真实 GPU 优先级、硬件后端及无窗口计算。回归直接编译生产排序函数，不依赖上游缺失的字体素材。
 - 统信 UOS 目标为 Intel x86_64，兼容基线为 glibc 2.28+；真实 UOS GPU 驱动与长期性能、Wayland 屏幕采集仍未验收。没有把容器检查等同于实机性能测试。
+- 原生缓存回归使用独立 Cargo 项目和真实 Sherpa 1.13.8：先成功链接并调用版本接口，模拟清理后复现 `could not find native static library sherpa-onnx-c-api`，再分别验证独立缓存恢复、缓存未命中后的定向清理与重新解包。两种恢复路径均重新链接和调用成功；原 SDK 哈希保持一致。三端工作流增加独立 SDK 缓存与未命中恢复，工作流语法检查通过。
+- Linux 应用源码 `088fcc5` 的最终构建完成：57 个 ELF 全部为 x86_64，最高 GLIBC 版本 2.28；原生和便携包的录屏、系统声、暂停恢复、无 DISPLAY 的仅录音检查通过。干净运行环境通过 AppRun 启动完整应用，默认日志级别、未强制 OpenGL，实际中文界面截图已查看且内容正常。`.deb` 的 amd64 / libc6 依赖、便携启动器、三个字体与全部 ELF 对照检查通过。构建记录：[39043623596，第 2 次执行](https://github.com/NOBB2333/meeting_summary/actions/runs/39043623596/attempts/2)。随后只有缓存工作流及验收文档调整，应用源码未再更改。

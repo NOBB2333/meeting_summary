@@ -39,6 +39,18 @@ jobs:
           key: linux-glibc228
           cache-on-failure: true
           cache-all-crates: true
+      # This runs after rust-cache so its post hook saves the SDK before Rust
+      # cache cleanup recursively removes non-Cargo files from target/.
+      - uses: actions/cache@v5
+        id: sherpa-cache
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Recover an uncached native SDK
+        if: steps.sherpa-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf target/sherpa-onnx-prebuilt
+          cargo clean -p sherpa-onnx-sys
       - uses: docker/setup-buildx-action@v4.4.1
       - name: Build pinned FFmpeg and glibc 2.28 toolchain
         uses: docker/build-push-action@v7.4.0
@@ -169,6 +181,17 @@ jobs:
           save-if: false
           cache-on-failure: true
           cache-all-crates: true
+      - uses: actions/cache@v5
+        if: inputs.window_probe
+        id: sherpa-probe-cache
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Recover the probe native SDK
+        if: inputs.window_probe && steps.sherpa-probe-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf target/sherpa-onnx-prebuilt
+          cargo clean -p sherpa-onnx-sys
       - name: Load compiler for the minimal window
         if: inputs.window_probe
         uses: docker/build-push-action@v7.4.0

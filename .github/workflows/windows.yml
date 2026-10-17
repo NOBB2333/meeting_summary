@@ -17,6 +17,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      # Save native files before rust-cache's post-job target cleanup.
+      - uses: actions/cache@v5
+        id: sherpa-cache
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Recover an uncached native SDK
+        if: steps.sherpa-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          if (Test-Path target/sherpa-onnx-prebuilt) {
+            Remove-Item -Recurse -Force target/sherpa-onnx-prebuilt
+          }
+          cargo clean -p sherpa-onnx-sys
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to invalidate the incomplete native SDK cache' }
       - name: Install pinned FFmpeg development libraries
         shell: pwsh
         run: ./scripts/setup.ps1
