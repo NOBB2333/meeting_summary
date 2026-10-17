@@ -201,3 +201,11 @@ fixture v2 的 3600 秒 PPT 与文档 HEVC QSV 已编码完成，分别 8.79 MB 
 - 本轮没有 Windows 编译目标或实机，因此不新增 Windows FPS 或录制性能结论；延续虚拟列表，只重测变化行范围，没有加入动效或更换采集模型。
 - 正式 Release 的原生界面操作通过：从系统文件选择框载入 180 段原创合成 JSON，出现“回到最新”、“复制路径”、“打开会议文件夹”、“打开原文件位置”；点击“导出逐字稿 Word…”实际打开系统保存对话框，另存副本成功，DOCX 与本机稿逐字节一致且 Word XML 含全部 180 段。
 - 检查后正常退出应用，只移除了该合成样本的 1 条索引和本轮测试目录；未搬移或删除历史会议、用户原音频与参考文档。正式 arm64 Mach-O / 15 dylib Release 打包与完整签名验证通过，仍为本机临时签名。没有创建应用副本、启动包装脚本、证书或刷新录屏权限；截图排除仍启用，未将像素视觉验收记为通过。
+
+## Windows 任务栏与托盘状态同步（2026-10-17）
+
+- 确认缺陷：主窗口 set_app_icon 仅启动时调用并固定 app_icon(false)，而录制轮询只更新托盘的 NIM_MODIFY，未更新窗口图标。
+- 修复：主窗口大小图标使用同一录制布尔状态，切换时通过 WM_SETICON 更新；初始 / 完成 / 失败为绿色，Starting / Recording / Paused / Stopping 为录制色。缓存窗口已应用状态，仅在变化时更新；窗口图标更新独立于托盘控件创建是否成功，修改快捷键重建托盘也会重新同步。
+- 使用已有 101 / 102 内嵌图标，无新增图片、应用副本或依赖。LoadIconW 返回共享句柄，保持其生命周期，不销毁仍被窗口使用的图标。
+- 本机 63 项常规测试、全工作区 / 所有目标 / 所有特性 Clippy（-D warnings）、格式及差异检查通过。本机仅 macOS 目标，未宣称 Windows 分支编译或任务栏实机验收通过。Windows 新构建需检查：首次打开绿色、启动 / 暂停 / 恢复 / 保存时录制色、完成 / 失败绿色、第二次录制再次切换，以及固定在任务栏 / 最小化场景。
+- 接口依据：[Microsoft WM_SETICON](https://learn.microsoft.com/zh-cn/windows/win32/winmsg/wm-seticon)、[LoadImage / 共享图标缓存语义](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew)。没有更改固定快捷方式或系统图标缓存。

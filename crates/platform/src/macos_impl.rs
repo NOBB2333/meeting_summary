@@ -648,7 +648,7 @@ pub fn desktop_controls(record: &str, pause: &str) -> Result<DesktopControls> {
         _sender: sender,
     })
 }
-pub fn set_app_icon(_: isize) {}
+pub fn set_app_icon(_: isize, _: bool) {}
 pub fn set_capture_exclusion(view: isize, value: bool) -> Result<()> {
     unsafe {
         oc_window(view, 2, value);

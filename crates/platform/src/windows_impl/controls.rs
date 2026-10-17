@@ -59,27 +59,28 @@ impl DesktopControls {
     }
 }
 
-pub fn set_app_icon(hwnd: isize) {
+/// Window/taskbar icons are separate from the notification-area icon. Update
+/// both sizes from the same state, including when desktop controls are unavailable.
+pub fn set_app_icon(hwnd: isize, recording: bool) {
+    if hwnd == 0 {
+        return;
+    }
     unsafe {
-        if hwnd == 0 {
-            return;
-        }
-        if let Ok(icon) = app_icon(false) {
-            let _ = SendMessageW(
-                HWND(hwnd as _),
-                WM_SETICON,
-                Some(WPARAM(0)),
-                Some(LPARAM(icon.0 as isize)),
-            );
-            let _ = SendMessageW(
-                HWND(hwnd as _),
-                WM_SETICON,
-                Some(WPARAM(1)),
-                Some(LPARAM(icon.0 as isize)),
-            );
+        if let Ok(icon) = app_icon(recording) {
+            // LoadIconW returns a shared embedded icon. Keep it alive while the
+            // window uses it; do not DestroyIcon on either state's resource.
+            for kind in [ICON_SMALL, ICON_BIG] {
+                let _ = SendMessageW(
+                    HWND(hwnd as _),
+                    WM_SETICON,
+                    Some(WPARAM(kind as usize)),
+                    Some(LPARAM(icon.0 as isize)),
+                );
+            }
         }
     }
 }
+
 struct ShellState {
     sender: Sender<ShellEvent>,
 }

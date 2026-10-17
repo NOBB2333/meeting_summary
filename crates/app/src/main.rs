@@ -34,6 +34,7 @@ struct Recorder {
     stats: RecordingStats,
     controls: Option<DesktopControls>,
     hwnd: isize,
+    window_icon_recording: bool,
     floating: Option<WindowHandle<gpui::base::Root>>,
     floating_hwnd: isize,
     mode: usize,
@@ -159,7 +160,7 @@ impl Recorder {
             };
         }
         let hwnd = native_handle(window);
-        opencap_platform::set_app_icon(hwnd);
+        opencap_platform::set_app_icon(hwnd, false);
         if !std::env::args().any(|a| a == "--preview") {
             let _ = opencap_platform::set_capture_exclusion(hwnd, config.exclude_app);
         }
@@ -239,6 +240,7 @@ impl Recorder {
             stats: RecordingStats::default(),
             controls,
             hwnd,
+            window_icon_recording: false,
             floating: None,
             floating_hwnd: 0,
             mode,
@@ -561,11 +563,21 @@ impl Recorder {
                 }
             }
         }
+        // The taskbar's window icons and notification-area icon share one state.
+        // Starting/paused/finalizing still belong to an active recording session.
+        let recording = matches!(
+            self.stats.state,
+            RecordingState::Starting
+                | RecordingState::Recording
+                | RecordingState::Paused
+                | RecordingState::Stopping
+        );
+        if recording != self.window_icon_recording {
+            opencap_platform::set_app_icon(self.hwnd, recording);
+            self.window_icon_recording = recording;
+        }
         if let Some(controls) = &self.controls {
-            controls.set_recording_state(matches!(
-                self.stats.state,
-                RecordingState::Recording | RecordingState::Paused | RecordingState::Stopping
-            ));
+            controls.set_recording_state(recording);
         }
         let wants_monitor = self.config.monitor_levels
             && !self.settings
