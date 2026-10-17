@@ -190,6 +190,10 @@ try:
                 time.sleep(1)
                 text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
                 run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-key-event.png")
+                run("xdotool", "windowsize", window, "1210", "830")
+                time.sleep(1)
+                text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
+                run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-resized.png")
             assert rendered, "GUI did not draw its contents within 25 seconds; see gui.png and gui.log"
             results.append({"gui_started": True, "gui_rendered": True})
     (output / "report.json").write_text(json.dumps(results, indent=2) + "\n")
