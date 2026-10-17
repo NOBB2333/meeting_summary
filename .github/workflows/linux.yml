@@ -1,0 +1,53 @@
+name: Linux (UOS compatible)
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-glibc228
+      - name: Build pinned FFmpeg and glibc 2.28 toolchain
+        run: docker build -f scripts/linux/Dockerfile -t opencap-build:glibc228 .
+      - name: Format, tests, Clippy, Release and native capture checks
+        run: |
+          docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 bash -euc '
+            cargo fmt --all -- --check
+            scripts/setup.sh
+            scripts/dev.sh test
+            scripts/dev.sh lint -- -D warnings
+            scripts/dev.sh build --release
+            python3 scripts/linux/smoke.py target/release
+            scripts/package.sh
+          '
+      - name: Restore workspace cache ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo/registry" release 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCap-linux-x64
+          path: |
+            release/OpenCap-linux-x64.tar.gz
+            release/OpenCap-linux-x64.deb
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Linux-validation
+          path: |
+            target/verify/linux-smoke/report.json
+            target/verify/linux-smoke/*/stats.json
+            release/OpenCap-linux-x64/elf-audit.json
+          if-no-files-found: ignore

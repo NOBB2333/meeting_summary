@@ -171,6 +171,11 @@ fn start_route(
                     }
                 }
             }
+        })
+        .inspect_err(|_| {
+            let mut child = child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
         })?;
     Ok(AudioRoute {
         kind,

@@ -257,13 +257,19 @@ impl ProcessMeter {
     pub fn sample(&mut self) -> (Option<f64>, Option<u64>) {
         let pid = std::process::id();
         let mut pids = vec![pid];
-        if let Ok(children) = std::fs::read_to_string(format!("/proc/self/task/{pid}/children")) {
-            pids.extend(
-                children
-                    .split_whitespace()
-                    .filter_map(|s| s.parse::<u32>().ok()),
-            );
+        if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+            for task in tasks.flatten() {
+                if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+                    pids.extend(
+                        children
+                            .split_whitespace()
+                            .filter_map(|s| s.parse::<u32>().ok()),
+                    );
+                }
+            }
         }
+        pids.sort_unstable();
+        pids.dedup();
         let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
         let pages = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
         let mut current = HashMap::new();

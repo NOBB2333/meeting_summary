@@ -48,7 +48,7 @@ $stage = Join-Path $stageRoot 'OpenCap'
 $final = Join-Path $releaseDirectory 'OpenCap'
 $archive = Join-Path $releaseDirectory 'OpenCap-windows-x64.zip'
 New-Item -ItemType Directory -Force $stage | Out-Null
-foreach ($exe in @('opencap.exe', 'opencap-bench.exe')) {
+foreach ($exe in @('opencap.exe', 'opencap-bench.exe', 'opencap-transcribe.exe')) {
     $source = Join-Path $buildDirectory $exe
     if (!(Test-Path -LiteralPath $source)) { throw "缺少构建产物：$source" }
     Copy-Item -LiteralPath $source -Destination $stage

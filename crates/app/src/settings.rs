@@ -84,7 +84,11 @@ impl Recorder {
             ))
             .child(ui::setting_row(
                 "录屏中隐藏应用",
-                "从录制画面中排除 OpenCap 窗口",
+                if cfg!(target_os = "linux") {
+                    "X11 不支持排除应用，可选择要录制的目标窗口"
+                } else {
+                    "从录制画面中排除 OpenCap 窗口"
+                },
                 button(
                     "capture-exclusion",
                     if self.config.exclude_app {
@@ -94,6 +98,7 @@ impl Recorder {
                     },
                     self.config.exclude_app,
                 )
+                .disabled(cfg!(target_os = "linux"))
                 .on_click(cx.listener(|this, _, _, cx| {
                     let enabled = !this.config.exclude_app;
                     match opencap_platform::set_capture_exclusion(this.hwnd, enabled).and_then(
@@ -129,6 +134,7 @@ impl Recorder {
                                     text,
                                     self.config.effective_border_mode() == mode,
                                 )
+                                .disabled(cfg!(target_os = "linux"))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.config.show_capture_border = mode != BorderMode::Never;
@@ -144,9 +150,11 @@ impl Recorder {
                         ),
                     ),
             )
-            .child(label(
-                "红框表示录制，黄框表示暂停；目标窗口最小化后隐藏，边框不录入视频。",
-            ))
+            .child(label(if cfg!(target_os = "linux") {
+                "X11 暂不提供录制边框和窗口缩略预览；可通过悬浮控制条查看录制状态。"
+            } else {
+                "红框表示录制，黄框表示暂停；目标窗口最小化后隐藏，边框不录入视频。"
+            }))
     }
     fn audio_settings(&self, cx: &Context<Self>) -> Div {
         ui::card().child(ui::section_title("声音", "输入处理与音频规格"))

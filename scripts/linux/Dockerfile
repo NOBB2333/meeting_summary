@@ -1,8 +1,14 @@
-FROM debian:bullseye-slim
+FROM debian:buster-slim
 ENV DEBIAN_FRONTEND=noninteractive
-# Bullseye security updates moved to the signed archive after LTS ended.
-RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG TARGETARCH
+# Bootstrap HTTPS for the archived base image; APT still verifies Debian signatures.
+ADD --chmod=644 https://curl.se/ca/cacert.pem /etc/ssl/certs/ca-certificates.crt
+# Build against glibc 2.28 for UOS 20 / Debian 10. Use signed archived repositories.
+RUN printf 'deb https://archive.debian.org/debian buster main\ndeb https://archive.debian.org/debian-security buster/updates main\n' > /etc/apt/sources.list \
+    && printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "4";\nAcquire::https::Pipeline-Depth "0";\n' > /etc/apt/apt.conf.d/99archive \
+    && rm /etc/apt/apt.conf.d/docker-clean
+RUN --mount=type=cache,id=opencap-buster-apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl xz-utils build-essential clang libclang-dev cmake pkg-config \
     nasm python3 git patchelf binutils \
     libx264-dev libpulse-dev pulseaudio pulseaudio-utils \
@@ -19,6 +25,11 @@ ENV PATH=/opt/rust/cargo/bin:/opt/ffmpeg/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh \
     && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97.1 --component rustfmt,clippy \
     && rm /tmp/rustup.sh
-ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig LD_LIBRARY_PATH=/opt/ffmpeg/lib
+RUN apt-get update && apt-get install -y --no-install-recommends x11-xserver-utils \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/linux/cxx-runtime.sh /opt/cxx-runtime.sh
+RUN bash /opt/cxx-runtime.sh
+ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig LD_LIBRARY_PATH=/opt/compat/lib:/opt/ffmpeg/lib
+ENV LIBRARY_PATH=/opt/compat/lib
 ENV CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0
 WORKDIR /workspace
