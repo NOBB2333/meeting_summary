@@ -19,18 +19,36 @@ jobs:
         with:
           key: linux-glibc228
           cache-on-failure: true
+      - uses: docker/setup-buildx-action@v4.4.1
       - name: Build pinned FFmpeg and glibc 2.28 toolchain
-        run: docker build -f scripts/linux/Dockerfile -t opencap-build:glibc228 .
-      - name: Format, tests, Clippy, Release and native capture checks
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: scripts/linux/Dockerfile
+          load: true
+          tags: opencap-build:glibc228
+          cache-from: type=gha,scope=opencap-linux-toolchain
+          cache-to: type=gha,mode=max,scope=opencap-linux-toolchain,ignore-error=true
+      - name: Formatting, tests and Clippy
         run: |
           docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 bash -euc '
             cargo fmt --all -- --check
             scripts/setup.sh
             scripts/dev.sh test
             scripts/dev.sh lint -- -D warnings
-            scripts/dev.sh build --release
-            python3 scripts/linux/smoke.py target/release
-            scripts/package.sh
+          '
+      - name: Release build
+        id: release
+        run: |
+          docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 scripts/dev.sh build --release
+      - name: Bundle dependencies and audit ELF compatibility
+        id: package
+        run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 scripts/package.sh
+      - name: Native X11, audio and GUI checks
+        run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 python3 scripts/linux/smoke.py target/release
+      - name: Packaged application without developer library paths
+        run: |
+          docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 bash -euc '
             export LD_LIBRARY_PATH="$PWD/release/OpenCap-linux-x64/usr/lib"
             export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
             export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
@@ -48,6 +66,12 @@ jobs:
             release/OpenCap-linux-x64.deb
           if-no-files-found: error
           retention-days: 14
+      - uses: actions/upload-artifact@v7.0.2
+        if: failure() && steps.package.outcome == 'success'
+        with:
+          name: Linux-diagnostic-build
+          path: release/OpenCap-linux-x64.tar.gz
+          retention-days: 3
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
