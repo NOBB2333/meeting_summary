@@ -219,3 +219,12 @@ fixture v2 的 3600 秒 PPT 与文档 HEVC QSV 已编码完成，分别 8.79 MB 
 - 使用已有 101 / 102 内嵌图标，无新增图片、应用副本或依赖。LoadIconW 返回共享句柄，保持其生命周期，不销毁仍被窗口使用的图标。
 - 本机 63 项常规测试、全工作区 / 所有目标 / 所有特性 Clippy（-D warnings）、格式及差异检查通过。本机仅 macOS 目标，未宣称 Windows 分支编译或任务栏实机验收通过。Windows 新构建需检查：首次打开绿色、启动 / 暂停 / 恢复 / 保存时录制色、完成 / 失败绿色、第二次录制再次切换，以及固定在任务栏 / 最小化场景。
 - 接口依据：[Microsoft WM_SETICON](https://learn.microsoft.com/zh-cn/windows/win32/winmsg/wm-seticon)、[LoadImage / 共享图标缓存语义](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew)。没有更改固定快捷方式或系统图标缓存。
+
+## 三端构建、图标与 Linux 兼容复查（2026-10-17）
+
+- 本机 Mac 70 项常规测试通过，1 项实际模型测试保持按条件忽略；严格 Clippy、Release 打包与完整签名检查通过。只更新规范路径 `release/OpenCap.app`，15 个 dylib 随包，最低系统版本按本机依赖计算为 26.0；没有新增应用副本或证书、重置 TCC。
+- Windows Actions 完成 Debug / Release、测试、Clippy、软件编码及干净 PATH 运行库检查；下载的 ZIP 通过 CRC 检查，包含 3 个 EXE、5 个 FFmpeg DLL 和 2 个私有 C++ 运行库。构建记录：[39042254915](https://github.com/NOBB2333/meeting_summary/actions/runs/39042254915)。
+- Mac Actions 的 ARM / Intel 两项均完成测试、Clippy、Release、签名与 ICNS 解码检查；下载的 ZIP 通过 CRC / plist / 两个 ICNS 检查，最低系统版本分别为 14.0 / 15.0。构建记录：[39042254854](https://github.com/NOBB2333/meeting_summary/actions/runs/39042254854)。
+- Linux 的 glibc 2.28 媒体验收与图形验收分离；便携包使用私有 RUNPATH，不给宿主服务设置全局 LD_LIBRARY_PATH。图形测试通过 AppRun 启动，校验实际窗口截图中的内容；进程存活、鼠标指针或单色窗口不算通过。
+- 软件 Vulkan 空白窗口问题在最小 GPUI 窗口也可复现；相同环境 OpenGL 能绘制完整应用。CPU 窗口优先 GL 的补丁通过最小窗口截图验证，本地 Linux 容器中四项适配器排序回归通过，覆盖 CPU 窗口、真实 GPU 优先级、硬件后端及无窗口计算。回归直接编译生产排序函数，不依赖上游缺失的字体素材。
+- 统信 UOS 目标为 Intel x86_64，兼容基线为 glibc 2.28+；真实 UOS GPU 驱动与长期性能、Wayland 屏幕采集仍未验收。没有把容器检查等同于实机性能测试。

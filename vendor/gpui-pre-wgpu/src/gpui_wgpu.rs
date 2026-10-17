@@ -1,3 +1,5 @@
+#[cfg(not(target_family = "wasm"))]
+mod adapter_selection;
 mod cosmic_text_system;
 mod wgpu_atlas;
 mod wgpu_context;

@@ -1,5 +1,5 @@
 # Runtime verification is separate from the old-glibc compiler sysroot. Real
-# desktops supply their graphics drivers; CI uses Mesa's software Vulkan driver.
+# desktops supply their graphics drivers; CI exposes both Mesa software backends.
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \

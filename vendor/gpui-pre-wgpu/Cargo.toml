@@ -48,6 +48,10 @@ name = "gpui_wgpu"
 path = "src/gpui_wgpu.rs"
 doctest = false
 
+[[test]]
+name = "adapter_selection"
+path = "tests/adapter_selection.rs"
+
 [[bench]]
 name = "layout_line"
 path = "benches/layout_line.rs"

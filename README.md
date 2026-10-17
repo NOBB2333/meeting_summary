@@ -1,6 +1,6 @@
 # OpenCap
 
-Windows / macOS 本地开源录屏、转录与纪要工具。Rust + GPUI Kit + FFmpeg + sherpa-onnx；Windows 使用 Windows Graphics Capture / WASAPI，macOS 使用 ScreenCaptureKit / CoreAudio / VideoToolbox。本地 CPU 转录，无遥测；AI 纪要可选择本机模型或自行配置的远程服务。
+Windows / macOS / Linux 本地开源录屏、转录与纪要工具。Rust + GPUI Kit + FFmpeg + sherpa-onnx；Windows 使用 Windows Graphics Capture / WASAPI，macOS 使用 ScreenCaptureKit / CoreAudio / VideoToolbox，Linux 使用 X11 / PulseAudio。本地 CPU 转录，无遥测；AI 纪要可选择本机模型或自行配置的远程服务。
 
 ## 去哪里看结果、怎样生成会议纪要
 
@@ -68,7 +68,7 @@ AI 设置显示当前服务的密钥保存状态，载入后可用小眼睛显�
 
 FFmpeg 的 DLL 已经放在 `opencap.exe` 旁边，不需要另外安装 FFmpeg，也不需要装运行库。
 
-推荐：Windows 11 x64。此轮新版在 Mac 上验证，Windows 的 Kit / ASR / AI 集成仍需实机回归；不将此前录制版测试当作新版已通过。
+推荐：Windows 11 x64。新版已通过 Windows CI 构建、软件编码与私有运行库检查；Kit / ASR / AI 交互和实际录制性能仍需实机回归。
 
 **macOS**：直接打开 `release/OpenCap.app`，FFmpeg 动态库已放在应用包内，无需安装虚拟声卡。源码后端支持 macOS 13+，应用包的最低版本同时取决于捆绑库；本机 Homebrew 库要求 macOS 26，当前本机包因此要求 macOS 26+。首次使用在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」允许 OpenCap；录制麦克风还需要独立的麦克风权限。macOS 的默认输出位置是 `~/Movies/OpenCap`。
 
@@ -320,6 +320,8 @@ macOS 的 `scripts/dev.sh` 默认构建 Debug 原生应用包并打开 `release/
 Linux 首先支持 Intel / x86_64 的统信 UOS：X11 显示器、窗口和区域录制，PulseAudio 或 PipeWire-Pulse 的系统声与麦克风，以及仅录音、暂停恢复和文稿功能。Wayland 暂仅支持音频和文稿。X11 不支持排除本应用，暂不提供窗口缩略预览、录制边框或托盘；关闭主窗会退出，快捷键与悬浮控制仍可用；Linux 暂未实现锁屏自动停止，请先停止录制再锁屏。窗口最小化或关闭时结束采集并保存，窗口内容被遮挡时建议改录完整屏幕。
 
 Actions 提供 Windows x64、Mac Apple Silicon / Intel 和 Linux x64 测试包。Linux 在 Debian 10 / glibc 2.28 基线上构建，私有捆绑 FFmpeg、C++、字体等依赖并审计 ELF 符号版本，不替换系统 glibc 或显卡驱动。图形界面使用宿主 Vulkan / OpenGL 驱动；Linux 当前提供软件 H.264 / AAC 路径，UOS 实机性能仍需按设备验证。
+
+当前 Actions 的 Mac Apple Silicon 包要求 macOS 14+，Intel 包要求 macOS 15+；本机 Homebrew 打包的最低版本单独计算，不能把本机 macOS 26 的要求套到云端包。Linux 的 CPU 窗口渲染优先选择 OpenGL，以避开已复现的软件 Vulkan 空白窗口；硬件 GPU 和无窗口计算保留原排序。
 
 Linux 下载 `OpenCap-linux-x64.deb` 安装，或解压 `OpenCap-linux-x64.tar.gz` 后运行 `OpenCap/AppRun`，保留整个目录。构建和兼容检查见 [docs/build-and-linux.md](docs/build-and-linux.md)。Mac 图标由同一套绿色 / 红色图源生成 ICNS 并在签名前装入应用包，Dock 随录制状态切换；系统权限列表使用应用包图标。
 

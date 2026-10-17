@@ -55,7 +55,7 @@ jobs:
             cargo fmt --all -- --check
             scripts/setup.sh
             scripts/dev.sh test
-            cargo test --locked -p gpui-pre-wgpu --lib adapter_selection
+            cargo test --locked -p gpui-pre-wgpu --test adapter_selection
             scripts/dev.sh lint -- -D warnings
           '
       - uses: actions/cache/restore@v5
@@ -95,7 +95,7 @@ jobs:
             unset LIBRARY_PATH PKG_CONFIG_PATH LD_LIBRARY_PATH
             dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin --skip-gui
           '
-      - name: Graphics runtime with software Vulkan
+      - name: Graphics runtime with Mesa software adapters
         uses: docker/build-push-action@v7.4.0
         with:
           context: .

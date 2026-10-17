@@ -147,8 +147,11 @@ try:
             directory = Path(runtime.name) / name
             directory.mkdir(exist_ok=True)
             gui_env[variable] = str(directory)
+        launcher = build.parent.parent / "AppRun"
+        if not launcher.is_file():
+            launcher = build / "opencap"
         with (output / "gui.log").open("w") as log:
-            gui = subprocess.Popen([str(build / "opencap")], env=gui_env, stdout=log, stderr=log)
+            gui = subprocess.Popen([str(launcher)], env=gui_env, stdout=log, stderr=log)
             processes.append(gui)
             deadline = time.monotonic() + 20
             window = None

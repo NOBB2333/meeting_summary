@@ -601,54 +601,8 @@ impl WgpuContext {
     ) {
         adapters.sort_by_key(|adapter| {
             let info = adapter.get_info();
-            Self::adapter_priority(&info, device_id_filter, compositor_gpu, presenting)
+            crate::adapter_selection::priority(&info, device_id_filter, compositor_gpu, presenting)
         });
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    fn adapter_priority(
-        info: &wgpu::AdapterInfo,
-        device_id_filter: Option<u32>,
-        compositor_gpu: Option<&CompositorGpuHint>,
-        presenting: bool,
-    ) -> (u8, u8, u8, u8) {
-        // Backends like OpenGL report device=0 for all adapters, so
-        // device-based matching is only meaningful when non-zero.
-        let device_known = info.device != 0;
-        let user_override: u8 = match device_id_filter {
-            Some(id) if device_known && info.device == id => 0,
-            _ => 1,
-        };
-        let compositor_match: u8 = match compositor_gpu {
-            Some(hint)
-                if device_known
-                    && info.vendor == hint.vendor_id
-                    && info.device == hint.device_id =>
-            {
-                0
-            }
-            _ => 1,
-        };
-        let type_priority: u8 = match info.device_type {
-            wgpu::DeviceType::DiscreteGpu => 0,
-            wgpu::DeviceType::IntegratedGpu => 1,
-            wgpu::DeviceType::Other => 2,
-            wgpu::DeviceType::VirtualGpu => 3,
-            wgpu::DeviceType::Cpu => 4,
-        };
-        let backend_priority: u8 = match (presenting, info.device_type, info.backend) {
-            (true, wgpu::DeviceType::Cpu, wgpu::Backend::Gl) => 0,
-            (true, wgpu::DeviceType::Cpu, _) => 1,
-            (_, _, wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12) => 0,
-            _ => 1,
-        };
-
-        (
-            user_override,
-            compositor_match,
-            type_priority,
-            backend_priority,
-        )
     }
 
     /// Try to use an adapter with a surface by creating a device and testing configuration.
@@ -782,68 +736,6 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::{DeviceErrorState, parse_pci_id};
-
-    #[cfg(not(target_family = "wasm"))]
-    mod adapter_selection {
-        use super::super::WgpuContext;
-        use wgpu::{AdapterInfo, Backend, DeviceType};
-
-        fn info(device_type: DeviceType, backend: Backend) -> AdapterInfo {
-            AdapterInfo {
-                name: "synthetic adapter".into(),
-                vendor: 0x8086,
-                device: 1,
-                device_type,
-                device_pci_bus_id: String::new(),
-                driver: String::new(),
-                driver_info: String::new(),
-                backend,
-                subgroup_min_size: 4,
-                subgroup_max_size: 32,
-                transient_saves_memory: false,
-            }
-        }
-
-        #[test]
-        fn software_presentation_prefers_opengl() {
-            let gl = info(DeviceType::Cpu, Backend::Gl);
-            let vulkan = info(DeviceType::Cpu, Backend::Vulkan);
-            assert!(
-                WgpuContext::adapter_priority(&gl, None, None, true)
-                    < WgpuContext::adapter_priority(&vulkan, None, None, true)
-            );
-        }
-
-        #[test]
-        fn hardware_still_precedes_software_opengl() {
-            let hardware = info(DeviceType::IntegratedGpu, Backend::Vulkan);
-            let software = info(DeviceType::Cpu, Backend::Gl);
-            assert!(
-                WgpuContext::adapter_priority(&hardware, None, None, true)
-                    < WgpuContext::adapter_priority(&software, None, None, true)
-            );
-        }
-
-        #[test]
-        fn hardware_backend_preference_is_preserved() {
-            let gl = info(DeviceType::IntegratedGpu, Backend::Gl);
-            let vulkan = info(DeviceType::IntegratedGpu, Backend::Vulkan);
-            assert!(
-                WgpuContext::adapter_priority(&vulkan, None, None, true)
-                    < WgpuContext::adapter_priority(&gl, None, None, true)
-            );
-        }
-
-        #[test]
-        fn headless_software_vulkan_preference_is_preserved() {
-            let gl = info(DeviceType::Cpu, Backend::Gl);
-            let vulkan = info(DeviceType::Cpu, Backend::Vulkan);
-            assert!(
-                WgpuContext::adapter_priority(&vulkan, None, None, false)
-                    < WgpuContext::adapter_priority(&gl, None, None, false)
-            );
-        }
-    }
 
     #[test]
     fn device_errors_are_observed_independently() {
