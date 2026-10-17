@@ -86,13 +86,14 @@ try:
     print(run(build / "opencap-bench", "sources"), flush=True)
     print(run(build / "opencap-bench", "audio-probe", "--seconds", "4"), flush=True)
     results = []
-    for name, arguments, audio in (
+    cases = (
         ("screen", ["--no-audio", "--seconds", "4"], False),
         ("screen-audio", ["--seconds", "4"], False),
         ("pause", ["--no-audio", "--seconds", "6", "--pause-at", "1", "--pause-for", "2"], False),
         ("audio", ["--audio-only", "--seconds", "4"], True),
         ("audio-pause", ["--audio-only", "--seconds", "6", "--pause-at", "1", "--pause-for", "2"], True),
-    ):
+    )
+    for name, arguments, audio in (() if "--gui-only" in sys.argv else cases):
         destination = output / name
         destination.mkdir(exist_ok=True)
         for old in destination.glob("*.mp4" if not audio else "*.m4a"):
@@ -179,6 +180,12 @@ try:
                 time.sleep(3)
                 text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
                 run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-remapped.png")
+                text = run(build / "opencap-bench", "record", "--region", "0,0,1920,1080", "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
+                run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-desktop.png")
+                run("xdotool", "key", "--window", window, "F13")
+                time.sleep(1)
+                text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
+                run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-key-event.png")
             assert rendered, "GUI did not draw its contents within 25 seconds; see gui.png and gui.log"
             results.append({"gui_started": True, "gui_rendered": True})
     (output / "report.json").write_text(json.dumps(results, indent=2) + "\n")
