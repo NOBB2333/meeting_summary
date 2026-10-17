@@ -38,15 +38,35 @@ jobs:
             scripts/dev.sh test
             scripts/dev.sh lint -- -D warnings
           '
+      - uses: actions/cache/restore@v5
+        id: release-cache
+        with:
+          path: |
+            target/release/opencap
+            target/release/opencap-bench
+            target/release/opencap-transcribe
+            target/release/opencap-assets
+          key: linux-x64-release-${{ hashFiles('Cargo.*', 'rust-toolchain.toml', '.cargo/**', 'crates/**', 'scripts/linux/Dockerfile', 'scripts/build-ffmpeg.sh', 'scripts/linux/cxx-runtime.sh') }}
       - name: Release build
         id: release
+        if: steps.release-cache.outputs.cache-hit != 'true'
         run: |
           docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 scripts/dev.sh build --release
+      - uses: actions/cache/save@v5
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        with:
+          path: |
+            target/release/opencap
+            target/release/opencap-bench
+            target/release/opencap-transcribe
+            target/release/opencap-assets
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
       - name: Bundle dependencies and audit ELF compatibility
         id: package
         run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 scripts/package.sh
-      - name: Native X11, audio and GUI checks
-        run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 dbus-run-session -- python3 scripts/linux/smoke.py target/release
+      - name: Native X11 and audio on glibc 2.28
+        run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 dbus-run-session -- python3 scripts/linux/smoke.py target/release --skip-gui
       - name: Packaged application without developer library paths
         run: |
           docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 bash -euc '
@@ -54,6 +74,23 @@ jobs:
             export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
             export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
             unset LIBRARY_PATH PKG_CONFIG_PATH
+            dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin --skip-gui
+          '
+      - name: Graphics runtime with software Vulkan
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: scripts/linux/runtime.Dockerfile
+          load: true
+          tags: opencap-runtime:check
+          cache-from: type=gha,scope=opencap-linux-runtime
+          cache-to: type=gha,mode=max,scope=opencap-linux-runtime,ignore-error=true
+      - name: Packaged GUI and media on a clean runtime
+        run: |
+          docker run --rm -v "$PWD:/workspace" opencap-runtime:check bash -euc '
+            export LD_LIBRARY_PATH="$PWD/release/OpenCap-linux-x64/usr/lib"
+            export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
+            export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
             dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin
           '
       - name: Restore workspace cache ownership

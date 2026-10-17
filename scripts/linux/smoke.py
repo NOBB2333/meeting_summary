@@ -25,7 +25,12 @@ def run(*args, **kwargs):
 
 
 def start(*args):
-    process = subprocess.Popen([str(v) for v in args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Host services use their own libraries; only OpenCap and its helper programs
+    # should load the application's private runtime.
+    environment = os.environ.copy()
+    environment.pop("LD_LIBRARY_PATH", None)
+    environment.pop("FONTCONFIG_FILE", None)
+    process = subprocess.Popen([str(v) for v in args], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     processes.append(process)
     return process
 
@@ -111,40 +116,41 @@ try:
         results.append(inspect(path, audio))
         if name == "screen-audio":
             results.append(inspect(path, audio=True))
-    # Run the actual application against an isolated home, then capture its
-    # rendered X11 window. CLI-only checks cannot detect graphics startup errors.
-    gui_env = os.environ.copy()
-    for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
-        directory = output / name
-        directory.mkdir(exist_ok=True)
-        gui_env[variable] = str(directory)
-    with (output / "gui.log").open("w") as log:
-        gui = subprocess.Popen([str(build / "opencap")], env=gui_env, stdout=log, stderr=log)
-        processes.append(gui)
-        deadline = time.monotonic() + 20
-        window = None
-        while time.monotonic() < deadline:
-            if gui.poll() is not None:
-                raise RuntimeError("GUI exited during startup; see target/verify/linux-smoke/gui.log")
-            sources = run(build / "opencap-bench", "sources")
-            for line in sources.splitlines():
-                if line.startswith("Window(") and "\tOpenCap\t" in line:
-                    window = line.split(")", 1)[0][7:]
+    if "--skip-gui" not in sys.argv:
+        # Run the actual application against an isolated home, then capture its
+        # rendered X11 window. CLI-only checks cannot detect graphics startup errors.
+        gui_env = os.environ.copy()
+        for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
+            directory = output / name
+            directory.mkdir(exist_ok=True)
+            gui_env[variable] = str(directory)
+        with (output / "gui.log").open("w") as log:
+            gui = subprocess.Popen([str(build / "opencap")], env=gui_env, stdout=log, stderr=log)
+            processes.append(gui)
+            deadline = time.monotonic() + 20
+            window = None
+            while time.monotonic() < deadline:
+                if gui.poll() is not None:
+                    raise RuntimeError("GUI exited during startup; see target/verify/linux-smoke/gui.log")
+                sources = run(build / "opencap-bench", "sources")
+                for line in sources.splitlines():
+                    if line.startswith("Window(") and "\tOpenCap\t" in line:
+                        window = line.split(")", 1)[0][7:]
+                        break
+                if window:
                     break
-            if window:
-                break
-            time.sleep(0.2)
-        assert window, "GUI did not create its X11 window"
-        time.sleep(1)
-        destination = output / "gui"
-        destination.mkdir(exist_ok=True)
-        text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
-        (destination / "stats.json").write_text(text + "\n")
-        path = Path(json.loads(text)["output"])
-        _, _, raw = decoded_frame(path)
-        assert len({raw[i:i + 3] for i in range(0, len(raw) - 2, 30)}) > 16, "GUI window did not render its contents"
-        run("ffmpeg", "-v", "error", "-y", "-i", path, "-frames:v", "1", output / "gui.png")
-        results.append({"gui_started": True, "gui_rendered": True})
+                time.sleep(0.2)
+            assert window, "GUI did not create its X11 window"
+            time.sleep(1)
+            destination = output / "gui"
+            destination.mkdir(exist_ok=True)
+            text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
+            (destination / "stats.json").write_text(text + "\n")
+            path = Path(json.loads(text)["output"])
+            _, _, raw = decoded_frame(path)
+            assert len({raw[i:i + 3] for i in range(0, len(raw) - 2, 30)}) > 16, "GUI window did not render its contents"
+            run("ffmpeg", "-v", "error", "-y", "-i", path, "-frames:v", "1", output / "gui.png")
+            results.append({"gui_started": True, "gui_rendered": True})
     (output / "report.json").write_text(json.dumps(results, indent=2) + "\n")
     print("Linux X11 capture, cursor path, pause/resume, M4A and decoded audio checks passed", flush=True)
 finally:
