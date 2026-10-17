@@ -25,7 +25,7 @@ fn main() {
     struct Logger;
     impl log::Log for Logger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Info
+            metadata.level() <= log::max_level()
         }
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
@@ -36,7 +36,7 @@ fn main() {
     }
     static LOGGER: Logger = Logger;
     let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Debug);
     gpui::application()
         .with_assets(gpui::assets::Assets)
         .run(|cx| {

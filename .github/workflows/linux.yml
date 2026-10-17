@@ -65,7 +65,7 @@ jobs:
             target/release/opencap-bench
             target/release/opencap-transcribe
             target/release/opencap-assets
-          key: linux-x64-release-${{ hashFiles('Cargo.*', 'rust-toolchain.toml', '.cargo/**', 'crates/**', 'scripts/linux/Dockerfile', 'scripts/build-ffmpeg.sh', 'scripts/linux/cxx-runtime.sh') }}
+          key: linux-x64-release-${{ hashFiles('Cargo.*', 'rust-toolchain.toml', '.cargo/**', 'crates/**', 'vendor/**', 'scripts/linux/Dockerfile', 'scripts/build-ffmpeg.sh', 'scripts/linux/cxx-runtime.sh') }}
       - name: Release build
         id: release
         if: steps.release-cache.outputs.cache-hit != 'true'
