@@ -125,6 +125,7 @@ try:
         time.sleep(0.5)
         assert manager.poll() is None, "The virtual desktop window manager did not start"
         gui_env = os.environ.copy()
+        gui_env["OPENCAP_LOG"] = "info"
         for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
             directory = output / name
             directory.mkdir(exist_ok=True)

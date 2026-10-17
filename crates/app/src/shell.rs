@@ -441,6 +441,17 @@ impl Recorder {
 
 impl Render for Recorder {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "linux")]
+        if log::log_enabled!(log::Level::Info) {
+            static FIRST_RENDER: std::sync::Once = std::sync::Once::new();
+            FIRST_RENDER.call_once(|| {
+                log::info!(
+                    "OpenCap main view rendered: viewport={:?}, visibility={:?}",
+                    window.viewport_size(),
+                    window.visibility()
+                );
+            });
+        }
         self.sync_notes(window, cx);
         self.sync_ai_view(window, cx);
         if self.transcript_dirty {

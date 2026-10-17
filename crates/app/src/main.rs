@@ -190,6 +190,7 @@ impl Recorder {
             false
         });
         cx.spawn(async move |entity, cx| {
+            log::info!("OpenCap foreground polling started");
             loop {
                 futures_timer::Delay::new(Duration::from_millis(200)).await;
                 if entity.update(cx, |this, cx| this.poll(cx)).is_err() {
@@ -1021,7 +1022,7 @@ fn main() {
     struct StderrLogger;
     impl log::Log for StderrLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Warn
+            metadata.level() <= log::max_level()
         }
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
@@ -1032,7 +1033,12 @@ fn main() {
     }
     static LOGGER: StderrLogger = StderrLogger;
     let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Warn);
+    let level = match std::env::var("OPENCAP_LOG").as_deref() {
+        Ok("info") => log::LevelFilter::Info,
+        Ok("debug") => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Warn,
+    };
+    log::set_max_level(level);
     let application = gpui::application().with_assets(gpui::assets::Assets);
     #[cfg(target_os = "macos")]
     let reopen_view = Rc::new(std::cell::Cell::new(0isize));
@@ -1117,6 +1123,15 @@ fn main() {
             opencap_platform::show_native_window(r.hwnd, true);
         });
         cx.activate(true);
+        if log::log_enabled!(log::Level::Info) {
+            let _ = main_window.update(cx, |_, window, _| {
+                log::info!(
+                    "OpenCap window initialized: viewport={:?}, visibility={:?}",
+                    window.viewport_size(),
+                    window.visibility()
+                );
+            });
+        }
         #[cfg(feature = "ui-smoke")]
         if let Some(source) = smoke::preview_source() {
             entity.update(cx, |r, cx| {
