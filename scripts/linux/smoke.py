@@ -128,6 +128,8 @@ try:
         gui_env["OPENCAP_LOG"] = "debug"
         if os.environ.get("OPENCAP_TEST_PRESENT_MODE") == "immediate":
             gui_env["MESA_VK_WSI_PRESENT_MODE"] = "immediate"
+        elif os.environ.get("OPENCAP_TEST_PRESENT_MODE") == "opengl":
+            gui_env["VK_ICD_FILENAMES"] = "/nonexistent/opencap-no-vulkan.json"
         for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
             directory = output / name
             directory.mkdir(exist_ok=True)

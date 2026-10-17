@@ -11,7 +11,7 @@ on:
       present_mode:
         description: "Software-GPU presentation mode for the virtual display"
         type: choice
-        options: [auto, immediate]
+        options: [auto, immediate, opengl]
         default: auto
       window_probe:
         description: "Build the minimal native window for framework diagnostics"
