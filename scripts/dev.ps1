@@ -4,7 +4,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $ffmpegRoot = Join-Path $root '.deps/ffmpeg/ffmpeg-9.0.2-full_build-shared'
 . "$PSScriptRoot/runtime.ps1"
-$requiredFiles = @('include/libavcodec/avcodec.h', 'lib/avcodec.lib') + @(Get-OpenCapRuntimeNames | ForEach-Object { "bin/$_" })
+$requiredFiles = @('include/libavcodec/avcodec.h', 'lib/avcodec.lib') + @(Get-OpenCapFfmpegRuntimeNames | ForEach-Object { "bin/$_" })
 if (@($requiredFiles | Where-Object { !(Test-Path -LiteralPath (Join-Path $ffmpegRoot $_) -PathType Leaf) }).Count -gt 0) {
     Write-Host 'Preparing the pinned FFmpeg development and runtime libraries...'
     & "$PSScriptRoot/setup.ps1"
@@ -23,6 +23,11 @@ $arguments = switch ($Task) {
 }
 if ($Release) { $arguments += '--release' }
 $arguments += '--locked'
+# PowerShell consumes a literal -- while binding a script's remaining arguments.
+# Restore the rustc/Clippy separator when the remainder starts with lint flags.
+if ($Task -eq 'lint' -and $ExtraArgs -and $ExtraArgs[0] -match '^(-[DAWF]|--(deny|allow|warn|forbid))') {
+    $ExtraArgs = @('--') + $ExtraArgs
+}
 if ($Task -in @('run','bench') -and $ExtraArgs) { $arguments += '--' }
 & cargo @arguments @ExtraArgs
 $buildExitCode = $LASTEXITCODE

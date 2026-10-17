@@ -37,6 +37,7 @@ unsafe extern "C" {
         error: *mut *mut c_char,
     ) -> *mut c_void;
     fn oc_controls_state(handle: *mut c_void, recording: bool);
+    fn oc_app_icon(recording: bool);
     fn oc_controls_drop(handle: *mut c_void);
     fn oc_region(input: *const c_char, callback: Callback, user: *mut c_void) -> *mut c_void;
     fn oc_region_drop(handle: *mut c_void);
@@ -617,6 +618,9 @@ pub struct DesktopControls {
     _sender: Box<Sender<ShellEvent>>,
 }
 impl DesktopControls {
+    pub fn has_tray(&self) -> bool {
+        true
+    }
     pub fn set_recording_state(&self, value: bool) {
         unsafe { oc_controls_state(self.handle, value) };
     }
@@ -648,7 +652,9 @@ pub fn desktop_controls(record: &str, pause: &str) -> Result<DesktopControls> {
         _sender: sender,
     })
 }
-pub fn set_app_icon(_: isize, _: bool) {}
+pub fn set_app_icon(_: isize, recording: bool) {
+    unsafe { oc_app_icon(recording) };
+}
 pub fn set_capture_exclusion(view: isize, value: bool) -> Result<()> {
     unsafe {
         oc_window(view, 2, value);

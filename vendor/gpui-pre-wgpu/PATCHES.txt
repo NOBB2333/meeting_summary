@@ -1,0 +1,14 @@
+Upstream: gpui-pre-wgpu 0.3.9, Apache-2.0
+Zed snapshot: 93d745668805029476e6d7fbb19652116fed51de
+
+Local patch: prefer OpenGL when CPU adapters present desktop windows.
+An unmodified OpenCap package remained blank with Mesa software Vulkan in
+Xvfb but rendered its complete UI with software OpenGL in the same runtime.
+Hardware adapters retain their original ranking, as do headless contexts.
+The ranking function is extracted into src/adapter_selection.rs. Four
+focused integration tests compile that same source, without enabling
+upstream shader/font unit tests whose fixtures are absent from the crate.
+Run from the application workspace:
+  cargo test --locked -p gpui-pre-wgpu --test adapter_selection
+
+Retain LICENSE-APACHE. Other source matches the crates.io snapshot.

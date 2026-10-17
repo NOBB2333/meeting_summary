@@ -1,0 +1,7 @@
+target
+.deps
+release
+.git
+*.docx
+*.m4a
+*.mp4

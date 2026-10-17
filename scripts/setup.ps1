@@ -8,7 +8,7 @@ $uri = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$version-full_build-s
 $expectedHash = '4D2060A8B34A940AA47D785142055BB92A63053781E55F2ACE4546EDD519A8F5'
 $ffmpegRoot = Join-Path $destination "ffmpeg-$version-full_build-shared"
 . "$PSScriptRoot/runtime.ps1"
-$requiredFiles = @('include/libavcodec/avcodec.h', 'lib/avcodec.lib', 'bin/ffmpeg.exe') + @(Get-OpenCapRuntimeNames | ForEach-Object { "bin/$_" })
+$requiredFiles = @('include/libavcodec/avcodec.h', 'lib/avcodec.lib', 'bin/ffmpeg.exe') + @(Get-OpenCapFfmpegRuntimeNames | ForEach-Object { "bin/$_" })
 $missing = @($requiredFiles | Where-Object { !(Test-Path -LiteralPath (Join-Path $ffmpegRoot $_) -PathType Leaf) })
 New-Item -ItemType Directory -Force (Split-Path $archive) | Out-Null
 if ($missing.Count -gt 0) {

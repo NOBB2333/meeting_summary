@@ -13,6 +13,8 @@ pub struct Segment {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Transcript {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_duration_ms: Option<u64>,
     pub source: Option<PathBuf>,
     pub model: String,
     pub complete: bool,

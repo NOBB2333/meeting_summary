@@ -3,6 +3,13 @@ use gpui::component::IconName;
 
 impl Recorder {
     fn task_banner(&self) -> Option<Div> {
+        if self.summary_task.is_some()
+            && self.transcription_tab
+            && !self.settings
+            && self.meeting_page == workspace::MeetingPage::Minutes
+        {
+            return None; // The conversation shows its own status and timer without moving the document.
+        }
         let progress = if self.speaker_task.is_some() {
             ui::task_progress(
                 "speaker-task-progress",
@@ -168,6 +175,8 @@ impl Recorder {
                     .w_full()
                     .justify_start()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.persist_minutes_draft(cx);
+                        this.persist_notes(cx);
                         this.quit_pending = true;
                         if let Some(s) = &this.session {
                             s.command(RecordingCommand::Stop);
@@ -432,7 +441,19 @@ impl Recorder {
 
 impl Render for Recorder {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "linux")]
+        if log::log_enabled!(log::Level::Info) {
+            static FIRST_RENDER: std::sync::Once = std::sync::Once::new();
+            FIRST_RENDER.call_once(|| {
+                log::info!(
+                    "OpenCap main view rendered: viewport={:?}, visibility={:?}",
+                    window.viewport_size(),
+                    window.visibility()
+                );
+            });
+        }
         self.sync_notes(window, cx);
+        self.sync_ai_view(window, cx);
         if self.transcript_dirty {
             self.transcript_view.update(cx, |view, cx| {
                 view.replace(&self.transcript, self.transcript_new_document, cx)
@@ -449,7 +470,7 @@ impl Render for Recorder {
         let content = if self.settings {
             self.settings_view(cx)
         } else if self.transcription_tab {
-            self.meeting_workspace(width, cx)
+            self.meeting_workspace(width, f32::from(window.viewport_size().height), cx)
         } else {
             self.recording_view(width, cx)
         };

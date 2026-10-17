@@ -2,7 +2,6 @@ use super::*;
 
 impl Recorder {
     pub(super) fn recording_view(&self, width: f32, cx: &Context<Self>) -> Div {
-        let text_first = self.active() && self.config.realtime_transcription;
         let target = if let CaptureTarget::Region { rect, .. } = self.config.target {
             format!("录制区域 · {} × {}", rect.width, rect.height)
         } else {
@@ -97,7 +96,6 @@ impl Recorder {
                 "录制工作台",
                 "准备好画面和声音，专注会议本身。",
             ))
-            .when(text_first, |d| d.child(self.live_transcript_card(cx)))
             .child(
                 div()
                     .w_full()
@@ -115,7 +113,7 @@ impl Recorder {
                         )
                     }),
             )
-            .when(!text_first, |d| d.child(self.live_transcript_card(cx)))
+            .child(self.live_transcript_card(cx))
             .when(!self.recoverables.is_empty(), |d| {
                 d.child(
                     ui::card()

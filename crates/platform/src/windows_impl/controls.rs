@@ -42,6 +42,9 @@ impl Drop for DesktopControls {
     }
 }
 impl DesktopControls {
+    pub fn has_tray(&self) -> bool {
+        true
+    }
     /// The tray changes quietly between the two embedded icons. The tooltip stays neutral.
     pub fn set_recording_state(&self, recording: bool) {
         let next = i8::from(recording);

@@ -91,6 +91,92 @@ pub fn read_format_reference(path: &Path) -> Result<String> {
     anyhow::ensure!(!text.trim().is_empty(), "参考文件没有可读取的正文");
     Ok(text)
 }
+
+/// Import an edited body, preserving ordinary headings and tables from Word.
+/// Layout, pictures, headers and comments are not meeting body content.
+pub fn read_minutes_document(path: &Path) -> Result<String> {
+    if !path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("docx"))
+    {
+        return read_format_reference(path);
+    }
+    use docx_rs::{DocumentChild, FromXML, TableChild, TableRowChild};
+    let file = std::fs::File::open(path)?;
+    anyhow::ensure!(file.metadata()?.len() <= 10_000_000, "纪要文件超过 10 MB");
+    let mut archive = zip::ZipArchive::new(file).context("Word 文件格式无效")?;
+    let mut xml = archive.by_name("word/document.xml")?;
+    anyhow::ensure!(xml.size() <= 8_000_000, "Word 正文过大");
+    let mut bytes = Vec::new();
+    xml.read_to_end(&mut bytes)?;
+    let document = docx_rs::Document::from_xml(bytes.as_slice()).context("Word 正文无法解析")?;
+    let has_title = document.children.iter().any(|c| matches!(c, DocumentChild::Paragraph(p) if p.property.style.as_ref().is_some_and(|s| s.val == "Title")));
+    let mut output = String::new();
+    for child in &document.children {
+        match child {
+            DocumentChild::Paragraph(p) => {
+                let mut text = String::new();
+                collect_text(&serde_json::to_value(&p.children)?, &mut text);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let style = p
+                    .property
+                    .style
+                    .as_ref()
+                    .map(|s| s.val.as_str())
+                    .unwrap_or("");
+                let level = if style == "Title" {
+                    Some(1)
+                } else {
+                    style
+                        .strip_prefix("Heading")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .map(|n| (n + usize::from(has_title)).clamp(1, 6))
+                };
+                if let Some(level) = level {
+                    output.push_str(&"#".repeat(level));
+                    output.push(' ');
+                }
+                output.push_str(&text);
+                output.push_str("\n\n");
+            }
+            DocumentChild::Table(table) => {
+                let mut rows = Vec::new();
+                for row in &table.rows {
+                    let TableChild::TableRow(row) = row;
+                    let mut cells = Vec::new();
+                    for cell in &row.cells {
+                        let TableRowChild::TableCell(cell) = cell;
+                        let mut paragraphs = Vec::new();
+                        collect_paragraphs(&serde_json::to_value(&cell.children)?, &mut paragraphs);
+                        cells.push(paragraphs.join("；").replace('|', "\\|").replace('\n', " "));
+                    }
+                    rows.push(cells);
+                }
+                let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+                for (index, row) in rows.iter_mut().enumerate() {
+                    row.resize(width, String::new());
+                    output.push_str(&format!("| {} |\n", row.join(" | ")));
+                    if index == 0 {
+                        output.push_str(&format!("| {} |\n", vec!["---"; width].join(" | ")));
+                    }
+                }
+                output.push('\n');
+            }
+            _ => {
+                let mut paragraphs = Vec::new();
+                collect_paragraphs(&serde_json::to_value(child)?, &mut paragraphs);
+                for text in paragraphs {
+                    output.push_str(&text);
+                    output.push_str("\n\n");
+                }
+            }
+        }
+    }
+    anyhow::ensure!(!output.trim().is_empty(), "文件没有可同步的正文");
+    Ok(output)
+}
 fn collect_paragraphs(value: &Value, output: &mut Vec<String>) {
     if value["type"] == "paragraph" {
         let mut line = String::new();

@@ -32,7 +32,8 @@ case "$platform" in
     echo "macOS backend: ScreenCaptureKit + CoreAudio + VideoToolbox (macOS 13+)."
     ;;
   Linux)
-    echo "Linux toolchain detected. PipeWire backend is the next platform implementation step."
+    echo "Linux backend: X11 + PulseAudio / PipeWire-Pulse. Wayland: audio and documents only."
+    echo "For UOS-compatible builds use scripts/linux/Dockerfile (glibc 2.28); see docs/build-and-linux.md."
     ;;
   *)
     echo "Use scripts/setup.ps1 on Windows." >&2

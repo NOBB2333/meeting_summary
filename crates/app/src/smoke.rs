@@ -165,7 +165,7 @@ pub fn run(
     path: PathBuf,
     cx: &mut App,
 ) {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let exercise_microphone = true;
     #[cfg(target_os = "macos")]
     let exercise_microphone = opencap_platform::microphone_permission_granted();

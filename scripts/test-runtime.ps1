@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/runtime.ps1"
 $directoryPath = (Resolve-Path -LiteralPath $Directory).Path
-foreach ($name in (@('opencap.exe', 'opencap-bench.exe') + @(Get-OpenCapRuntimeNames))) {
+foreach ($name in (@('opencap.exe', 'opencap-bench.exe', 'opencap-transcribe.exe') + @(Get-OpenCapRuntimeNames))) {
     if (!(Test-Path -LiteralPath (Join-Path $directoryPath $name) -PathType Leaf)) {
         throw "Incomplete runtime directory: missing $name in $directoryPath"
     }
@@ -49,11 +49,25 @@ function Start-CleanProcess {
 }
 
 function Invoke-CleanBench {
-    param([string]$Label, [string[]]$Arguments, [int]$TimeoutSeconds = 20)
-    $process = Start-CleanProcess 'opencap-bench.exe' $Arguments
+    param([string]$Label, [string[]]$Arguments, [int]$TimeoutSeconds = 20, [string]$Executable = 'opencap-bench.exe')
+    $process = Start-CleanProcess $Executable $Arguments
     try {
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
+        if ($Label -eq 'runtime-fixture') {
+            Start-Sleep -Milliseconds 150
+            $process.Refresh()
+            if ($process.HasExited) { throw 'Runtime fixture exited before DLL inspection.' }
+            $expected = @(Get-OpenCapFfmpegRuntimeNames) + @('vcruntime140.dll')
+            $modules = @($process.Modules | Where-Object { $_.ModuleName -in $expected })
+            if ($modules.Count -ne $expected.Count) { throw 'The codec/VC runtime modules were not loaded.' }
+            foreach ($module in $modules) {
+                if ((Split-Path -Parent $module.FileName) -ne $directoryPath) {
+                    throw "Runtime loaded outside application directory: $($module.FileName)"
+                }
+            }
+            $report.runtime_modules = @($modules | ForEach-Object { $_.FileName })
+        }
         if (!$process.WaitForExit($TimeoutSeconds * 1000)) { throw "$Label timed out." }
         $stdout.GetAwaiter().GetResult() | Set-Content (Join-Path $outputPath "$Label.stdout.txt") -Encoding utf8
         $errorText = $stderr.GetAwaiter().GetResult()
@@ -71,6 +85,8 @@ $samples = [Collections.Generic.List[object]]::new()
 $report = [ordered]@{ directory = $directoryPath; clean_path = $true; cli_passed = $false; gui_passed = $null; recording_passed = $null; runtime_modules = @(); passed = $false }
 try {
     Invoke-CleanBench 'version' @('--version')
+    Invoke-CleanBench 'transcribe-help' @('--help') -Executable 'opencap-transcribe.exe'
+    Invoke-CleanBench 'runtime-fixture' @('fixture', '--seconds', '5', '--width', '160', '--height', '90', '--codec', 'h264', '--encoder', 'libx264', '--output', (Join-Path $outputPath ('fixture-' + [Guid]::NewGuid().ToString('N'))))
     $report.cli_passed = $true
     if (!$CliOnly) {
         $gui = Start-CleanProcess 'opencap.exe'

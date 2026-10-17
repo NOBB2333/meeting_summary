@@ -123,7 +123,7 @@ impl Drop for Canvas {
         }
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use opencap_platform::FixtureCanvas as Canvas;
 pub fn run(
     mut config: RecordingConfig,

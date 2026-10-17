@@ -1,5 +1,15 @@
 # 验收规范
 
+## 2026-10-17 会议列表与纪要对话
+
+`cargo test --workspace --all-features`：70 项通过、1 项依赖已安装模型的测试按条件忽略。`cargo clippy --workspace --all-targets --all-features -- -D warnings` 通过。
+
+新增验证覆盖：四种协议的真实 SSE / NDJSON 分片（逐字节切开中文）、完成事件校验、取消和截断拒绝发布；本地 HTTP 服务必须收到 UI 增量回调后才发送完成事件；断流不更新已保存历史或正文。手动正文、外部 Word 标题与表格回读、同步版本及后续修订上下文；Word 写入失败不发布历史。会议重命名保留音视频与未知元数据，列表优先展示纪要或转录预览并使用真实体积与完整时长。250 轮对话更新时保留早期阅读锚点。
+
+macOS 原生界面用独立的合成会议和本地模拟服务检查：1200×900 双栏、名称保存与卡片预览、20 分钟时长和实际文件大小；正文流式预览、手动编辑保存为 v2，再发送修订后请求中包含 v2 正文；眼睛开关用临时示例文本显示 / 隐藏，未保存测试密钥。真实密钥、原有会议索引、音视频均未修改。 默认特性的 macOS Release 编译与标准应用包签名校验通过，主程序保持原生 Mach-O（无启动包装脚本）。
+
+后续窄窗和文件选择器的原生复验受到本机窗口访问 `cgWindowNotFound` 限制，未标记为手工通过；对应渲染分支已编译，文件回读与保存有自动测试。Windows 运行、任务栏、不同 DPI 与真实云模型未在本机复验。测试文件位于独立 `target/verify` 子目录，测试进程与文件在交付前清理，只保留标准 `release/OpenCap.app`。
+
 ## 自动检查
 
 `scripts/dev.ps1 test`：暂停时间扣除、帧调度、显式编码器选择、混音对齐/限幅、VFR 尾帧与音轨时长、无损恢复拒绝覆盖、窗口尺寸改变时保持输出尺寸。
@@ -209,3 +219,14 @@ fixture v2 的 3600 秒 PPT 与文档 HEVC QSV 已编码完成，分别 8.79 MB 
 - 使用已有 101 / 102 内嵌图标，无新增图片、应用副本或依赖。LoadIconW 返回共享句柄，保持其生命周期，不销毁仍被窗口使用的图标。
 - 本机 63 项常规测试、全工作区 / 所有目标 / 所有特性 Clippy（-D warnings）、格式及差异检查通过。本机仅 macOS 目标，未宣称 Windows 分支编译或任务栏实机验收通过。Windows 新构建需检查：首次打开绿色、启动 / 暂停 / 恢复 / 保存时录制色、完成 / 失败绿色、第二次录制再次切换，以及固定在任务栏 / 最小化场景。
 - 接口依据：[Microsoft WM_SETICON](https://learn.microsoft.com/zh-cn/windows/win32/winmsg/wm-seticon)、[LoadImage / 共享图标缓存语义](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew)。没有更改固定快捷方式或系统图标缓存。
+
+## 三端构建、图标与 Linux 兼容复查（2026-10-17）
+
+- 本机 Mac 70 项常规测试通过，1 项实际模型测试保持按条件忽略；严格 Clippy、Release 打包与完整签名检查通过。只更新规范路径 `release/OpenCap.app`，15 个 dylib 随包，最低系统版本按本机依赖计算为 26.0；没有新增应用副本或证书、重置 TCC。
+- Windows Actions 完成 Debug / Release、测试、Clippy、软件编码及干净 PATH 运行库检查；下载的 ZIP 通过 CRC 检查，包含 3 个 EXE、5 个 FFmpeg DLL 和 2 个私有 C++ 运行库。构建记录：[39043623537](https://github.com/NOBB2333/meeting_summary/actions/runs/39043623537)。
+- Mac Actions 的 ARM / Intel 两项均完成测试、Clippy、Release、签名与 ICNS 解码检查；下载的 ZIP 通过 CRC / plist / 两个 ICNS 检查，最低系统版本分别为 14.0 / 15.0。构建记录：[39043623588](https://github.com/NOBB2333/meeting_summary/actions/runs/39043623588)。
+- Linux 的 glibc 2.28 媒体验收与图形验收分离；便携包使用私有 RUNPATH，不给宿主服务设置全局 LD_LIBRARY_PATH。图形测试通过 AppRun 启动，校验实际窗口截图中的内容；进程存活、鼠标指针或单色窗口不算通过。
+- 软件 Vulkan 空白窗口问题在最小 GPUI 窗口也可复现；相同环境 OpenGL 能绘制完整应用。CPU 窗口优先 GL 的补丁通过最小窗口截图验证，本地 Linux 容器中四项适配器排序回归通过，覆盖 CPU 窗口、真实 GPU 优先级、硬件后端及无窗口计算。回归直接编译生产排序函数，不依赖上游缺失的字体素材。
+- 统信 UOS 目标为 Intel x86_64，兼容基线为 glibc 2.28+；真实 UOS GPU 驱动与长期性能、Wayland 屏幕采集仍未验收。没有把容器检查等同于实机性能测试。
+- 原生缓存回归使用独立 Cargo 项目和真实 Sherpa 1.13.8：先成功链接并调用版本接口，模拟清理后复现 `could not find native static library sherpa-onnx-c-api`，再分别验证独立缓存恢复、缓存未命中后的定向清理与重新解包。两种恢复路径均重新链接和调用成功；原 SDK 哈希保持一致。三端工作流增加独立 SDK 缓存与未命中恢复，工作流语法检查通过。
+- Linux 应用源码 `088fcc5` 的最终构建完成：57 个 ELF 全部为 x86_64，最高 GLIBC 版本 2.28；原生和便携包的录屏、系统声、暂停恢复、无 DISPLAY 的仅录音检查通过。干净运行环境通过 AppRun 启动完整应用，默认日志级别、未强制 OpenGL，实际中文界面截图已查看且内容正常。`.deb` 的 amd64 / libc6 依赖、便携启动器、三个字体与全部 ELF 对照检查通过。构建记录：[39043623596，第 2 次执行](https://github.com/NOBB2333/meeting_summary/actions/runs/39043623596/attempts/2)。随后只有缓存工作流及验收文档调整，应用源码未再更改。

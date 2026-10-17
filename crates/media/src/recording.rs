@@ -388,7 +388,10 @@ fn run(
         }
         if tick.elapsed() >= Duration::from_secs(1) {
             writer.flush_io()?;
-            if !opencap_platform::desktop_available() {
+            // PulseAudio-only Linux sessions do not require an X11/Wayland
+            // connection. Absence of DISPLAY is not a lock-screen event.
+            let requires_desktop = !(cfg!(target_os = "linux") && config.audio_only);
+            if requires_desktop && !opencap_platform::desktop_available() {
                 stop_reason = Some("桌面已锁定或无法访问，录制已安全结束".into());
                 break;
             }

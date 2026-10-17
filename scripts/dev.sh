@@ -29,6 +29,9 @@ fi
 
 # A Windows FFmpeg SDK must never shadow Homebrew's native libraries.
 if [[ "$(uname -s)" == Darwin ]]; then
+  # Rust 1.97's debuginfo stripping can produce a __LINKEDIT layout rejected by
+  # older Apple tools. Release already has debug=0; preserve the Mach-O layout.
+  export CARGO_PROFILE_RELEASE_STRIP="${CARGO_PROFILE_RELEASE_STRIP:-none}"
   if [[ -n "${FFMPEG_DIR:-}" && ! -f "$FFMPEG_DIR/lib/libavcodec.dylib" ]]; then
     unset FFMPEG_DIR
   fi

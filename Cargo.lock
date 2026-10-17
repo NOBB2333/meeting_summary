@@ -2867,8 +2867,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-wgpu"
 version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b1cdb26c1503bf9662ee8fbc5ab0b44b2deeee4b5c12dc67491ba6fb5fc544b"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4814,13 +4812,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "image",
  "libc",
  "opencap-core",
  "parking_lot",
+ "pathfinder_geometry",
  "serde_json",
  "wasapi",
  "windows 0.62.2",
  "windows-capture 2.0.1",
+ "x11rb",
+ "zed-font-kit",
 ]
 
 [[package]]

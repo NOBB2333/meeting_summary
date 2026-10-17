@@ -1,0 +1,14 @@
+Microsoft Visual C++ runtime DLLs (Windows test packages)
+
+Copyright Microsoft Corporation. All rights reserved.
+
+vcruntime140.dll and vcruntime140_1.dll are copied from the installed Visual
+Studio x64 redistributable directory, not from Windows system directories.
+They retain Microsoft's embedded version and signing information and are
+subject to the Microsoft Visual Studio software license and REDIST list.
+
+https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files
+https://visualstudio.microsoft.com/license-terms/
+
+Other OpenCap components retain their own licenses. This notice does not
+replace or modify Microsoft's license terms.

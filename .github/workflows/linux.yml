@@ -1,0 +1,241 @@
+name: Linux (UOS compatible)
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      artifact_run:
+        description: "Optional failed build run ID for GUI diagnostics without recompiling"
+        type: string
+        default: ""
+      present_mode:
+        description: "Software-GPU presentation mode for the virtual display"
+        type: choice
+        options: [auto, immediate, opengl]
+        default: auto
+      window_probe:
+        description: "Build the minimal native window for framework diagnostics"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: linux-${{ github.ref }}-${{ inputs.artifact_run || 'build' }}
+  cancel-in-progress: true
+jobs:
+  build:
+    if: github.event_name != 'workflow_dispatch' || inputs.artifact_run == ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-glibc228
+          cache-on-failure: true
+          cache-all-crates: true
+      # This runs after rust-cache so its post hook saves the SDK before Rust
+      # cache cleanup recursively removes non-Cargo files from target/.
+      - uses: actions/cache@v5
+        id: sherpa-cache
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Recover an uncached native SDK
+        if: steps.sherpa-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf target/sherpa-onnx-prebuilt
+          cargo clean -p sherpa-onnx-sys
+      - uses: docker/setup-buildx-action@v4.4.1
+      - name: Build pinned FFmpeg and glibc 2.28 toolchain
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: scripts/linux/Dockerfile
+          load: true
+          tags: opencap-build:glibc228
+          cache-from: type=gha,scope=opencap-linux-toolchain
+          cache-to: type=gha,mode=max,scope=opencap-linux-toolchain,ignore-error=true
+      - name: Formatting, tests and Clippy
+        run: |
+          docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 bash -euc '
+            cargo fmt --all -- --check
+            scripts/setup.sh
+            scripts/dev.sh test
+            cargo test --locked -p gpui-pre-wgpu --test adapter_selection
+            scripts/dev.sh lint -- -D warnings
+          '
+      - uses: actions/cache/restore@v5
+        id: release-cache
+        with:
+          path: |
+            target/release/opencap
+            target/release/opencap-bench
+            target/release/opencap-transcribe
+            target/release/opencap-assets
+          key: linux-x64-release-${{ hashFiles('Cargo.*', 'rust-toolchain.toml', '.cargo/**', 'crates/**', 'vendor/**', 'scripts/linux/Dockerfile', 'scripts/build-ffmpeg.sh', 'scripts/linux/cxx-runtime.sh') }}
+      - name: Release build
+        id: release
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 scripts/dev.sh build --release
+      - uses: actions/cache/save@v5
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        with:
+          path: |
+            target/release/opencap
+            target/release/opencap-bench
+            target/release/opencap-transcribe
+            target/release/opencap-assets
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
+      - name: Bundle dependencies and audit ELF compatibility
+        id: package
+        run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 scripts/package.sh
+      - name: Native X11 and audio on glibc 2.28
+        run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 dbus-run-session -- python3 scripts/linux/smoke.py target/release --skip-gui
+      - name: Packaged application without developer library paths
+        run: |
+          docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 bash -euc '
+            export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
+            export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
+            unset LIBRARY_PATH PKG_CONFIG_PATH LD_LIBRARY_PATH
+            dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin --skip-gui
+          '
+      - name: Graphics runtime with Mesa software adapters
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: scripts/linux/runtime.Dockerfile
+          load: true
+          tags: opencap-runtime:check
+          cache-from: type=gha,scope=opencap-linux-runtime
+          cache-to: type=gha,mode=max,scope=opencap-linux-runtime,ignore-error=true
+      - name: Packaged GUI and media on a clean runtime
+        run: |
+          docker run --rm --cap-add=SYS_PTRACE -v "$PWD:/workspace" opencap-runtime:check bash -euc '
+            export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
+            export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
+            dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin
+          '
+      - name: Restore workspace cache ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo/registry" release 2>/dev/null || true
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: OpenCap-linux-x64
+          path: |
+            release/OpenCap-linux-x64.tar.gz
+            release/OpenCap-linux-x64.deb
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v7.0.2
+        if: failure() && steps.package.outcome == 'success'
+        with:
+          name: Linux-diagnostic-build
+          path: release/OpenCap-linux-x64.tar.gz
+          retention-days: 3
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: Linux-validation
+          path: |
+            target/verify/linux-smoke/report.json
+            target/verify/linux-smoke/*/stats.json
+            target/verify/linux-smoke/gui.log
+            target/verify/linux-smoke/services.log
+            target/verify/linux-smoke/gui-threads.log
+            target/verify/linux-smoke/gui-window.log
+            target/verify/linux-smoke/gui.png
+            target/verify/linux-smoke/gui-remapped.png
+            release/OpenCap-linux-x64/elf-audit.json
+          if-no-files-found: ignore
+  inspect-runtime:
+    if: github.event_name == 'workflow_dispatch' && inputs.artifact_run != ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Download existing test package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_RUN: ${{ inputs.artifact_run }}
+        run: |
+          gh run download "$ARTIFACT_RUN" --name Linux-diagnostic-build --dir release/runtime-download
+          mkdir -p release/runtime-package
+          tar -xzf release/runtime-download/OpenCap-linux-x64.tar.gz -C release/runtime-package
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.window_probe
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        if: inputs.window_probe
+        with:
+          shared-key: linux-glibc228-build
+          save-if: false
+          cache-on-failure: true
+          cache-all-crates: true
+      - uses: actions/cache@v5
+        if: inputs.window_probe
+        id: sherpa-probe-cache
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Recover the probe native SDK
+        if: inputs.window_probe && steps.sherpa-probe-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf target/sherpa-onnx-prebuilt
+          cargo clean -p sherpa-onnx-sys
+      - name: Load compiler for the minimal window
+        if: inputs.window_probe
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: scripts/linux/Dockerfile
+          load: true
+          tags: opencap-build:glibc228
+          cache-from: type=gha,scope=opencap-linux-toolchain
+      - name: Build isolated window probe
+        if: inputs.window_probe
+        run: |
+          docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 bash -euc '
+            cargo build --locked -p opencap --example linux-window-probe
+            cp target/debug/examples/linux-window-probe release/runtime-package/OpenCap/usr/bin/opencap
+            patchelf --set-rpath "\$ORIGIN/../lib" release/runtime-package/OpenCap/usr/bin/opencap
+          '
+      - uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: scripts/linux/runtime.Dockerfile
+          load: true
+          tags: opencap-runtime:check
+          cache-from: type=gha,scope=opencap-linux-runtime
+          cache-to: type=gha,mode=max,scope=opencap-linux-runtime,ignore-error=true
+      - name: Inspect GUI from the existing package
+        env:
+          OPENCAP_TEST_PRESENT_MODE: ${{ inputs.present_mode }}
+        run: |
+          docker run --rm --cap-add=SYS_PTRACE --env OPENCAP_TEST_PRESENT_MODE -v "$PWD:/workspace" opencap-runtime:check bash -euc '
+            export PATH="$PWD/release/runtime-package/OpenCap/usr/bin:/usr/bin:/bin"
+            export FONTCONFIG_FILE="$PWD/release/runtime-package/OpenCap/fonts.conf"
+            dbus-run-session -- python3 scripts/linux/smoke.py release/runtime-package/OpenCap/usr/bin --gui-only
+          '
+      - name: Restore probe cache ownership
+        if: always() && inputs.window_probe
+        run: sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo/registry" 2>/dev/null || true
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: Linux-runtime-diagnostics
+          path: |
+            target/verify/linux-smoke/*.png
+            target/verify/linux-smoke/*.log
+            target/verify/linux-smoke/report.json
+            target/verify/linux-smoke/gui/stats.json
+          if-no-files-found: ignore

@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/core", "crates/policy", "crates/platform", "crates/media", "crates/app", "crates/bench", "crates/asr"]
 default-members = ["crates/app", "crates/bench"]
+exclude = ["vendor/gpui-pre-wgpu"]
 resolver = "2"
 
 [workspace.package]
@@ -29,3 +30,6 @@ debug = 0
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+[patch.crates-io]
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }

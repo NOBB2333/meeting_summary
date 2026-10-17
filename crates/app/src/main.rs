@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 extern crate gpui_kit as gpui;
 mod ai;
+mod ai_chat;
 mod recording;
 mod settings;
 mod shell;
@@ -89,6 +90,9 @@ struct Recorder {
     speaker_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     meeting_page: workspace::MeetingPage,
     meetings: Vec<workspace::MeetingFile>,
+    rename_base: Option<PathBuf>,
+    rename_input: Entity<InputState>,
+    meeting_title: String,
     notes: Entity<gpui::component::input::TextareaState>,
     notes_status: String,
     notes_base: Option<PathBuf>,
@@ -98,17 +102,25 @@ struct Recorder {
 }
 #[cfg(target_os = "macos")]
 const UI_FONT: &str = "PingFang SC";
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 const UI_FONT: &str = "Microsoft YaHei UI";
+#[cfg(target_os = "linux")]
+const UI_FONT: &str = "Noto Sans CJK SC";
 #[cfg(target_os = "macos")]
 const MONO_FONT: &str = "Menlo";
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 const MONO_FONT: &str = "Consolas";
+#[cfg(target_os = "linux")]
+const MONO_FONT: &str = "DejaVu Sans Mono";
 fn native_handle(window: &Window) -> isize {
     match HasWindowHandle::window_handle(window).map(|w| w.as_raw()) {
         Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
         #[cfg(target_os = "macos")]
         Ok(RawWindowHandle::AppKit(h)) => h.ns_view.as_ptr() as isize,
+        #[cfg(target_os = "linux")]
+        Ok(RawWindowHandle::Xlib(h)) => h.window as isize,
+        #[cfg(target_os = "linux")]
+        Ok(RawWindowHandle::Xcb(h)) => h.window.get() as isize,
         _ => 0,
     }
 }
@@ -168,7 +180,7 @@ impl Recorder {
             opencap_platform::desktop_controls(&config.hotkey_record, &config.hotkey_pause)
                 .map_err(|e| message = format!("托盘/快捷键不可用：{e}"))
                 .ok();
-        let tray_available = controls.is_some();
+        let tray_available = controls.as_ref().is_some_and(|c| c.has_tray());
         window.on_window_should_close(cx, move |_, cx| {
             if tray_available {
                 opencap_platform::show_native_window(hwnd, false);
@@ -178,6 +190,7 @@ impl Recorder {
             false
         });
         cx.spawn(async move |entity, cx| {
+            log::info!("OpenCap foreground polling started");
             loop {
                 futures_timer::Delay::new(Duration::from_millis(200)).await;
                 if entity.update(cx, |this, cx| this.poll(cx)).is_err() {
@@ -295,6 +308,9 @@ impl Recorder {
             speaker_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             meeting_page: workspace::MeetingPage::Library,
             meetings,
+            rename_base: None,
+            rename_input: cx.new(|cx| InputState::new(window, cx).placeholder("会议名称")),
+            meeting_title: String::new(),
             notes,
             notes_status: String::new(),
             notes_base: None,
@@ -413,7 +429,9 @@ impl Recorder {
             needs_render = true;
         }
         self.persist_notes(cx);
+        needs_render |= self.persist_minutes_draft(cx);
         needs_render |= self.poll_transcription();
+        needs_render |= self.poll_minutes_document();
         let events: Vec<_> = self
             .controls
             .as_ref()
@@ -1004,7 +1022,7 @@ fn main() {
     struct StderrLogger;
     impl log::Log for StderrLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Warn
+            metadata.level() <= log::max_level()
         }
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
@@ -1015,7 +1033,12 @@ fn main() {
     }
     static LOGGER: StderrLogger = StderrLogger;
     let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Warn);
+    let level = match std::env::var("OPENCAP_LOG").as_deref() {
+        Ok("info") => log::LevelFilter::Info,
+        Ok("debug") => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Warn,
+    };
+    log::set_max_level(level);
     let application = gpui::application().with_assets(gpui::assets::Assets);
     #[cfg(target_os = "macos")]
     let reopen_view = Rc::new(std::cell::Cell::new(0isize));
@@ -1095,11 +1118,20 @@ fn main() {
             std::thread::spawn(move || {
                 let _ = opencap_platform::configure_floating_controls(toolbar, owner);
             });
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             let _ = opencap_platform::configure_floating_controls(toolbar, owner);
             opencap_platform::show_native_window(r.hwnd, true);
         });
         cx.activate(true);
+        if log::log_enabled!(log::Level::Info) {
+            let _ = main_window.update(cx, |_, window, _| {
+                log::info!(
+                    "OpenCap window initialized: viewport={:?}, visibility={:?}",
+                    window.viewport_size(),
+                    window.visibility()
+                );
+            });
+        }
         #[cfg(feature = "ui-smoke")]
         if let Some(source) = smoke::preview_source() {
             entity.update(cx, |r, cx| {

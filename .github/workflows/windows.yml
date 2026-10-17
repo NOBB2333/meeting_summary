@@ -1,15 +1,37 @@
 name: Windows
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # Save native files before rust-cache's post-job target cleanup.
+      - uses: actions/cache@v5
+        id: sherpa-cache
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Recover an uncached native SDK
+        if: steps.sherpa-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          if (Test-Path target/sherpa-onnx-prebuilt) {
+            Remove-Item -Recurse -Force target/sherpa-onnx-prebuilt
+          }
+          cargo clean -p sherpa-onnx-sys
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to invalidate the incomplete native SDK cache' }
       - name: Install pinned FFmpeg development libraries
         shell: pwsh
         run: ./scripts/setup.ps1
@@ -32,3 +54,12 @@ jobs:
       - name: Lint
         shell: pwsh
         run: ./scripts/dev.ps1 lint -- -D warnings
+      - name: Package and verify portable runtime
+        shell: pwsh
+        run: ./scripts/package.ps1 -Release -LocalPreview
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: OpenCap-windows-x64
+          path: release/OpenCap-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

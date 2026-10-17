@@ -197,6 +197,10 @@ impl AsrSession {
                             let mut consume = |audio: PcmAudio,
                                                duration: Option<f64>|
                              -> Result<()> {
+                                if let Some(seconds) = duration.filter(|s| s.is_finite() && *s > 0.)
+                                {
+                                    transcript.source_duration_ms = Some((seconds * 1000.) as u64);
+                                }
                                 anyhow::ensure!(
                                     !worker_cancelled.load(Ordering::Relaxed),
                                     "转录已取消"

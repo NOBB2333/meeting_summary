@@ -66,6 +66,11 @@ def package(profile, identity, build=True):
         directory.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, macos / "opencap")
     shutil.copy2(root / "crates/app/resources/Info.plist", staging / "Contents/Info.plist")
+    for icon in ("OpenCap.icns", "OpenCap-recording.icns"):
+        source = binary.parent / "opencap-assets" / icon
+        if not source.is_file():
+            raise RuntimeError(f"Missing generated application icon: {source}; rebuild the application")
+        shutil.copy2(source, resources / icon)
     for name in ("LICENSE", "THIRD_PARTY.md", "README.md"):
         shutil.copy2(root / name, resources / name)
     shutil.copytree(root / "LICENSES", resources / "LICENSES")
@@ -87,8 +92,9 @@ def package(profile, identity, build=True):
         return Path(name).resolve()
 
     def bundle(source, target):
-        # Existing Homebrew signatures become invalid after dependency rewriting.
-        subprocess.run(["codesign", "--remove-signature", str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Keep the signature load command while editing. Removing it first can
+        # leave __LINKEDIT padding that older Xcode install_name_tool rejects.
+        # Every edited Mach-O is signed again after dependency rewriting.
         for name in dependencies(source):
             if name.startswith(("/System/", "/usr/lib/")):
                 continue
@@ -103,7 +109,9 @@ def package(profile, identity, build=True):
                 shutil.copy2(dep, dest)
                 bundle(dep, dest)
                 run("install_name_tool", "-id", f"@rpath/{dep.name}", str(dest))
-            run("install_name_tool", "-change", name, f"@rpath/{copied[dep].name}", str(target))
+            replacement = f"@rpath/{copied[dep].name}"
+            if name != replacement:
+                run("install_name_tool", "-change", name, replacement, str(target))
         for directory in rpaths(target):
             if directory.startswith("/"):
                 run("install_name_tool", "-delete_rpath", directory, str(target))
@@ -117,6 +125,8 @@ def package(profile, identity, build=True):
     with plist_path.open("rb") as handle:
         info = plistlib.load(handle)
     info["LSMinimumSystemVersion"] = minimum_text
+    if info.get("CFBundleIconFile") != "OpenCap.icns":
+        raise RuntimeError("Application icon is missing from Info.plist")
     with plist_path.open("wb") as handle:
         plistlib.dump(info, handle)
     for library in frameworks.iterdir():
