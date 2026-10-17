@@ -152,9 +152,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_RUN: ${{ inputs.artifact_run }}
         run: |
-          gh run download "$ARTIFACT_RUN" --name Linux-diagnostic-build --dir target/runtime-download
-          mkdir -p target/runtime-package
-          tar -xzf target/runtime-download/OpenCap-linux-x64.tar.gz -C target/runtime-package
+          gh run download "$ARTIFACT_RUN" --name Linux-diagnostic-build --dir release/runtime-download
+          mkdir -p release/runtime-package
+          tar -xzf release/runtime-download/OpenCap-linux-x64.tar.gz -C release/runtime-package
       - uses: docker/setup-buildx-action@v4.4.1
       - uses: dtolnay/rust-toolchain@stable
         if: inputs.window_probe
@@ -180,8 +180,8 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/workspace" -v "$HOME/.cargo/registry:/opt/rust/cargo/registry" opencap-build:glibc228 bash -euc '
             cargo build --locked -p opencap --example linux-window-probe
-            cp target/debug/examples/linux-window-probe target/runtime-package/OpenCap/usr/bin/opencap
-            patchelf --set-rpath "\$ORIGIN/../lib" target/runtime-package/OpenCap/usr/bin/opencap
+            cp target/debug/examples/linux-window-probe release/runtime-package/OpenCap/usr/bin/opencap
+            patchelf --set-rpath "\$ORIGIN/../lib" release/runtime-package/OpenCap/usr/bin/opencap
           '
       - uses: docker/build-push-action@v7.4.0
         with:
@@ -196,9 +196,9 @@ jobs:
           OPENCAP_TEST_PRESENT_MODE: ${{ inputs.present_mode }}
         run: |
           docker run --rm --cap-add=SYS_PTRACE --env OPENCAP_TEST_PRESENT_MODE -v "$PWD:/workspace" opencap-runtime:check bash -euc '
-            export PATH="$PWD/target/runtime-package/OpenCap/usr/bin:/usr/bin:/bin"
-            export FONTCONFIG_FILE="$PWD/target/runtime-package/OpenCap/fonts.conf"
-            dbus-run-session -- python3 scripts/linux/smoke.py target/runtime-package/OpenCap/usr/bin --gui-only
+            export PATH="$PWD/release/runtime-package/OpenCap/usr/bin:/usr/bin:/bin"
+            export FONTCONFIG_FILE="$PWD/release/runtime-package/OpenCap/fonts.conf"
+            dbus-run-session -- python3 scripts/linux/smoke.py release/runtime-package/OpenCap/usr/bin --gui-only
           '
       - name: Restore probe cache ownership
         if: always() && inputs.window_probe
