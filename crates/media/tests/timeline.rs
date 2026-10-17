@@ -507,7 +507,12 @@ fn audio_only_session_pauses_and_finalizes_without_screen_or_audio_devices() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(session.stats().state, RecordingState::Recording);
-    std::thread::sleep(Duration::from_millis(100));
+    // Exercise the periodic desktop check as well as initial device-free startup.
+    std::thread::sleep(Duration::from_millis(if cfg!(target_os = "linux") {
+        1200
+    } else {
+        100
+    }));
     session.command(RecordingCommand::Stop);
     session.join();
     let stats = session.stats();

@@ -19,6 +19,7 @@ jobs:
         with:
           key: linux-glibc228
           cache-on-failure: true
+          cache-all-crates: true
       - uses: docker/setup-buildx-action@v4.4.1
       - name: Build pinned FFmpeg and glibc 2.28 toolchain
         uses: docker/build-push-action@v7.4.0
@@ -45,7 +46,7 @@ jobs:
         id: package
         run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 scripts/package.sh
       - name: Native X11, audio and GUI checks
-        run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 python3 scripts/linux/smoke.py target/release
+        run: docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 dbus-run-session -- python3 scripts/linux/smoke.py target/release
       - name: Packaged application without developer library paths
         run: |
           docker run --rm -v "$PWD:/workspace" opencap-build:glibc228 bash -euc '
@@ -53,7 +54,7 @@ jobs:
             export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
             export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
             unset LIBRARY_PATH PKG_CONFIG_PATH
-            python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin
+            dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin
           '
       - name: Restore workspace cache ownership
         if: always()

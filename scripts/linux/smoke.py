@@ -60,10 +60,12 @@ def inspect(path, audio=False):
 
 
 try:
-    start("Xvfb", ":91", "-screen", "0", "1920x1080x24", "-nolisten", "tcp", "-ac")
+    desktop = start("Xvfb", ":91", "-screen", "0", "1920x1080x24", "-nolisten", "tcp", "-ac", "-noreset")
     start("pulseaudio", "-n", "--daemonize=no", "--exit-idle-time=-1", "--disable-shm=yes", "--load=module-native-protocol-unix socket=" + str(output / "pulse.sock") + " auth-anonymous=1", "--load=module-null-sink sink_name=opencap_test rate=48000 channels=2")
     deadline = time.monotonic() + 15
     while True:
+        if desktop.poll() is not None:
+            raise RuntimeError("Cannot start the dedicated virtual desktop; refusing to use another display")
         try:
             run("pactl", "info")
             run("xsetroot", "-solid", "#f00000")
@@ -93,12 +95,16 @@ try:
         if audio:
             recording_env.pop("DISPLAY", None)
             recording_env.pop("WAYLAND_DISPLAY", None)
+        began = time.monotonic()
         text = run(build / "opencap-bench", "record", "--region", "0,0,640,360", "--codec", "h264", "--encoder", "libx264", "--fps", "10", "--output", destination, *arguments, env=recording_env)
+        elapsed = time.monotonic() - began
         (destination / "stats.json").write_text(text + "\n")
         stats = json.loads(text)
         assert stats["state"] == "Finished", stats
+        requested = int(arguments[arguments.index("--seconds") + 1])
+        assert stats["duration_seconds"] >= requested - (2 if "pause" in name else 0) - 0.75, stats
         if "pause" in name:
-            assert 2.5 <= stats["duration_seconds"] < 5, stats
+            assert stats["duration_seconds"] <= elapsed - 1.5, stats
         path = Path(stats["output"])
         assert path.is_file() and ".partial." not in path.name, path
         assert path.suffix == (".m4a" if audio else ".mp4"), path
