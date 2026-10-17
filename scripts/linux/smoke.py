@@ -35,10 +35,11 @@ def start(*args):
     return process
 
 
-def decoded_frame(path):
+def decoded_frame(path, last=False):
     # The distributed FFmpeg deliberately enables a small set of encoders.
     # BMP is included; rawvideo is not needed by the application.
-    data = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-c:v", "bmp", "-pix_fmt", "bgr24", "-f", "image2pipe", "-"])
+    filters = ["-vf", "reverse"] if last else []
+    data = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), *filters, "-frames:v", "1", "-c:v", "bmp", "-pix_fmt", "bgr24", "-f", "image2pipe", "-"])
     assert data[:2] == b"BM"
     offset = struct.unpack_from("<I", data, 10)[0]
     width, height = struct.unpack_from("<ii", data, 18)
@@ -144,17 +145,27 @@ try:
                     break
                 time.sleep(0.2)
             assert window, "GUI did not create its X11 window"
-            time.sleep(1)
             destination = output / "gui"
             destination.mkdir(exist_ok=True)
-            text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
-            (destination / "stats.json").write_text(text + "\n")
-            path = Path(json.loads(text)["output"])
-            width, height, raw = decoded_frame(path)
-            red = sum(1 for i in range(0, len(raw), 3) if raw[i + 2] > 180 and raw[i + 1] < 70 and raw[i] < 70)
-            assert red < width * height * 0.5, "GUI window still contains the synthetic desktop background"
-            assert len({raw[i:i + 3] for i in range(0, len(raw) - 2, 30)}) > 64, "GUI window did not render its contents"
-            run("ffmpeg", "-v", "error", "-y", "-i", path, "-frames:v", "1", output / "gui.png")
+            # A mapped window can precede the first software-GPU frame. Poll for
+            # painted content and inspect the last frame, with a bounded deadline.
+            deadline = time.monotonic() + 25
+            rendered = False
+            while time.monotonic() < deadline:
+                if gui.poll() is not None:
+                    raise RuntimeError("GUI exited before drawing its contents; see gui.log")
+                text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
+                (destination / "stats.json").write_text(text + "\n")
+                path = Path(json.loads(text)["output"])
+                width, height, raw = decoded_frame(path, last=True)
+                run("ffmpeg", "-v", "error", "-y", "-i", path, "-vf", "reverse", "-frames:v", "1", output / "gui.png")
+                red = sum(1 for i in range(0, len(raw), 3) if raw[i + 2] > 180 and raw[i + 1] < 70 and raw[i] < 70)
+                colors = len({raw[i:i + 3] for i in range(0, len(raw) - 2, 30)})
+                print("GUI content: red background {:.1%}, {} sampled colors".format(red / (width * height), colors), flush=True)
+                rendered = red < width * height * 0.5 and colors > 64
+                if rendered:
+                    break
+            assert rendered, "GUI did not draw its contents within 25 seconds; see gui.png and gui.log"
             results.append({"gui_started": True, "gui_rendered": True})
     (output / "report.json").write_text(json.dumps(results, indent=2) + "\n")
     print("Linux X11 capture, cursor path, pause/resume, M4A and decoded audio checks passed", flush=True)
