@@ -126,6 +126,7 @@ try:
         assert manager.poll() is None, "The virtual desktop window manager did not start"
         gui_env = os.environ.copy()
         gui_env["OPENCAP_LOG"] = "info"
+        gui_env["LD_LIBRARY_PATH"] = str(build.parent / "lib")
         if os.environ.get("OPENCAP_TEST_PRESENT_MODE") == "immediate":
             gui_env["MESA_VK_WSI_PRESENT_MODE"] = "immediate"
         for variable, name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")):
@@ -173,7 +174,7 @@ try:
                 with (output / "gui-threads.log").open("w") as diagnostic:
                     subprocess.run(["gdb", "-batch", "-ex", "set pagination off", "-ex", "attach {}".format(gui.pid), "-ex", "thread apply all bt 12", "-ex", "detach"], stdout=diagnostic, stderr=diagnostic, timeout=45)
                 with (output / "gui-window.log").open("w") as diagnostic:
-                    for command in (["xwininfo", "-id", window], ["xprop", "-id", window], ["xrandr", "--current"]):
+                    for command in (["xwininfo", "-all", "-id", window], ["xprop", "-id", window], ["xrandr", "--current"]):
                         subprocess.run(command, stdout=diagnostic, stderr=diagnostic, timeout=5)
                 # An explicit unmap/map helps diagnose missed initial visibility
                 # events. A failure remains a failure even if this wakes it up.
