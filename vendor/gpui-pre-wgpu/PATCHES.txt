@@ -1,10 +1,10 @@
 Upstream: gpui-pre-wgpu 0.3.9, Apache-2.0
 Zed snapshot: 93d745668805029476e6d7fbb19652116fed51de
 
-Local surface-acquisition compatibility patch:
-- Present valid suboptimal textures rather than discarding every frame.
-- Reconfigure mismatched extents after presenting and request another frame.
-- Retry transient surface acquisition failures instead of losing pending content.
-- Emit optional debug diagnostics for surface acquisition.
+Local patch: prefer OpenGL when CPU adapters present desktop windows.
+An unmodified OpenCap package remained blank with Mesa software Vulkan in
+Xvfb but rendered its complete UI with software OpenGL in the same runtime.
+Hardware adapters retain their original ranking, as do headless contexts.
+Four metadata-only selection tests cover these policy boundaries.
 
-Retain LICENSE-APACHE. All other source is the crates.io snapshot.
+Retain LICENSE-APACHE. Other source matches the crates.io snapshot.

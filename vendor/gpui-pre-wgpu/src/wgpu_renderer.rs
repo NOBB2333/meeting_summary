@@ -1137,7 +1137,6 @@ impl WgpuRenderer {
         // a texture from an unconfigured surface can block indefinitely on
         // some drivers (Adreno).
         let RendererState::Ready { surface, core } = &mut self.state else {
-            log::debug!("GPU surface is not configured; skipping draw");
             return false;
         };
 
@@ -1165,28 +1164,19 @@ impl WgpuRenderer {
             self.failed_frame_count = 0;
         }
 
-        let mut suboptimal = false;
         let frame = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => {
-                log::debug!("GPU surface texture acquired");
-                frame
-            }
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // This is a usable texture. Dropping every suboptimal frame can
-                // leave older Mesa drivers permanently displaying no content.
-                log::debug!("GPU surface texture is suboptimal; presenting available content");
-                suboptimal = true;
-                frame
+                // Textures must be destroyed before the surface can be reconfigured.
+                drop(frame);
+                surface.configure(&core.resources.device, &self.surface_config);
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                log::debug!("GPU surface is lost/outdated; reconfiguring and retrying");
                 surface.configure(&core.resources.device, &self.surface_config);
-                self.needs_redraw = true;
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                log::debug!("GPU surface is temporarily unavailable; retrying");
-                self.needs_redraw = true;
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
@@ -1217,15 +1207,7 @@ impl WgpuRenderer {
             return false;
         }
 
-        drop(frame_view);
         frame.present();
-        if suboptimal
-            && (size.width.0 as u32 != self.surface_config.width
-                || size.height.0 as u32 != self.surface_config.height)
-        {
-            surface.configure(&core.resources.device, &self.surface_config);
-            self.needs_redraw = true;
-        }
         true
     }
 }

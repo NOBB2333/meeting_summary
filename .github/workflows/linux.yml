@@ -55,6 +55,7 @@ jobs:
             cargo fmt --all -- --check
             scripts/setup.sh
             scripts/dev.sh test
+            cargo test --locked -p gpui-pre-wgpu --lib adapter_selection
             scripts/dev.sh lint -- -D warnings
           '
       - uses: actions/cache/restore@v5
@@ -165,6 +166,7 @@ jobs:
         if: inputs.window_probe
         with:
           shared-key: linux-glibc228-build
+          save-if: false
           cache-on-failure: true
           cache-all-crates: true
       - name: Load compiler for the minimal window
