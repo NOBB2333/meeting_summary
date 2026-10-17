@@ -850,7 +850,7 @@ impl Recorder {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("选择录制保存目录".into()),
+            prompt: Some("选择会议保存根目录".into()),
         });
         cx.spawn(async move |entity, cx| {
             if let Ok(Ok(Some(paths))) = prompt.await
@@ -878,18 +878,7 @@ fn same_target(a: &CaptureTarget, b: &CaptureTarget) -> bool {
     }
 }
 fn find_recoverables(dir: &std::path::Path) -> Vec<PathBuf> {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name().is_some_and(|n| {
-                let name = n.to_string_lossy();
-                name.ends_with(".partial.mp4") || name.ends_with(".partial.m4a")
-            })
-        })
-        .collect()
+    opencap_core::recoverable_recordings(dir)
 }
 
 struct Floating {

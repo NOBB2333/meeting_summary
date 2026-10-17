@@ -161,22 +161,17 @@ impl Recorder {
             }
             return;
         }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let stem = source
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .replace('.', "_");
         let output = if source.with_extension("recording.json").exists() {
             source.clone()
         } else {
-            self.config
-                .output_dir
-                .join("Transcripts")
-                .join(format!("{stem}-{stamp}"))
+            let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+            match opencap_core::create_meeting_base(&self.config.output_dir, &stem) {
+                Ok(base) => base,
+                Err(error) => {
+                    self.transcription_status = format!("无法准备会议文件夹：{error:#}");
+                    return;
+                }
+            }
         };
         match AsrSession::file_with_revision(
             model_root(),
@@ -422,16 +417,14 @@ impl Recorder {
                     .justify_between()
                     .items_center()
                     .child(label("实时文字"))
-                    .child(
-                        button("open-live-text", "查看转录", false).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.transcription_tab = true;
-                                this.settings = false;
-                                this.meeting_page = workspace::MeetingPage::Transcript;
-                                cx.notify();
-                            },
-                        )),
-                    ),
+                    .child(button("open-live-text", "查看完整逐字稿", false).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.transcription_tab = true;
+                            this.settings = false;
+                            this.meeting_page = workspace::MeetingPage::Transcript;
+                            cx.notify();
+                        }),
+                    )),
             )
             .child(
                 div()
@@ -484,14 +477,21 @@ impl Recorder {
                 ))
             })
             .child(label(self.transcription_status.clone()))
-            .child(div().max_h(px(130.)).overflow_hidden().children(
-                self.transcript.segments.last().map(|s| {
-                    div()
-                        .text_base()
-                        .text_color(rgb(if s.finalized { TEXT } else { ACCENT }))
-                        .child(s.text.clone())
-                }),
-            ))
+            .child(
+                div()
+                    .h(px(
+                        if !self.config.realtime_transcription
+                            && self.transcript.segments.is_empty()
+                        {
+                            64.
+                        } else if self.config.audio_only {
+                            380.
+                        } else {
+                            320.
+                        },
+                    ))
+                    .child(self.transcript_view.clone()),
+            )
     }
     pub(super) fn transcription_view(&self, width: f32, cx: &Context<Self>) -> Div {
         let busy = self.transcription_busy();
@@ -508,17 +508,15 @@ impl Recorder {
                     .flex_wrap()
                     .gap_2()
                     .child(
-                        primary_button("export-transcript-word", "导出逐字稿 Word")
+                        primary_button("export-transcript-word", "导出逐字稿 Word…")
                             .disabled(busy || !ready)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(base) = &this.transcript_output {
-                                    match this.transcript.save(base) {
+                                    match this.transcript.export_word(base) {
                                         Ok(()) => {
-                                            this.transcription_status =
-                                                "逐字稿已保存，Word 保留原话、时间和说话人标签"
-                                                    .into();
-                                            let _ = opencap_platform::open_path(
-                                                &base.with_extension("transcript.docx"),
+                                            this.export_document(
+                                                base.with_extension("transcript.docx"),
+                                                cx,
                                             );
                                         }
                                         Err(e) => {

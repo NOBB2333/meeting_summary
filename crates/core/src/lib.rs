@@ -10,3 +10,6 @@ pub use region::*;
 pub use types::*;
 mod audio;
 pub use audio::*;
+
+mod meeting;
+pub use meeting::*;

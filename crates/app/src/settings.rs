@@ -362,9 +362,12 @@ impl Recorder {
                     .truncate(),
             )
             .child(
-                button("save-folder", "选择保存目录", false)
+                button("save-folder", "更改保存根目录", false)
                     .on_click(cx.listener(|this, _, _, cx| this.choose_folder(cx))),
             )
+            .child(label(
+                "每场新会议单独建一个文件夹，集中保存录音、逐字稿、纪要和笔记。",
+            ))
             .child(ui::setting_row(
                 "保存独立音频",
                 "同时保存同名 M4A 文件，下次录制生效",

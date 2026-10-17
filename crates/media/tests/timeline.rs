@@ -512,6 +512,9 @@ fn audio_only_session_pauses_and_finalizes_without_screen_or_audio_devices() {
     assert!(session.take_preview().is_none());
     let output = stats.output.unwrap();
     assert_eq!(output.extension().unwrap(), "m4a");
+    assert_ne!(output.parent().unwrap(), dir.as_path());
+    assert_eq!(output.parent().unwrap().parent(), Some(dir.as_path()));
+    assert!(output.with_extension("recording.json").exists());
     assert_eq!(stats.audio_output.as_ref(), Some(&output));
     assert!(!output.with_extension("mp4").exists());
     assert!(!output.with_extension("partial.m4a").exists());

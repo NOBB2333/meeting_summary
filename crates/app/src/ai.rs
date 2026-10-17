@@ -485,7 +485,7 @@ impl Recorder {
                             }),
                     )
                     .child(
-                        button("export-word", "重新导出 Word", false)
+                        button("export-word", "导出纪要 Word…", false)
                             .disabled(busy || !has_minutes)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let path = word_base.with_extension("summary.docx");
@@ -494,8 +494,7 @@ impl Recorder {
                                     &path,
                                 ) {
                                     Ok(()) => {
-                                        this.ai.status = format!("Word 已保存：{}", path.display());
-                                        let _ = opencap_platform::open_path(&path);
+                                        this.export_document(path, cx);
                                     }
                                     Err(e) => {
                                         this.ai.status = format!("Word 导出失败；原纪要保留：{e}")
@@ -505,13 +504,13 @@ impl Recorder {
                             })),
                     )
                     .child(
-                        button("open-minutes-markdown", "打开文字稿", false)
+                        button("open-minutes-markdown", "打开纪要 Markdown", false)
                             .disabled(!markdown_path.exists())
                             .on_click(move |_, _, _| {
                                 let _ = opencap_platform::open_path(&markdown_path);
                             }),
                     )
-                    .child(button("minutes-history", "打开版本目录", false).on_click(
+                    .child(button("minutes-history", "会议文件夹", false).on_click(
                         move |_, _, _| {
                             let _ = opencap_platform::open_path(&folder);
                         },

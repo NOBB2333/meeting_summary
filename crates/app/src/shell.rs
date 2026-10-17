@@ -149,7 +149,7 @@ impl Recorder {
                     .child(label("文件与笔记保存在本机")),
             )
             .child(
-                button("sidebar-folder", "打开保存目录", false)
+                button("sidebar-folder", "打开保存根目录", false)
                     .icon(IconName::FolderOpen)
                     .ghost()
                     .w_full()

@@ -111,35 +111,15 @@ impl Drop for RecordingSession {
 }
 fn unique_output(dir: &Path, audio_only: bool) -> Result<(PathBuf, PathBuf)> {
     let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    for n in 0..100 {
-        let suffix = if n == 0 {
-            String::new()
-        } else {
-            format!("_{n:02}")
-        };
-        let extension = if audio_only { "m4a" } else { "mp4" };
-        let output = dir.join(format!("OpenCap_{stamp}{suffix}.{extension}"));
-        let partial = output.with_extension(format!("partial.{extension}"));
-        if output.exists()
-            || output.with_extension("mp4").exists()
-            || output.with_extension("partial.mp4").exists()
-            || output.with_extension("m4a").exists()
-            || output.with_extension("partial.m4a").exists()
-            || output.with_extension("recording.json").exists()
-        {
-            continue;
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-        {
-            Ok(_) => return Ok((output, partial)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    anyhow::bail!("Unable to allocate recording filename")
+    let base = create_meeting_base(dir, &format!("OpenCap_{stamp}"))?;
+    let extension = if audio_only { "m4a" } else { "mp4" };
+    let output = base.with_extension(extension);
+    let partial = base.with_extension(format!("partial.{extension}"));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)?;
+    Ok((output, partial))
 }
 /// Microphone conditioning runs on the capture side so the level meter and the
 /// recorded track always see the same signal.

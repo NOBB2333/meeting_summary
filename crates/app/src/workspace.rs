@@ -131,7 +131,63 @@ fn card() -> Div {
 pub(super) fn heading(title: &str, description: &str) -> Div {
     ui::heading(title, description)
 }
+fn copy_export(
+    source: &Path,
+    destination: &Path,
+    protected_media: Option<&Path>,
+) -> anyhow::Result<()> {
+    if let Some(media) = protected_media
+        && let (Ok(media), Ok(target)) = (media.canonicalize(), destination.canonicalize())
+    {
+        anyhow::ensure!(
+            media != target,
+            "请为文档选择新位置，原录音或视频不会被覆盖"
+        );
+    }
+    let bytes = std::fs::read(source)?;
+    opencap_asr::atomic_write(destination, &bytes)
+}
+
 impl Recorder {
+    /// Save an independent document copy. Opening an existing document is a separate action.
+    pub(super) fn export_document(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+        let folder = source.parent().unwrap_or(Path::new("."));
+        let suggested = source.file_name().unwrap_or_default().to_string_lossy();
+        let prompt = cx.prompt_for_new_path(folder, Some(&suggested));
+        let protected_media = self.transcript.source.clone();
+        cx.spawn(async move |entity, cx| {
+            let selected = match prompt.await {
+                Ok(Ok(Some(path))) => path,
+                Ok(Ok(None)) => return,
+                error => {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.message = format!("无法选择导出位置：{error:?}");
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let mut destination = selected;
+            if destination.extension().is_none() {
+                destination.set_extension("docx");
+            }
+            let saved = destination.clone();
+            let result = cx
+                .background_executor()
+                .spawn(
+                    async move { copy_export(&source, &destination, protected_media.as_deref()) },
+                )
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.message = match result {
+                    Ok(()) => format!("已导出副本：{}", saved.display()),
+                    Err(error) => format!("导出失败：{error:#}"),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     pub(super) fn refresh_meetings(&mut self) {
         self.meetings = discover(&self.config.output_dir);
         let paths: Vec<_> = self.meetings.iter().map(|m| &m.base).collect();
@@ -249,23 +305,58 @@ impl Recorder {
         if let Some(base) = &self.transcript_output {
             let folder = base.parent().unwrap_or(Path::new(".")).to_path_buf();
             let open = folder.clone();
+            let copy_folder = folder.clone();
             header = header.child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(
-                        label(format!("保存位置：{}", folder.display()))
+                        label(format!("会议文件夹：{}", folder.display()))
                             .flex_1()
                             .min_w(px(0.))
                             .truncate(),
                     )
                     .child(
-                        button("meeting-location", "查看文件", false)
+                        button("copy-meeting-location", "复制路径", false)
+                            .ghost()
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    copy_folder.display().to_string(),
+                                ))
+                            }),
+                    )
+                    .child(
+                        button("meeting-location", "打开会议文件夹", false)
                             .icon(gpui::component::IconName::FolderOpen)
                             .ghost()
                             .on_click(move |_, _, _| {
                                 let _ = opencap_platform::open_path(&open);
+                            }),
+                    ),
+            );
+        }
+        if let (Some(source), Some(base)) = (&self.transcript.source, &self.transcript_output)
+            && source.parent() != base.parent()
+            && let Some(folder) = source.parent()
+        {
+            let original_folder = folder.to_path_buf();
+            header = header.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        label(format!("原文件留在：{}", source.display()))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate(),
+                    )
+                    .child(
+                        button("original-media-location", "打开原文件位置", false)
+                            .ghost()
+                            .on_click(move |_, _, _| {
+                                let _ = opencap_platform::open_path(&original_folder);
                             }),
                     ),
             );
@@ -371,9 +462,6 @@ impl Recorder {
                             |this, _, _, cx| {
                                 this.transcription_tab = false;
                                 this.settings = false;
-                                if this.targets.is_empty() {
-                                    this.refresh_targets();
-                                }
                                 this.page_scroll.set_offset(point(px(0.), px(0.)));
                                 cx.notify();
                             },
@@ -477,7 +565,7 @@ impl Recorder {
                                     }),
                             )
                             .child(
-                                button(("meeting-folder", i), "打开文件夹", false)
+                                button(("meeting-folder", i), "会议文件夹", false)
                                     .ghost()
                                     .on_click(move |_, _, _| {
                                         let _ = opencap_platform::open_path(&folder);
@@ -492,7 +580,7 @@ impl Recorder {
         )))
     }
     fn notes_view(&self, cx: &Context<Self>) -> Div {
-        let export = primary_button("export-notes-word", "导出笔记 Word")
+        let export = primary_button("export-notes-word", "导出笔记 Word…")
             .disabled(self.transcript_output.is_none())
             .on_click(cx.listener(|this, _, _, cx| {
                 this.persist_notes(cx);
@@ -505,8 +593,7 @@ impl Recorder {
                     let path = base.with_extension("notes.docx");
                     match opencap_asr::export_minutes_docx(&md, &path) {
                         Ok(()) => {
-                            this.notes_status = format!("笔记 Word 已保存：{}", path.display());
-                            let _ = opencap_platform::open_path(&path);
+                            this.export_document(path, cx);
                         }
                         Err(e) => this.notes_status = format!("导出失败：{e}"),
                     }
@@ -529,5 +616,36 @@ impl Recorder {
             )
             .child(Textarea::new(&self.notes).disabled(self.transcript_output.is_none()))
             .child(label(self.notes_status.clone()))
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::copy_export;
+    #[test]
+    fn exporting_keeps_the_local_document_and_refuses_to_replace_original_media() {
+        let dir = std::env::temp_dir().join(format!(
+            "opencap-export-copy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("original.m4a");
+        let document = dir.join("transcript.docx");
+        let copy = dir.join("shared-copy.docx");
+        std::fs::write(&original, b"unchanged audio").unwrap();
+        std::fs::write(&document, b"document bytes").unwrap();
+        copy_export(&document, &copy, Some(&original)).unwrap();
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            std::fs::read(&document).unwrap()
+        );
+        assert!(copy_export(&document, &original, Some(&original)).is_err());
+        assert_eq!(std::fs::read(&original).unwrap(), b"unchanged audio");
+        assert_eq!(std::fs::read(&document).unwrap(), b"document bytes");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
