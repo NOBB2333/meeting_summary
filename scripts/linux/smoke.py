@@ -165,6 +165,20 @@ try:
                 rendered = red < width * height * 0.5 and colors > 64
                 if rendered:
                     break
+            if not rendered:
+                with (output / "gui-threads.log").open("w") as diagnostic:
+                    subprocess.run(["gdb", "-batch", "-ex", "set pagination off", "-ex", "attach {}".format(gui.pid), "-ex", "thread apply all bt 12", "-ex", "detach"], stdout=diagnostic, stderr=diagnostic, timeout=45)
+                with (output / "gui-window.log").open("w") as diagnostic:
+                    for command in (["xwininfo", "-id", window], ["xprop", "-id", window], ["xrandr", "--current"]):
+                        subprocess.run(command, stdout=diagnostic, stderr=diagnostic, timeout=5)
+                # An explicit unmap/map helps diagnose missed initial visibility
+                # events. A failure remains a failure even if this wakes it up.
+                run("xdotool", "windowunmap", window)
+                time.sleep(0.2)
+                run("xdotool", "windowmap", window)
+                time.sleep(3)
+                text = run(build / "opencap-bench", "record", "--window", window, "--no-audio", "--seconds", "2", "--fps", "2", "--codec", "h264", "--encoder", "libx264", "--output", destination)
+                run("ffmpeg", "-v", "error", "-y", "-i", json.loads(text)["output"], "-vf", "reverse", "-frames:v", "1", output / "gui-remapped.png")
             assert rendered, "GUI did not draw its contents within 25 seconds; see gui.png and gui.log"
             results.append({"gui_started": True, "gui_rendered": True})
     (output / "report.json").write_text(json.dumps(results, indent=2) + "\n")

@@ -86,7 +86,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=opencap-linux-runtime,ignore-error=true
       - name: Packaged GUI and media on a clean runtime
         run: |
-          docker run --rm -v "$PWD:/workspace" opencap-runtime:check bash -euc '
+          docker run --rm --cap-add=SYS_PTRACE -v "$PWD:/workspace" opencap-runtime:check bash -euc '
             export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
             export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
             dbus-run-session -- python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin
@@ -116,6 +116,9 @@ jobs:
             target/verify/linux-smoke/report.json
             target/verify/linux-smoke/*/stats.json
             target/verify/linux-smoke/gui.log
+            target/verify/linux-smoke/gui-threads.log
+            target/verify/linux-smoke/gui-window.log
             target/verify/linux-smoke/gui.png
+            target/verify/linux-smoke/gui-remapped.png
             release/OpenCap-linux-x64/elf-audit.json
           if-no-files-found: ignore
