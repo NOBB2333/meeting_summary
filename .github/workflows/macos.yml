@@ -23,6 +23,8 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Native prerequisites
         run: |
           brew install ffmpeg pkgconf

@@ -15,6 +15,8 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Install pinned FFmpeg development libraries
         shell: pwsh
         run: ./scripts/setup.ps1

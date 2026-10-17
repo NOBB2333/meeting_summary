@@ -48,7 +48,7 @@ target/debug/opencap-transcribe transcribe meeting.wav --output recordings/live-
 target/debug/opencap-transcribe summary recordings/meeting.transcript.json --output recordings/meeting --model qwen2.5:7b
 ```
 
-首次构建会取得固定版本 sherpa-onnx 原生静态运行库；无需 Python、GPU、Metal 推理或网络转录服务。整个录制应用的 Linux 后端尚未实现，不能把识别运行库的平台支持当作整款应用已支持 Linux。
+首次构建会取得固定版本 sherpa-onnx 原生静态运行库；无需 Python、GPU、Metal 推理或网络转录服务。Linux 使用独立的 X11 / PulseAudio 平台层；Wayland 屏幕采集暂未实现。
 
 目标不是做第二个 OBS，而是一个**点一下就能录**的轻量工具：全屏 / 窗口 / 区域 / 仅录音，系统声音和麦克风，暂停继续，托盘和全局快捷键，输出 MP4（可选同名 M4A），仅录音直接输出 M4A。针对 PPT、文档、浏览器、IDE 这类桌面内容做了低码率优化，同时支持录制游戏和视频等高动态画面。
 
@@ -317,7 +317,11 @@ macOS 的 `scripts/dev.sh` 默认构建 Debug 原生应用包并打开 `release/
 
 命令行 `target/release/opencap-bench` 支持同样的探测和录制命令。裸命令行进程的系统授权可能与应用包不同，实机操作优先使用 `OpenCap.app`。
 
-Linux / PipeWire 后端尚未实现，当前仍会显式编译失败。
+Linux 首先支持 Intel / x86_64 的统信 UOS：X11 显示器、窗口和区域录制，PulseAudio 或 PipeWire-Pulse 的系统声与麦克风，以及仅录音、暂停恢复和文稿功能。Wayland 暂仅支持音频和文稿。X11 不支持排除本应用，暂不提供窗口缩略预览、录制边框或托盘；关闭主窗会退出，快捷键与悬浮控制仍可用；Linux 暂未实现锁屏自动停止，请先停止录制再锁屏。窗口最小化或关闭时结束采集并保存，窗口内容被遮挡时建议改录完整屏幕。
+
+Actions 提供 Windows x64、Mac Apple Silicon / Intel 和 Linux x64 测试包。Linux 在 Debian 10 / glibc 2.28 基线上构建，私有捆绑 FFmpeg、C++、字体等依赖并审计 ELF 符号版本，不替换系统 glibc 或显卡驱动。图形界面使用宿主 Vulkan / OpenGL 驱动；Linux 当前提供软件 H.264 / AAC 路径，UOS 实机性能仍需按设备验证。
+
+Linux 下载 `OpenCap-linux-x64.deb` 安装，或解压 `OpenCap-linux-x64.tar.gz` 后运行 `OpenCap/AppRun`，保留整个目录。构建和兼容检查见 [docs/build-and-linux.md](docs/build-and-linux.md)。Mac 图标由同一套绿色 / 红色图源生成 ICNS 并在签名前装入应用包，Dock 随录制状态切换；系统权限列表使用应用包图标。
 
 ---
 

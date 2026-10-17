@@ -228,14 +228,15 @@ pub fn configure_floating_controls(id: isize, owner: isize) -> Result<()> {
     Ok(())
 }
 pub fn open_path(path: &Path) -> Result<()> {
-    anyhow::ensure!(
-        std::process::Command::new("xdg-open")
-            .arg(path)
-            .spawn()?
-            .wait()?
-            .success(),
-        "无法打开路径，请检查文件关联"
-    );
+    let mut process = std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .context("无法启动系统文件管理器，请检查 xdg-utils 和文件关联")?;
+    // Some desktop handlers stay alive until their window closes.
+    // Reap them off the UI thread rather than waiting for the user to close it.
+    thread::spawn(move || {
+        let _ = process.wait();
+    });
     Ok(())
 }
 pub fn desktop_available() -> bool {

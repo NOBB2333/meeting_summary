@@ -25,7 +25,7 @@ echo "$digest  ffmpeg.tar.xz" | sha256sum --check
 tar -xJf ffmpeg.tar.xz
 cd "ffmpeg-$version"
 ./configure --prefix="$prefix" --enable-shared --disable-static --disable-doc --disable-debug \
-  --disable-autodetect --enable-gpl --enable-libx264 --enable-libpulse \
+  --disable-autodetect --enable-gpl --enable-libx264 --enable-libpulse --enable-zlib \
   --disable-encoders --enable-encoder=aac,pcm_f32le,pcm_s16le,libx264,mpeg4,png,bmp \
   --disable-ffplay
 make -j"${OPENCAP_BUILD_JOBS:-4}"

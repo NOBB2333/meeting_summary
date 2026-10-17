@@ -25,6 +25,7 @@ ENV PATH=/opt/rust/cargo/bin:/opt/ffmpeg/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh \
     && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97.1 --component rustfmt,clippy \
     && rm /tmp/rustup.sh
+RUN ln -s "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/rust-lld" /usr/local/bin/ld.lld
 RUN apt-get update && apt-get install -y --no-install-recommends x11-xserver-utils \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/linux/cxx-runtime.sh /opt/cxx-runtime.sh
@@ -33,5 +34,6 @@ ADD --chmod=644 https://conda.anaconda.org/conda-forge/linux-aarch64/libstdcxx-n
 RUN bash /opt/cxx-runtime.sh && rm -rf /opt/compat/downloads
 ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig LD_LIBRARY_PATH=/opt/compat/lib:/opt/ffmpeg/lib
 ENV LIBRARY_PATH=/opt/compat/lib
+ENV RUSTFLAGS="-Clink-arg=-fuse-ld=lld"
 ENV CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0
 WORKDIR /workspace

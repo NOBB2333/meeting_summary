@@ -158,17 +158,16 @@ fn start_route(
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                     .collect();
-                if let Some(pts_us) = timeline.timestamp(&clock, 20_000, samples.len() / 2) {
-                    if tx
+                if let Some(pts_us) = timeline.timestamp(&clock, 20_000, samples.len() / 2)
+                    && tx
                         .try_send(AudioChunk {
                             kind,
                             pts_us,
                             samples,
                         })
                         .is_err()
-                    {
-                        let _ = warnings.try_send("声音队列积压，部分采样未能保存".into());
-                    }
+                {
+                    let _ = warnings.try_send("声音队列积压，部分采样未能保存".into());
                 }
             }
         })

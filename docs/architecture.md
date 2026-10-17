@@ -1,12 +1,12 @@
 # 架构与实现约束
 
-UI → RecordingSession 命令队列 → 录制工作线程 → 平台采集 → 帧策略/混音 → FFmpeg → fragmented MP4 → 无损 remux。Windows 使用 WGC/WASAPI，macOS 使用 ScreenCaptureKit/CoreAudio。
+UI → RecordingSession 命令队列 → 录制工作线程 → 平台采集 → 帧策略/混音 → FFmpeg → fragmented MP4 → 无损 remux。Windows 使用 WGC/WASAPI，macOS 使用 ScreenCaptureKit/CoreAudio，Linux 使用 X11 / PulseAudio。
 
 ## 边界
 
 `core` 不依赖 GPUI、FFmpeg 或平台 API。`CaptureBackend` / `AudioBackend` 管理原生后端生命周期；`VideoEncoder` 接受带时间戳的帧，返回零到多个 packet 并支持 flush。`Muxer<P>` 是后续分离输出容器的接口，当前 `MediaWriter` 直接管理视频与音频编码器及 MP4 输出。`RegionEditor` 位于 `core`，处理物理坐标中的编辑约束；macOS 原生选择器在 AppKit 点坐标中编辑，再转换为物理像素。后端初始化由 platform 的类型化函数负责。
 
-平台 API 位于 platform。`CaptureTarget::Window` 保存 HWND（Windows）或 CGWindowID（macOS），启动时要求重新选择以避免 ID 复用。GPUI 的 AppKit 原始句柄是 NSView，不能直接作为 CGWindowID。当前 `VideoFrame` 是拥有所有权的 BGRA CPU 缓冲区，`Arc` 支持静态帧复用。未来 GPU 缓冲区应增加独立枚举/生命周期协议。Linux 后端未实现，仍显式编译失败。
+平台 API 位于 platform。`CaptureTarget::Window` 保存 HWND（Windows）或 CGWindowID（macOS），启动时要求重新选择以避免 ID 复用。GPUI 的 AppKit 原始句柄是 NSView，不能直接作为 CGWindowID。当前 `VideoFrame` 是拥有所有权的 BGRA CPU 缓冲区，`Arc` 支持静态帧复用。未来 GPU 缓冲区应增加独立枚举/生命周期协议。Linux 平台层分离 X11 图像与鼠标采集、PulseAudio 音频子进程和桌面交互。X11 后端不提供应用排除、缩略预览、范围边框或托盘；这些限制在配置与界面中明确展示。仅录音不连接 X11；Wayland 录屏明确报错，不把 XWayland 截图误作整个桌面采集。
 
 macOS 的 Swift 桥接层通过 C ABI 接收配置和同步回调。屏幕采集与系统声音分别使用 SCStream，系统声音流只输出音频并采用 2×2 / 1 FPS 配置；麦克风使用 AVAudioEngine / AVAudioConverter。Rust 在回调返回前复制媒体数据。停止时关闭回调入口、停止流并排空队列，再释放 Rust 上下文，避免异步回调访问已释放指针。AppKit 菜单、区域选择及范围提示在主线程操作；会触发 GPUI 回调的窗口操作延后到下一轮主线程执行。
 
@@ -35,7 +35,7 @@ macOS 14+ 的窗口列表使用 SCScreenshotManager 快照，macOS 13 仅显示�
 
 ## 失败和发布
 
-开始失败会保留错误详情；录制中写入/编码错误保留 partial 文件。原生采集目标关闭、锁屏会走正常停止流程。恢复和普通输出均拒绝覆盖已有目标，原始恢复源保持不变。
+开始失败会保留错误详情；录制中写入/编码错误保留 partial 文件。原生采集目标关闭会走正常停止流程；Windows / macOS 另有锁屏通知，Linux 暂未实现锁屏事件订阅。恢复和普通输出均拒绝覆盖已有目标，原始恢复源保持不变。
 
 FFmpeg ABI、GPUI 版本及 Rust 依赖由固定版本与 Cargo.lock 管理。发布构建必须使用同一套 FFmpeg DLL，禁止 `--enable-nonfree`。不承诺已有本机 FFmpeg 构建与打包 DLL 可互换。
 
@@ -155,3 +155,5 @@ flowchart LR
 实施顺序：固定录制布局；会议元数据与重命名；流式协议与失败验证；对话、编辑与文件同步；凭据显示；原生界面和工作区检查。无需数据库或新网络服务。
 
 协议参考：[OpenAI SSE](https://developers.openai.com/api/docs/guides/streaming-responses)、[Claude 事件序列](https://platform.claude.com/docs/en/build-with-claude/streaming)、[Ollama Chat](https://docs.ollama.com/api/chat)。
+
+三端 Actions 和旧 glibc 打包约束见 `build-and-linux.md`。Linux 随包 FFmpeg 音频进程只输出固定 48 kHz 双声道 float PCM；每路独立、有界传递。停止时先终止并回收子进程以解除阻塞读，再 join 工作线程；设备切换仅替换改变的路线。性能统计包含所有工作线程创建的直接子进程。没有托盘时关闭主窗直接退出，不留无法恢复的隐藏窗口。

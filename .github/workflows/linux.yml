@@ -18,6 +18,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: linux-glibc228
+          cache-on-failure: true
       - name: Build pinned FFmpeg and glibc 2.28 toolchain
         run: docker build -f scripts/linux/Dockerfile -t opencap-build:glibc228 .
       - name: Format, tests, Clippy, Release and native capture checks
@@ -30,6 +31,11 @@ jobs:
             scripts/dev.sh build --release
             python3 scripts/linux/smoke.py target/release
             scripts/package.sh
+            export LD_LIBRARY_PATH="$PWD/release/OpenCap-linux-x64/usr/lib"
+            export PATH="$PWD/release/OpenCap-linux-x64/usr/bin:/usr/bin:/bin"
+            export FONTCONFIG_FILE="$PWD/release/OpenCap-linux-x64/fonts.conf"
+            unset LIBRARY_PATH PKG_CONFIG_PATH
+            python3 scripts/linux/smoke.py release/OpenCap-linux-x64/usr/bin
           '
       - name: Restore workspace cache ownership
         if: always()
@@ -49,5 +55,7 @@ jobs:
           path: |
             target/verify/linux-smoke/report.json
             target/verify/linux-smoke/*/stats.json
+            target/verify/linux-smoke/gui.log
+            target/verify/linux-smoke/gui.png
             release/OpenCap-linux-x64/elf-audit.json
           if-no-files-found: ignore

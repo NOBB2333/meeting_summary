@@ -101,6 +101,9 @@ def package(build_dir, output):
         bundle(Path(match[1]), lib_dir / name)
     for name in ("LICENSE", "THIRD_PARTY.md", "README.md"):
         shutil.copy2(ROOT / name, stage / name)
+    (stage / "build-scripts").mkdir()
+    for name in ("build-ffmpeg.sh", "package-linux.py", "linux/Dockerfile", "linux/cxx-runtime.sh"):
+        shutil.copy2(ROOT / "scripts" / name, stage / "build-scripts" / Path(name).name)
     shutil.copytree(ROOT / "LICENSES", stage / "licenses/project")
     for name, source in sorted(copied.items()):
         owner = subprocess.run(["dpkg-query", "-S", str(source)], capture_output=True, text=True)
@@ -152,7 +155,7 @@ Categories=AudioVideo;Recorder;
     (stage / "ffmpeg-buildconf.txt").write_text(run("ffmpeg", "-buildconf") + "\n")
     (stage / "runtime-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     (stage / "elf-audit.json").write_text(json.dumps(audit(stage), indent=2) + "\n")
-    (stage / "TEST-PACKAGE.txt").write_text("OpenCap Linux 测试包。解压后运行 AppRun，或安装同架构 .deb。\n支持 glibc 2.28+、X11 录屏、PulseAudio / PipeWire-Pulse 音频。\nWayland 暂仅支持音频和文稿；图形界面需要可用的 Vulkan 驱动。\n保留整个目录；不覆盖系统 glibc、图形驱动。\n正式公开发布需按 THIRD_PARTY.md 补齐所有所附库的对应源码。\n")
+    (stage / "TEST-PACKAGE.txt").write_text("OpenCap Linux 测试包。解压后运行 AppRun，或安装同架构 .deb。\n支持 glibc 2.28+、X11 录屏、PulseAudio / PipeWire-Pulse 音频。\nWayland 暂仅支持音频和文稿；图形界面需要可用的 Vulkan / OpenGL 驱动。\n保留整个目录；不覆盖系统 glibc、图形驱动。\n正式公开发布需按 THIRD_PARTY.md 补齐所有所附库的对应源码。\n")
     archive = output / f"OpenCap-linux-{arch[0]}.tar.gz"
     with tarfile.open(archive, "w:gz") as handle:
         handle.add(stage, arcname="OpenCap")
