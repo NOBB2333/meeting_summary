@@ -15,6 +15,9 @@ pub(super) struct MeetingFile {
     pub media: Option<PathBuf>,
     pub modified: std::time::SystemTime,
     complete: Option<bool>,
+    title: String,
+    preview: String,
+    details: String,
 }
 impl MeetingFile {
     fn age(&self) -> String {
@@ -31,13 +34,7 @@ impl MeetingFile {
         }
     }
     fn title(&self) -> String {
-        self.media
-            .as_ref()
-            .unwrap_or(&self.base)
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
+        self.title.clone()
     }
     fn status(&self) -> String {
         [
@@ -114,16 +111,108 @@ pub(super) fn discover(root: &Path) -> Vec<MeetingFile> {
         let media = [base.with_extension("mp4"), base.with_extension("m4a")]
             .into_iter()
             .find(|p| p.exists())
-            .or_else(|| saved.and_then(|t| t.source));
+            .or_else(|| saved.as_ref().and_then(|t| t.source.clone()));
+        let (title, preview, details) = meeting_details(&base, media.as_deref(), saved.as_ref());
         files.push(MeetingFile {
             base,
             media,
             modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
             complete,
+            title,
+            preview,
+            details,
         });
     }
     files.sort_by_key(|f| std::cmp::Reverse(f.modified));
     files
+}
+fn meeting_details(
+    base: &Path,
+    media: Option<&Path>,
+    transcript: Option<&opencap_asr::Transcript>,
+) -> (String, String, String) {
+    let summary = std::fs::metadata(base.with_extension("summary.md"))
+        .ok()
+        .filter(|m| m.len() <= 2_000_000)
+        .and_then(|_| std::fs::read_to_string(base.with_extension("summary.md")).ok())
+        .unwrap_or_default();
+    let fallback = media
+        .unwrap_or(base)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let title = opencap_asr::meeting_name(base).unwrap_or_else(|| fallback.into_owned());
+    let plain = summary
+        .lines()
+        .map(|line| line.trim().trim_start_matches('#').trim())
+        .filter(|line| !line.is_empty() && !line.starts_with("| ---"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let plain = if plain.is_empty() {
+        transcript
+            .map(|t| {
+                t.segments
+                    .iter()
+                    .filter(|s| s.finalized)
+                    .map(|s| s.text.as_str())
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    } else {
+        plain
+    };
+    let preview: String = plain.chars().take(140).collect();
+    let preview = if preview.is_empty() {
+        "尚未转录，完成后可在这里预览会议内容".into()
+    } else if plain.chars().count() > 140 {
+        format!("{preview}…")
+    } else {
+        preview
+    };
+    let report: serde_json::Value = std::fs::metadata(base.with_extension("recording.json"))
+        .ok()
+        .filter(|m| m.len() < 4_000_000)
+        .and_then(|_| std::fs::read(base.with_extension("recording.json")).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let seconds = report["stats"]["duration_seconds"]
+        .as_f64()
+        .filter(|s| s.is_finite() && *s > 0.)
+        .or_else(|| transcript.and_then(|t| t.source_duration_ms.map(|ms| ms as f64 / 1000.)));
+    let duration = seconds
+        .map(|s| {
+            format!(
+                "时长 {}",
+                task::duration_text(Duration::from_millis((s * 1000.) as u64))
+            )
+        })
+        .unwrap_or_else(|| {
+            transcript
+                .and_then(|t| t.segments.last())
+                .map(|s| {
+                    format!(
+                        "内容约 {}",
+                        task::duration_text(Duration::from_millis(s.end_ms))
+                    )
+                })
+                .unwrap_or_else(|| "时长待获取".into())
+        });
+    let size = media
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| {
+            let bytes = m.len() as f64;
+            if bytes >= 1_000_000_000. {
+                format!("{:.2} GB", bytes / 1_000_000_000.)
+            } else if bytes >= 1_000_000. {
+                format!("{:.1} MB", bytes / 1_000_000.)
+            } else {
+                format!("{:.1} KB", bytes / 1000.)
+            }
+        })
+        .unwrap_or_else(|| "原文件不在当前位置".into());
+    (title, preview, format!("{duration}  ·  {size}"))
 }
 fn card() -> Div {
     ui::card()
@@ -149,10 +238,74 @@ fn copy_export(
 }
 
 impl Recorder {
+    fn begin_rename(&mut self, base: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let title = opencap_asr::meeting_name(&base)
+            .or_else(|| {
+                self.meetings
+                    .iter()
+                    .find(|m| m.base == base)
+                    .map(|m| m.title())
+            })
+            .unwrap_or_else(|| self.transcript.title());
+        self.rename_input
+            .update(cx, |s, cx| s.set_value(title, window, cx));
+        self.rename_base = Some(base);
+        cx.notify();
+    }
+    fn rename_editor(&self, cx: &Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(gpui::component::input::Input::new(&self.rename_input).flex_1())
+            .child(
+                primary_button("save-meeting-name", "保存名称").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        if let Some(base) = this.rename_base.clone() {
+                            match opencap_asr::rename_meeting(
+                                &base,
+                                &this.rename_input.read(cx).value(),
+                            ) {
+                                Ok(()) => {
+                                    if this.transcript_output.as_ref() == Some(&base) {
+                                        this.meeting_title =
+                                            opencap_asr::meeting_name(&base).unwrap_or_default();
+                                    }
+                                    this.rename_base = None;
+                                    this.refresh_meetings();
+                                }
+                                Err(e) => this.message = format!("重命名失败：{e:#}"),
+                            }
+                            cx.notify();
+                        }
+                    },
+                )),
+            )
+            .child(
+                button("cancel-meeting-name", "取消", false)
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.rename_base = None;
+                        cx.notify();
+                    })),
+            )
+    }
     /// Save an independent document copy. Opening an existing document is a separate action.
     pub(super) fn export_document(&mut self, source: PathBuf, cx: &mut Context<Self>) {
         let folder = source.parent().unwrap_or(Path::new("."));
-        let suggested = source.file_name().unwrap_or_default().to_string_lossy();
+        let kind = if source.to_string_lossy().ends_with("summary.docx") {
+            "纪要"
+        } else if source.to_string_lossy().ends_with("notes.docx") {
+            "笔记"
+        } else {
+            "逐字稿"
+        };
+        let title = if self.meeting_title.is_empty() {
+            self.transcript.title()
+        } else {
+            self.meeting_title.clone()
+        };
+        let suggested = opencap_asr::document_filename(&title, kind);
         let prompt = cx.prompt_for_new_path(folder, Some(&suggested));
         let protected_media = self.transcript.source.clone();
         cx.spawn(async move |entity, cx| {
@@ -219,6 +372,11 @@ impl Recorder {
         if self.notes_base != self.transcript_output {
             self.persist_notes(cx);
             self.notes_base = self.transcript_output.clone();
+            self.meeting_title = self
+                .transcript_output
+                .as_deref()
+                .and_then(opencap_asr::meeting_name)
+                .unwrap_or_else(|| self.transcript.title());
             let text = self
                 .notes_base
                 .as_ref()
@@ -279,7 +437,21 @@ impl Recorder {
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
-                            .child(self.transcript.title()),
+                            .child(if self.meeting_title.is_empty() {
+                                self.transcript.title()
+                            } else {
+                                self.meeting_title.clone()
+                            }),
+                    )
+                    .child(
+                        button("rename-current-meeting", "重命名", false)
+                            .ghost()
+                            .disabled(self.active())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(base) = this.transcript_output.clone() {
+                                    this.begin_rename(base, window, cx);
+                                }
+                            })),
                     ),
             )
             .child(
@@ -361,13 +533,16 @@ impl Recorder {
                     ),
             );
         }
+        if self.rename_base.is_some() && self.rename_base == self.transcript_output {
+            header = header.child(self.rename_editor(cx));
+        }
         header
     }
-    pub(super) fn meeting_workspace(&self, width: f32, cx: &Context<Self>) -> Div {
+    pub(super) fn meeting_workspace(&self, width: f32, height: f32, cx: &Context<Self>) -> Div {
         match self.meeting_page {
             MeetingPage::Library => self.library_view(cx),
             MeetingPage::Transcript => self.transcription_view(width, cx),
-            MeetingPage::Minutes => self.minutes_view(width, cx),
+            MeetingPage::Minutes => self.minutes_view(width, height, cx),
             MeetingPage::Notes => self.notes_view(cx),
         }
     }
@@ -470,6 +645,7 @@ impl Recorder {
             );
         }
         for (i, meeting) in self.meetings.iter().enumerate().take(100) {
+            let rename_base = meeting.base.clone();
             let transcript = meeting.base.with_extension("transcript.json");
             let exists = transcript.exists();
             let media = meeting.media.clone();
@@ -520,9 +696,27 @@ impl Recorder {
                     )
                     .child(
                         div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(meeting.preview.clone()),
+                    )
+                    .child(label(meeting.details.clone()))
+                    .when(self.rename_base.as_ref() == Some(&meeting.base), |d| {
+                        d.child(self.rename_editor(cx))
+                    })
+                    .child(
+                        div()
                             .flex()
                             .flex_wrap()
                             .gap_2()
+                            .child(
+                                button(("rename-meeting", i), "重命名", false)
+                                    .ghost()
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.begin_rename(rename_base.clone(), window, cx)
+                                    })),
+                            )
                             .child(
                                 button(
                                     ("open-meeting", i),
@@ -621,7 +815,43 @@ impl Recorder {
 
 #[cfg(test)]
 mod export_tests {
-    use super::copy_export;
+    use super::{copy_export, meeting_details};
+    #[test]
+    fn meeting_preview_uses_saved_body_duration_and_actual_media_size() {
+        let dir =
+            std::env::temp_dir().join(format!("opencap-library-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("generic");
+        let media = base.with_extension("m4a");
+        std::fs::write(&media, vec![0; 2_000_000]).unwrap();
+        let transcript = opencap_asr::Transcript {
+            source_duration_ms: Some(1_200_000),
+            segments: vec![opencap_asr::Segment {
+                id: 0,
+                revision: 1,
+                start_ms: 0,
+                end_ms: 10000,
+                text: "客户反馈与下周安排。".into(),
+                finalized: true,
+            }],
+            ..Default::default()
+        };
+        let (_, preview, details) = meeting_details(&base, Some(&media), Some(&transcript));
+        assert!(preview.contains("客户反馈"));
+        assert!(details.contains("20 分"));
+        assert!(details.contains("2.0 MB"));
+        opencap_asr::rename_meeting(&base, "产品评审").unwrap();
+        std::fs::write(
+            base.with_extension("summary.md"),
+            "# 新产品主题\n\n会议议定分批发布。",
+        )
+        .unwrap();
+        let (title, preview, _) = meeting_details(&base, Some(&media), Some(&transcript));
+        assert_eq!(title, "产品评审");
+        assert!(preview.contains("分批发布"));
+        assert!(!preview.contains("客户反馈"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn exporting_keeps_the_local_document_and_refuses_to_replace_original_media() {
         let dir = std::env::temp_dir().join(format!(

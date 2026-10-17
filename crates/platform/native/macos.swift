@@ -368,6 +368,13 @@ func window(_ view: Int) -> NSWindow? {
     return true
 }
 
+@_cdecl("oc_app_icon") public func ocAppIcon(_ recording: Bool) {
+    let name = recording ? "OpenCap-recording" : "OpenCap"
+    guard let url = Bundle.main.url(forResource: name, withExtension: "icns"),
+          let image = NSImage(contentsOf: url) else { return }
+    DispatchQueue.main.async { NSApp.applicationIconImage = image }
+}
+
 final class DesktopMenu: NSObject {
     let callback: Callback
     let user: UnsafeMutableRawPointer?

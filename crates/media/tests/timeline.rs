@@ -481,6 +481,7 @@ fn audio_only_session_pauses_and_finalizes_without_screen_or_audio_devices() {
         encoder: Some("not-a-video-encoder".into()),
         ..Default::default()
     };
+    let began = Instant::now();
     let mut session = RecordingSession::start(config).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while session.stats().state == RecordingState::Starting && Instant::now() < deadline {
@@ -501,17 +502,37 @@ fn audio_only_session_pauses_and_finalizes_without_screen_or_audio_devices() {
     assert_eq!(session.stats().state, RecordingState::Paused);
     std::thread::sleep(Duration::from_millis(300));
     session.command(RecordingCommand::Resume);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while session.stats().state == RecordingState::Paused && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(session.stats().state, RecordingState::Recording);
     std::thread::sleep(Duration::from_millis(100));
     session.command(RecordingCommand::Stop);
     session.join();
     let stats = session.stats();
     assert_eq!(stats.state, RecordingState::Finished, "{stats:?}");
-    assert!((0.15..0.45).contains(&stats.duration_seconds), "{stats:?}");
+    // Hosted runners can deschedule either thread for hundreds of milliseconds.
+    // Precise pause subtraction is covered by the deterministic core clock tests;
+    // this test validates the actual device-free session and encoded timeline.
+    assert!(
+        stats.duration_seconds >= 0.15
+            && stats.duration_seconds <= began.elapsed().as_secs_f64() + 0.1,
+        "{stats:?}"
+    );
     assert_eq!(stats.encoded_frames, 0);
     assert_eq!(stats.encoder, "aac");
     assert!(session.take_preview().is_none());
     let output = stats.output.unwrap();
     assert_eq!(output.extension().unwrap(), "m4a");
+    let duration = opencap_media::inspect_output(&output).unwrap()["duration_seconds"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (duration - stats.duration_seconds).abs() < 0.1,
+        "media={duration}, session={}",
+        stats.duration_seconds
+    );
     assert_ne!(output.parent().unwrap(), dir.as_path());
     assert_eq!(output.parent().unwrap().parent(), Some(dir.as_path()));
     assert!(output.with_extension("recording.json").exists());

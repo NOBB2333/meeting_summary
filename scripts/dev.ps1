@@ -23,6 +23,11 @@ $arguments = switch ($Task) {
 }
 if ($Release) { $arguments += '--release' }
 $arguments += '--locked'
+# PowerShell consumes a literal -- while binding a script's remaining arguments.
+# Restore the rustc/Clippy separator when the remainder starts with lint flags.
+if ($Task -eq 'lint' -and $ExtraArgs -and $ExtraArgs[0] -match '^(-[DAWF]|--(deny|allow|warn|forbid))') {
+    $ExtraArgs = @('--') + $ExtraArgs
+}
 if ($Task -in @('run','bench') -and $ExtraArgs) { $arguments += '--' }
 & cargo @arguments @ExtraArgs
 $buildExitCode = $LASTEXITCODE

@@ -1,8 +1,13 @@
 name: Windows
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,3 +37,12 @@ jobs:
       - name: Lint
         shell: pwsh
         run: ./scripts/dev.ps1 lint -- -D warnings
+      - name: Package and verify portable runtime
+        shell: pwsh
+        run: ./scripts/package.ps1 -Release -LocalPreview
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCap-windows-x64
+          path: release/OpenCap-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

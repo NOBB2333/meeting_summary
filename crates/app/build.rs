@@ -18,6 +18,7 @@ const PNG_FROM: u32 = 128;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    generate_bundle_icons();
     if let Ok(dir) = std::env::var("DEP_OPENCAP_NATIVE_LIB_DIR") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
@@ -57,6 +58,53 @@ fn main() {
         embed_resource::compile(&rc_path, embed_resource::NONE)
             .manifest_optional()
             .unwrap();
+    }
+}
+
+/// Package assets are generated from the same authored images as Windows.
+/// ICNS containers use PNG representations; no platform image tool is required.
+fn generate_bundle_icons() {
+    use image::ImageEncoder;
+    use std::path::PathBuf;
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let assets = out.ancestors().nth(3).unwrap().join("opencap-assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    for (source, name) in [
+        ("opencap-idle.jpg", "OpenCap"),
+        ("opencap-recording.jpg", "OpenCap-recording"),
+    ] {
+        let path = manifest.join("resources").join(source);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let image = image::open(&path).unwrap();
+        let mut entries = Vec::new();
+        for (tag, size) in [
+            (b"icp4", 16),
+            (b"icp5", 32),
+            (b"icp6", 64),
+            (b"ic07", 128),
+            (b"ic08", 256),
+            (b"ic09", 512),
+            (b"ic10", 1024),
+        ] {
+            let rgba = image
+                .resize_to_fill(size, size, image::imageops::FilterType::Lanczos3)
+                .to_rgba8();
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(rgba.as_raw(), size, size, image::ExtendedColorType::Rgba8)
+                .unwrap();
+            if size == 512 {
+                std::fs::write(assets.join(format!("{name}.png")), &png).unwrap();
+            }
+            entries.extend_from_slice(tag);
+            entries.extend_from_slice(&((png.len() + 8) as u32).to_be_bytes());
+            entries.extend_from_slice(&png);
+        }
+        let mut icns = b"icns".to_vec();
+        icns.extend_from_slice(&((entries.len() + 8) as u32).to_be_bytes());
+        icns.extend_from_slice(&entries);
+        std::fs::write(assets.join(format!("{name}.icns")), icns).unwrap();
     }
 }
 

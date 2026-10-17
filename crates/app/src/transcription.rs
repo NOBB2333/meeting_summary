@@ -21,6 +21,7 @@ impl Recorder {
         self.asr.as_ref().is_some_and(|a| !a.finished())
             || self.preparing_model.is_some()
             || self.summary_task.is_some()
+            || self.ai.document_task.is_some()
             || self.ai.credentials_busy
             || self.speaker_task.is_some()
     }
@@ -290,6 +291,16 @@ impl Recorder {
             self.start_file_transcription(source, false, true);
             changed = true;
         }
+        if let Some(rx) = &self.ai.events {
+            for event in rx.try_iter() {
+                match event {
+                    opencap_asr::MinutesEvent::Status(status) => self.ai.status = status,
+                    opencap_asr::MinutesEvent::Delta(text) => self.ai.stream.push_str(&text),
+                }
+                self.ai.chat_dirty = true;
+                changed = true;
+            }
+        }
         if let Some(result) = self
             .summary_task
             .as_ref()
@@ -303,12 +314,17 @@ impl Recorder {
         {
             self.summary_task = None;
             self.ai_clock.finish();
-            self.ai.progress = None;
+            self.ai.events = None;
+            self.ai.chat_dirty = true;
             changed = true;
             match result {
                 Ok(history) => {
                     self.summary_text = history.latest().to_string();
                     self.ai.history = history;
+                    self.ai.stream.clear();
+                    self.ai.pending_request.clear();
+                    self.ai.clear_composer = true;
+                    self.ai.editor_sync = true;
                     self.remember_meeting();
                     self.ai.status = "AI 结果已保存，可继续提问或修改；旧版本保留".into();
                 }
