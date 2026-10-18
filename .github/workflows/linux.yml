@@ -1,6 +1,7 @@
 name: Linux (UOS compatible)
 on:
   push:
+    branches: ['**']
   pull_request:
   workflow_dispatch:
     inputs:

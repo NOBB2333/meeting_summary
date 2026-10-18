@@ -739,10 +739,10 @@ impl Recorder {
             .child(div().flex().flex_wrap().gap_2()
                 .child(button("live-asr-toggle", if self.config.realtime_transcription { "实时转录：开启" } else { "实时转录：关闭" }, self.config.realtime_transcription).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.realtime_transcription = !this.config.realtime_transcription; this.save(); cx.notify(); })))
                 .child(button("context-revision", if self.config.transcription_context_revision { "断句校正：开启" } else { "断句校正：关闭" }, self.config.transcription_context_revision).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_context_revision = !this.config.transcription_context_revision; this.save(); cx.notify(); })))
-                .child(button("download-asr", if ready { "流式模型已就绪" } else { "下载流式 / 校正模型" }, false).disabled(busy || ready).on_click(cx.listener(|this,_,_,cx| { this.prepare_streaming_model(); cx.notify(); }))))
+                .child(button("download-asr", if ready { "流式模型已就绪" } else if !streaming { "下载流式模型 · 边说边显示" } else { "下载整句校正模型" }, false).disabled(busy || ready).on_click(cx.listener(|this,_,_,cx| { this.prepare_streaming_model(); cx.notify(); }))))
             .child(label(plan.map(|p| p.description()).unwrap_or("尚未安装语音模型")))
             .child(label(format!("流式模型：{} · 文件转录模型：{}", if streaming { "已安装" } else { "未安装" }, if offline { "已安装，可逐句实时识别" } else { "未安装" })))
-            .child(label("录制时只在断句后校正，关闭可降低 CPU 和内存。仅文件模型时停顿后显示文字，最长约 15 秒断句。"))
+            .child(label("流式模型会边说边出字并更新当前句；整句校正在独立队列运行。关闭校正可降低 CPU 和内存；校正积压或连续发言超过 30 秒时保留流式原文。仅文件模型时停顿后显示，不能逐字更新。"))
             .child(div().flex().flex_wrap().gap_2().child(Input::new(&self.hotwords_input).flex_1()).child(primary_button("apply-hotwords", "保存术语").disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_hotwords=this.hotwords_input.read(cx).value().to_string(); this.save(); cx.notify(); }))))
             .child(button("stream-file-demo", "试播文件，观察实时修正", false).ghost().disabled(busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(true,cx))))
     }

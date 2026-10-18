@@ -4726,7 +4726,7 @@ dependencies = [
 
 [[package]]
 name = "opencap"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -4745,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "opencap-asr"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -4765,7 +4765,7 @@ dependencies = [
 
 [[package]]
 name = "opencap-bench"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4780,7 +4780,7 @@ dependencies = [
 
 [[package]]
 name = "opencap-core"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -4792,7 +4792,7 @@ dependencies = [
 
 [[package]]
 name = "opencap-media"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4808,7 +4808,7 @@ dependencies = [
 
 [[package]]
 name = "opencap-platform"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -4827,7 +4827,7 @@ dependencies = [
 
 [[package]]
 name = "opencap-policy"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "opencap-core",
 ]

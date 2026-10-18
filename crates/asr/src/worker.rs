@@ -2,6 +2,7 @@ use crate::{
     ModelKind, Segment, Transcript,
     audio::{Normalizer, decode_file},
     prepare,
+    revision::{MAX_REVISION_SAMPLES, Reviser},
 };
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -170,15 +171,16 @@ impl AsrSession {
                             &kind.path(&root),
                             &hotwords,
                             revision.as_deref(),
-                            source.is_some(),
+                            worker_cancelled.clone(),
+                            &tx,
                         )?;
                         let _ = tx.send(AsrEvent::Status(
                             if source.is_some() {
                                 "文件识别已就绪 · 正在处理音频"
                             } else if kind == ModelKind::Offline {
-                                "逐句实时识别已就绪 · 复用文件模型，停顿后显示文字"
+                                "逐句模式已就绪 · 停顿后出字；流式模型支持边说边显示"
                             } else {
-                                "流式识别已就绪 · 当前句可修正"
+                                "流式识别已就绪 · 边说边显示，当前句可修正"
                             }
                             .into(),
                         ));
@@ -194,9 +196,11 @@ impl AsrSession {
                         let mut last_checkpoint = Instant::now();
                         let mut checkpoint_dirty = false;
                         let read_result = {
-                            let mut consume = |audio: PcmAudio,
+                            let mut consume = |audio: Option<PcmAudio>,
                                                duration: Option<f64>|
                              -> Result<()> {
+                                engine.poll_corrections(&mut transcript, &tx);
+                                let Some(audio) = audio else { return Ok(()) };
                                 if let Some(seconds) = duration.filter(|s| s.is_finite() && *s > 0.)
                                 {
                                     transcript.source_duration_ms = Some((seconds * 1000.) as u64);
@@ -221,6 +225,10 @@ impl AsrSession {
                                 if let Some(expected) = expected_us
                                     && audio.pts_us > expected + 200_000
                                 {
+                                    // Drain the resampling filter before closing the old
+                                    // timeline; resetting first silently drops its tail.
+                                    let tail = normalizer.flush()?;
+                                    engine.feed(&tail, expected / 1000, &mut transcript, &tx)?;
                                     engine.boundary(&mut transcript, &tx)?;
                                     let gap = (
                                         expected.max(0) as u64 / 1000,
@@ -275,18 +283,21 @@ impl AsrSession {
                                 Ok(())
                             };
                             if let Some(source) = &source {
-                                decode_file(source, &mut consume)
+                                decode_file(source, |audio, duration| {
+                                    consume(Some(audio), duration)
+                                })
                             } else {
                                 let mut result = Ok(());
                                 loop {
                                     match rx.recv_timeout(Duration::from_millis(100)) {
                                         Ok(audio) => {
-                                            if let Err(e) = consume(audio, None) {
+                                            if let Err(e) = consume(Some(audio), None) {
                                                 result = Err(e);
                                                 break;
                                             }
                                         }
                                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                            consume(None, None)?;
                                             if worker_cancelled.load(Ordering::Relaxed) {
                                                 break;
                                             }
@@ -307,6 +318,7 @@ impl AsrSession {
                             &tx,
                         )?;
                         engine.boundary(&mut transcript, &tx)?;
+                        engine.finish_corrections(&mut transcript, &tx);
                         transcript.cancelled = worker_cancelled.load(Ordering::Relaxed);
                         let last_ms = expected_us.unwrap_or(0).max(0) as u64 / 1000;
                         let wanted = worker_end.load(Ordering::Relaxed);
@@ -370,7 +382,7 @@ impl AsrSession {
         self.worker.is_finished()
     }
 }
-fn sense_voice(dir: &Path) -> Result<OfflineRecognizer> {
+pub(crate) fn sense_voice(dir: &Path) -> Result<OfflineRecognizer> {
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
         model: Some(dir.join("model.int8.onnx").to_string_lossy().into_owned()),
@@ -399,11 +411,8 @@ enum Engine {
         previous: String,
         end: u64,
         committed: bool,
-        correction: Option<OfflineRecognizer>,
-        utterance_audio: Vec<f32>,
-        last_correction: usize,
-        partial_revision: bool,
-        corrected_prefix: Option<(String, String)>,
+        correction: Option<Reviser>,
+        utterance_audio: Option<Vec<f32>>,
     },
     Offline {
         recognizer: OfflineRecognizer,
@@ -420,7 +429,8 @@ impl Engine {
         dir: &Path,
         hotwords: &str,
         revision_dir: Option<&Path>,
-        partial_revision: bool,
+        cancelled: Arc<AtomicBool>,
+        events: &Sender<AsrEvent>,
     ) -> Result<Self> {
         let file = |name: &str| Some(dir.join(name).to_string_lossy().into_owned());
         match kind {
@@ -431,7 +441,9 @@ impl Engine {
                     enable_endpoint: true,
                     rule1_min_trailing_silence: 2.4,
                     rule2_min_trailing_silence: 0.8,
-                    rule3_min_utterance_length: 20.0,
+                    // A clock boundary can land in the middle of a word. Keep
+                    // encoder/decoder context until real trailing silence or EOF.
+                    rule3_min_utterance_length: f32::MAX,
                     ..Default::default()
                 };
                 config.model_config.transducer = OnlineTransducerModelConfig {
@@ -475,11 +487,10 @@ impl Engine {
                     previous: String::new(),
                     end: 0,
                     committed: false,
-                    correction: revision_dir.map(sense_voice).transpose()?,
-                    utterance_audio: Vec::new(),
-                    last_correction: 0,
-                    partial_revision,
-                    corrected_prefix: None,
+                    correction: revision_dir
+                        .map(|dir| Reviser::new(dir.to_path_buf(), cancelled, events.clone()))
+                        .transpose()?,
+                    utterance_audio: revision_dir.map(|_| Vec::new()),
                 })
             }
             ModelKind::Offline => {
@@ -527,6 +538,7 @@ impl Engine {
         t: &mut Transcript,
         tx: &Sender<AsrEvent>,
     ) -> Result<()> {
+        self.poll_corrections(t, tx);
         if samples.is_empty() {
             return Ok(());
         }
@@ -541,7 +553,15 @@ impl Engine {
                 origin.get_or_insert(pts_ms.max(0) as u64);
                 *end = pts_ms.max(0) as u64 + samples.len() as u64 * 1000 / 16000;
                 stream.accept_waveform(16000, samples);
-                utterance_audio.extend_from_slice(samples);
+                if let Some(audio) = utterance_audio {
+                    if audio.len() + samples.len() <= MAX_REVISION_SAMPLES {
+                        audio.extend_from_slice(samples);
+                    } else {
+                        // Keep all native streaming words on long uninterrupted
+                        // speech; only the optional second pass is bounded.
+                        *utterance_audio = None;
+                    }
+                }
             }
             Self::Offline {
                 vad, origin, end, ..
@@ -571,9 +591,6 @@ impl Engine {
                 committed,
                 correction,
                 utterance_audio,
-                last_correction,
-                partial_revision,
-                corrected_prefix,
             } => {
                 while recognizer.is_ready(stream) {
                     recognizer.decode(stream);
@@ -582,44 +599,7 @@ impl Engine {
                 let result = recognizer
                     .get_result(stream)
                     .context("流式识别没有返回结果")?;
-                let native_text = result.text.trim().to_owned();
-                let mut text = if let Some((old, fixed)) = corrected_prefix.as_ref() {
-                    native_text
-                        .strip_prefix(old)
-                        .map(|suffix| format!("{fixed}{suffix}"))
-                        .unwrap_or_else(|| native_text.clone())
-                } else {
-                    native_text.clone()
-                };
-                // Live recording corrects only at endpoints, avoiding repeated 5/10/15/20s
-                // offline decodes of the same audio. File playback may revise partials.
-                // Streaming hypotheses remain immediate in either mode.
-                if let Some(correction) = correction
-                    && !native_text.is_empty()
-                    && !utterance_audio.is_empty()
-                    && (final_now
-                        || (*partial_revision
-                            && utterance_audio.len().saturating_sub(*last_correction) >= 5 * 16000))
-                {
-                    let correction_stream = correction.create_stream();
-                    correction_stream.accept_waveform(16000, utterance_audio);
-                    correction.decode(&correction_stream);
-                    let fixed = correction_stream
-                        .get_result()
-                        .context("上下文校正没有返回结果")?
-                        .text
-                        .trim()
-                        .to_owned();
-                    if !fixed.is_empty() {
-                        text = if final_now {
-                            fixed
-                        } else {
-                            bounded_revision(&native_text, &fixed)
-                        };
-                        *corrected_prefix = Some((native_text, text.clone()));
-                    }
-                    *last_correction = utterance_audio.len();
-                }
+                let text = result.text.trim().to_owned();
                 if !text.is_empty() && (text != *previous || final_now) {
                     *revision += 1;
                     let base = origin.unwrap_or(0)
@@ -637,14 +617,28 @@ impl Engine {
                         .and_then(|ts| ts.last())
                         .map(|v| base + ((*v).max(0.0) * 1000.0) as u64 + 100)
                         .unwrap_or(*end);
-                    let segment = Segment {
+                    let mut segment = Segment {
                         id: *id,
                         revision: *revision,
                         start_ms: start.min(*end),
                         end_ms: last.min(*end).max(start.min(*end)),
                         text: text.clone(),
                         finalized: final_now,
+                        correcting: false,
                     };
+                    if final_now
+                        && let Some(correction) = correction
+                        && let Some(audio) = utterance_audio.take().filter(|a| !a.is_empty())
+                    {
+                        segment.correcting = true;
+                        segment.finalized = false;
+                        if !correction.submit(&segment, audio) {
+                            // Queue full: confirm native text immediately. Audio
+                            // ingestion and the next sentence never wait on revision.
+                            segment.correcting = false;
+                            segment.finalized = true;
+                        }
+                    }
                     t.apply(segment.clone());
                     let _ = tx.send(AsrEvent::Segment(segment));
                     *previous = text;
@@ -657,9 +651,7 @@ impl Engine {
                     *id += 1;
                     *revision = 0;
                     previous.clear();
-                    utterance_audio.clear();
-                    *last_correction = 0;
-                    *corrected_prefix = None;
+                    *utterance_audio = correction.as_ref().map(|_| Vec::new());
                 }
             }
             Self::Offline {
@@ -686,6 +678,7 @@ impl Engine {
                             end_ms: stop.max(start),
                             text,
                             finalized: true,
+                            correcting: false,
                         };
                         t.apply(segment.clone());
                         let _ = tx.send(AsrEvent::Segment(segment));
@@ -731,38 +724,149 @@ impl Engine {
         };
         std::mem::take(value)
     }
-}
-fn bounded_revision(native: &str, corrected: &str) -> String {
-    // Offline decoders can anticipate the next word. Keep the provisional
-    // replacement within the streaming hypothesis length, so its next delta
-    // doesn't append that anticipated word a second time. Finals stay verbatim.
-    corrected
-        .chars()
-        .filter(|c| {
-            !c.is_whitespace() && !matches!(c, '，' | '。' | '！' | '？' | '；' | '、' | '：')
-        })
-        .take(native.chars().count())
-        .collect()
-}
-#[cfg(test)]
-mod revision_tests {
-    use super::*;
-    #[test]
-    fn corrected_context_does_not_preappend_future_streaming_words() {
-        assert_eq!(
-            bounded_revision("公司的陆平我们决定", "公司的录屏，我们决定先完成。"),
-            "公司的录屏我们决定"
-        );
-        assert_eq!(
-            bounded_revision("预算是两万元", "预算是2万元。"),
-            "预算是2万元"
-        );
+    fn poll_corrections(&mut self, t: &mut Transcript, tx: &Sender<AsrEvent>) {
+        if let Self::Online {
+            correction: Some(correction),
+            committed,
+            ..
+        } = self
+        {
+            *committed |= correction.poll(t, tx);
+        }
+    }
+    fn finish_corrections(&mut self, t: &mut Transcript, tx: &Sender<AsrEvent>) {
+        if let Self::Online {
+            correction: Some(correction),
+            ..
+        } = self
+        {
+            correction.finish(t, tx);
+        }
     }
 }
 
 #[cfg(test)]
 mod live_integration_tests {
     use super::*;
+    #[test]
+    #[ignore = "requires installed models and a 20–30s continuous synthetic OPENCAP_LIVE_TEST_AUDIO"]
+    fn streaming_updates_while_speaking_and_preserves_context_past_twenty_seconds() {
+        let input = PathBuf::from(std::env::var_os("OPENCAP_LIVE_TEST_AUDIO").unwrap());
+        let root = crate::model_root();
+        assert!(ModelKind::Streaming.ready(&root) && ModelKind::Offline.ready(&root));
+        let mut samples = Vec::new();
+        decode_file(&input, |audio, _| {
+            samples.extend(audio.samples);
+            Ok(())
+        })
+        .unwrap();
+        assert!((21 * 16000..30 * 16000).contains(&samples.len()));
+        let end_ms = samples.len() as u64 * 1000 / 16000;
+        let mut session = AsrSession::live_with_plan(
+            root,
+            String::new(),
+            crate::LiveModelPlan {
+                kind: ModelKind::Streaming,
+                context_revision: true,
+            },
+        )
+        .unwrap();
+        // Exclude model loading from steady-state speech latency.
+        loop {
+            match session
+                .events
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+            {
+                AsrEvent::Status(s) if s.starts_with("流式识别已就绪") => break,
+                AsrEvent::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        let sender = session.audio_sender();
+        let began = Instant::now();
+        let producer = thread::spawn(move || {
+            for (i, chunk) in samples.chunks(1600).enumerate() {
+                let deadline = began + Duration::from_millis(i as u64 * 100);
+                thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                sender
+                    .send(PcmAudio {
+                        pts_us: i as i64 * 100_000,
+                        sample_rate: 16000,
+                        channels: 1,
+                        samples: chunk.to_vec(),
+                    })
+                    .unwrap();
+            }
+        });
+        let mut first_partial = None;
+        let mut revisions = 0;
+        let mut past_twenty = false;
+        let mut pending_correction = false;
+        let mut visible = Transcript::default();
+        // Keep input open throughout speech; finalization happens only afterwards.
+        while began.elapsed() < Duration::from_millis(end_ms + 500) {
+            match session.events.recv_timeout(Duration::from_millis(100)) {
+                Ok(AsrEvent::Segment(s)) => {
+                    assert_eq!(
+                        s.id, 0,
+                        "continuous speech was cut at a clock boundary: {s:?}"
+                    );
+                    if !s.finalized && !s.correcting {
+                        first_partial.get_or_insert(began.elapsed());
+                        revisions += 1;
+                        past_twenty |= s.end_ms > 20_000;
+                    }
+                    pending_correction |= s.correcting;
+                    visible.apply(s);
+                }
+                Ok(AsrEvent::Error(e)) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        producer.join().unwrap();
+        assert!(
+            first_partial.is_some_and(|d| d < Duration::from_secs(4)),
+            "first partial: {first_partial:?}"
+        );
+        assert!(
+            revisions > 10 && past_twenty,
+            "revisions={revisions}, past20={past_twenty}"
+        );
+        let native = visible.segments[0].text.clone();
+        assert!(
+            native.contains("预算") && native.contains("万元"),
+            "boundary words missing: {native}"
+        );
+        session.finish_at(end_ms);
+        loop {
+            match session
+                .events
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+            {
+                AsrEvent::Segment(s) => {
+                    pending_correction |= s.correcting;
+                    visible.apply(s);
+                }
+                AsrEvent::Finished(t) => {
+                    assert!(pending_correction);
+                    assert!(t.complete && t.gaps.is_empty());
+                    assert!(t.segments.iter().all(|s| s.finalized && !s.correcting));
+                    assert_eq!(visible.segments, t.segments);
+                    assert_eq!(t.segments.len(), 1);
+                    eprintln!(
+                        "first_partial_ms={} partial_revisions={revisions} native={native} final={}",
+                        first_partial.unwrap().as_millis(),
+                        t.text()
+                    );
+                    break;
+                }
+                AsrEvent::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+    }
     #[test]
     #[ignore = "requires already installed local models and OPENCAP_LIVE_TEST_AUDIO (synthetic speech)"]
     fn installed_models_emit_live_segments_before_input_closes() {

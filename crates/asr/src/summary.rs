@@ -808,6 +808,7 @@ mod tests {
                 end_ms: 1000,
                 text: "不能上线，预算未定。".into(),
                 finalized: true,
+                correcting: false,
             }],
             ..Default::default()
         };
@@ -921,6 +922,7 @@ mod tests {
                     end_ms: (i + 1) * 1000,
                     text: "会议讨论内容".repeat(150),
                     finalized: true,
+                    correcting: false,
                 })
                 .collect(),
             speaker_turns: vec![crate::SpeakerTurn {
@@ -1059,6 +1061,7 @@ mod tests {
                 end_ms: 2000,
                 text: "预算未定。".into(),
                 finalized: true,
+                correcting: false,
             }],
             speaker_turns: vec![
                 crate::SpeakerTurn {
@@ -1154,6 +1157,7 @@ mod tests {
                     end_ms: 4000,
                     text: "本周不能上线，预算两万元，负责人未确定。".into(),
                     finalized: true,
+                    correcting: false,
                 }],
                 ..Default::default()
             };

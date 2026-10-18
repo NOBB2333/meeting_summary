@@ -186,7 +186,7 @@ impl Recorder {
                         }
                     })),
             )
-            .child(label("OpenCap 0.1.0").px_3())
+            .child(label(concat!("OpenCap ", env!("CARGO_PKG_VERSION"))).px_3())
     }
 
     fn recording_status(&self) -> &'static str {

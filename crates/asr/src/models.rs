@@ -84,9 +84,9 @@ impl LiveModelPlan {
     }
     pub fn description(self) -> &'static str {
         match (self.kind, self.context_revision) {
-            (ModelKind::Offline, _) => "逐句实时文字 · 复用文件转录模型，停顿后出字",
-            (ModelKind::Streaming, true) => "流式实时文字 · 断句后校正",
-            (ModelKind::Streaming, false) => "流式实时文字 · 无二次校正",
+            (ModelKind::Offline, _) => "逐句模式 · 停顿后出字；下载流式模型可边说边显示",
+            (ModelKind::Streaming, true) => "流式模式 · 边说边显示，停顿后后台校正",
+            (ModelKind::Streaming, false) => "流式模式 · 边说边显示，当前句持续更新",
         }
     }
 }

@@ -12,6 +12,7 @@ struct Row {
     metadata: SharedString,
     text: SharedString,
     finalized: bool,
+    correcting: bool,
 }
 impl Row {
     fn matches(&self, segment: &Segment) -> bool {
@@ -20,6 +21,7 @@ impl Row {
             && self.start_ms == segment.start_ms
             && self.end_ms == segment.end_ms
             && self.finalized == segment.finalized
+            && self.correcting == segment.correcting
             && self.text.as_ref() == segment.text
     }
     fn new(segment: &Segment, transcript: &Transcript) -> Self {
@@ -39,6 +41,8 @@ impl Row {
                 opencap_asr::timestamp(segment.start_ms, '.'),
                 if segment.finalized {
                     "已确认"
+                } else if segment.correcting {
+                    "整句校正中 · 下一句继续识别"
                 } else {
                     "识别中 · 后续语音可修正"
                 }
@@ -46,6 +50,7 @@ impl Row {
             .into(),
             text: segment.text.clone().into(),
             finalized: segment.finalized,
+            correcting: segment.correcting,
         }
     }
 }
@@ -218,6 +223,29 @@ mod tests {
     use super::TranscriptView;
     use gpui::{ListOffset, px};
     use opencap_asr::{Segment, Transcript};
+    #[test]
+    fn background_sentence_correction_replaces_its_row_while_next_sentence_stays_visible() {
+        let mut transcript = live_transcript(2);
+        transcript.segments[0].finalized = false;
+        transcript.segments[0].correcting = true;
+        transcript.segments[1].finalized = false;
+        let mut view = TranscriptView::new();
+        view.update_rows(&transcript, true);
+        assert!(view.rows[0].metadata.contains("整句校正中"));
+        assert!(view.rows[1].metadata.contains("识别中"));
+        let second = view.rows[1].clone();
+        let mut corrected = transcript.segments[0].clone();
+        corrected.revision += 1;
+        corrected.finalized = true;
+        corrected.correcting = false;
+        corrected.text = "后台校正后的完整句子".into();
+        assert!(transcript.apply(corrected));
+        view.update_rows(&transcript, false);
+        assert_eq!(view.rows.len(), 2);
+        assert_eq!(view.rows[0].text.as_ref(), "后台校正后的完整句子");
+        assert!(view.rows[0].metadata.contains("已确认"));
+        assert!(std::rc::Rc::ptr_eq(&second, &view.rows[1]));
+    }
     fn live_transcript(count: u64) -> Transcript {
         Transcript {
             segments: (0..count)
@@ -228,6 +256,7 @@ mod tests {
                     end_ms: id * 1000 + 900,
                     text: format!("第 {id} 段会议内容"),
                     finalized: true,
+                    correcting: false,
                 })
                 .collect(),
             ..Default::default()
@@ -257,6 +286,7 @@ mod tests {
             end_ms: 5_000_500,
             text: "正在说的新内容".into(),
             finalized: false,
+            correcting: false,
         });
         view.update_rows(&transcript, false);
         assert_eq!(view.state.item_count(), 5001);

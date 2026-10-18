@@ -56,6 +56,8 @@ def audit(directory):
 
 
 def package(build_dir, output):
+    metadata = json.loads(run("cargo", "metadata", "--no-deps", "--format-version", "1", "--locked", cwd=ROOT))
+    package_version = next(package["version"] for package in metadata["packages"] if package["name"] == "opencap")
     arch = {"x86_64": ("x64", "amd64"), "aarch64": ("arm64", "arm64")}.get(platform.machine())
     if arch is None:
         raise RuntimeError(f"Unsupported package architecture: {platform.machine()}")
@@ -167,7 +169,7 @@ Categories=AudioVideo;Recorder;
     shutil.copy2(stage / "OpenCap.desktop", desktop / "OpenCap.desktop")
     control = deb / "DEBIAN"
     control.mkdir()
-    (control / "control").write_text(f"Package: opencap\nVersion: 0.1.0\nArchitecture: {arch[1]}\nMaintainer: OpenCap contributors\nDepends: libc6 (>= 2.28), libvulkan1, xdg-utils\nSection: video\nPriority: optional\nDescription: Native screen recording and meeting notes\n")
+    (control / "control").write_text(f"Package: opencap\nVersion: {package_version}\nArchitecture: {arch[1]}\nMaintainer: OpenCap contributors\nDepends: libc6 (>= 2.28), libvulkan1, xdg-utils\nSection: video\nPriority: optional\nDescription: Native screen recording and meeting notes\n")
     subprocess.run(["dpkg-deb", "--build", "--root-owner-group", str(deb), str(output / f"OpenCap-linux-{arch[0]}.deb")], check=True)
     shutil.rmtree(deb)
     destination = output / f"OpenCap-linux-{arch[0]}"

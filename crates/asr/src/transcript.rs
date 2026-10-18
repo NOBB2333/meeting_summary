@@ -10,6 +10,9 @@ pub struct Segment {
     pub end_ms: u64,
     pub text: String,
     pub finalized: bool,
+    /// Endpoint reached; the independent sentence decoder may still replace it.
+    #[serde(default)]
+    pub correcting: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Transcript {
@@ -286,6 +289,7 @@ mod tests {
             end_ms: 2400,
             text: text.into(),
             finalized,
+            correcting: false,
         }
     }
     #[test]
@@ -305,6 +309,15 @@ mod tests {
         t.apply(s(1, "可能上线", false));
         assert!(t.text().is_empty());
         assert_eq!(timestamp(3_661_007, ','), "01:01:01,007");
+    }
+    #[test]
+    fn existing_transcripts_load_without_a_correction_state() {
+        let legacy = r#"{"id":1,"revision":2,"start_ms":0,"end_ms":1000,"text":"历史原文","finalized":true}"#;
+        let segment: Segment = serde_json::from_str(legacy).unwrap();
+        assert!(segment.finalized && !segment.correcting);
+        let mut transcript = Transcript::default();
+        transcript.apply(segment);
+        assert_eq!(transcript.text(), "历史原文");
     }
     #[test]
     fn brief_interruption_is_marked_ambiguous_inside_a_long_sentence() {

@@ -4,6 +4,7 @@ mod document;
 mod meeting;
 mod minutes_format;
 mod models;
+mod revision;
 mod summary;
 mod summary_stream;
 mod transcript;
