@@ -1,0 +1,42 @@
+name: Release
+run-name: OpenCap ${{ github.ref_name }}
+on:
+  push:
+    tags: ['v[0-9]*']
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    name: Windows
+    uses: ./.github/workflows/windows.yml
+  macos:
+    name: macOS
+    uses: ./.github/workflows/macos.yml
+  linux:
+    name: Linux
+    uses: ./.github/workflows/linux.yml
+  publish:
+    name: Publish ${{ github.ref_name }}
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Download packages from this run
+        run: gh run download "$GITHUB_RUN_ID" --dir target/release-artifacts
+      - name: Verify packages, versions and runtime evidence
+        env:
+          BUILD_RESULTS: ${{ toJSON(needs) }}
+        run: python3 scripts/release.py prepare --tag "$RELEASE_TAG" --artifacts target/release-artifacts --output target/release-assets
+      - name: Upload verified packages and publish release
+        run: python3 scripts/release.py publish --tag "$RELEASE_TAG" --output target/release-assets

@@ -5,3 +5,4 @@
 *.partial.mp4
 *.recording.json
 .DS_Store
+__pycache__/

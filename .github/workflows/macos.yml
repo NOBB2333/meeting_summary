@@ -1,9 +1,6 @@
 name: macOS
 on:
-  push:
-    branches: ['**']
-  pull_request:
-  workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
 concurrency:
@@ -22,6 +19,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Check release version
+        run: python3 scripts/release.py check-version --tag "$GITHUB_REF_NAME"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1

@@ -323,7 +323,11 @@ macOS 的 `scripts/dev.sh` 默认构建 Debug 原生应用包并打开 `release/
 
 Linux 首先支持 Intel / x86_64 的统信 UOS：X11 显示器、窗口和区域录制，PulseAudio 或 PipeWire-Pulse 的系统声与麦克风，以及仅录音、暂停恢复和文稿功能。Wayland 暂仅支持音频和文稿。X11 不支持排除本应用，暂不提供窗口缩略预览、录制边框或托盘；关闭主窗会退出，快捷键与悬浮控制仍可用；Linux 暂未实现锁屏自动停止，请先停止录制再锁屏。窗口最小化或关闭时结束采集并保存，窗口内容被遮挡时建议改录完整屏幕。
 
-Actions 提供 Windows x64、Mac Apple Silicon / Intel 和 Linux x64 测试包。Linux 在 Debian 10 / glibc 2.28 基线上构建，私有捆绑 FFmpeg、C++、字体等依赖并审计 ELF 符号版本，不替换系统 glibc 或显卡驱动。图形界面使用宿主 Vulkan / OpenGL 驱动；Linux 当前提供软件 H.264 / AAC 路径，UOS 实机性能仍需按设备验证。
+普通提交、分支推送和 PR 不触发云端构建；提交前在本地运行 `scripts/dev.sh test`、`scripts/dev.sh lint -- -D warnings`（Windows 使用 `dev.ps1`）。需要发布时，同步 `Cargo.toml`、`Cargo.lock`、macOS `Info.plist` 的版本，补充 `docs/releases/<标签>.md`，运行 `python3 scripts/release.py check-version --tag v1.2` 检查；为已审查的提交创建版本标签，再用一次 `git push --atomic origin main v1.2` 同时推送提交与标签。后续发布使用新的版本号，不移动旧标签。
+
+只有 `v1.2`、`v1.2.1` 这样的版本标签触发一个 `Release` 工作流，任务名显示版本号；Windows、Mac 双架构和 Linux 在同一轮中构建。全部成功后校验安装包版本、架构和 Linux 运行记录，上传五个带版本号的包、`build-validation.json` 和 `SHA256SUMS`，核对远端校验值后才公开 Release。失败时不会公开不完整的发布，也不需要额外推送来取包。Linux 的手动诊断入口仅复用已有失败构建产物，不触发整套发布构建。
+
+Release 提供 Windows x64、Mac Apple Silicon / Intel 和 Linux x64 安装包。Linux 在 Debian 10 / glibc 2.28 基线上构建，私有捆绑 FFmpeg、C++、字体等依赖并审计 ELF 符号版本，不替换系统 glibc 或显卡驱动。图形界面使用宿主 Vulkan / OpenGL 驱动；Linux 当前提供软件 H.264 / AAC 路径，UOS 实机性能仍需按设备验证。
 
 当前 Actions 的 Mac Apple Silicon 包要求 macOS 14+，Intel 包要求 macOS 15+；本机 Homebrew 打包的最低版本单独计算，不能把本机 macOS 26 的要求套到云端包。Linux 的 CPU 窗口渲染优先选择 OpenGL，以避开已复现的软件 Vulkan 空白窗口；硬件 GPU 和无窗口计算保留原排序。
 
