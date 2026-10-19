@@ -7,7 +7,9 @@ mod settings;
 mod shell;
 #[cfg(feature = "ui-smoke")]
 mod smoke;
+mod speakers;
 mod task;
+mod text_document;
 mod transcript_view;
 mod transcription;
 mod ui;
@@ -75,6 +77,8 @@ struct Recorder {
     ai_clock: task::TaskClock,
     speaker_threads: usize,
     transcript_view: Entity<transcript_view::TranscriptView>,
+    speakers_view: Entity<speakers::SpeakersView>,
+    voice_busy: bool,
     transcript_dirty: bool,
     transcript_new_document: bool,
     task_display_second: u64,
@@ -87,12 +91,15 @@ struct Recorder {
     speaker_count: Entity<InputState>,
     speaker_threshold: Entity<InputState>,
     speaker_task: Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::Transcript>>>,
+    transcript_sync: Option<crossbeam_channel::Receiver<opencap_asr::Transcript>>,
+    text_document: Option<Entity<text_document::TextDocument>>,
     speaker_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     meeting_page: workspace::MeetingPage,
     meetings: Vec<workspace::MeetingFile>,
     rename_base: Option<PathBuf>,
     rename_input: Entity<InputState>,
     meeting_title: String,
+    locations_expanded: bool,
     notes: Entity<gpui::component::input::TextareaState>,
     notes_status: String,
     notes_base: Option<PathBuf>,
@@ -292,6 +299,13 @@ impl Recorder {
             speaker_clock: task::TaskClock::default(),
             ai_clock: task::TaskClock::default(),
             speaker_threads: 2,
+            speakers_view: {
+                let view = cx.new(speakers::SpeakersView::new);
+                cx.subscribe(&view, |this, _, event, cx| this.edit_speaker(event, cx))
+                    .detach();
+                view
+            },
+            voice_busy: false,
             transcript_view: cx.new(|_| transcript_view::TranscriptView::new()),
             transcript_dirty: true,
             transcript_new_document: true,
@@ -305,12 +319,15 @@ impl Recorder {
             speaker_count,
             speaker_threshold,
             speaker_task: None,
+            transcript_sync: None,
+            text_document: None,
             speaker_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             meeting_page: workspace::MeetingPage::Library,
             meetings,
             rename_base: None,
             rename_input: cx.new(|cx| InputState::new(window, cx).placeholder("会议名称")),
             meeting_title: String::new(),
+            locations_expanded: false,
             notes,
             notes_status: String::new(),
             notes_base: None,
@@ -497,9 +514,10 @@ impl Recorder {
                 && let Some(asr) = &mut self.asr
             {
                 if let Some(path) = &self.stats.output {
-                    let base = transcription::final_recording_path(path);
+                    let media = transcription::final_recording_path(path);
+                    let base = meeting_base(&media);
                     if self.transcript_output.as_ref() != Some(&base) {
-                        asr.set_output(base.clone());
+                        asr.set_output(media);
                         self.transcript_output = Some(base);
                     }
                 }
@@ -1019,6 +1037,22 @@ impl Render for Floating {
     }
 }
 fn main() {
+    #[cfg(windows)]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new("--open-path-helper")) {
+            let result = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Missing document path"))
+                .and_then(|path| {
+                    opencap_platform::open_path_in_helper(std::path::Path::new(&path))
+                });
+            if let Err(error) = &result {
+                eprintln!("OpenCap file handler: {error:#}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+    }
     struct StderrLogger;
     impl log::Log for StderrLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
@@ -1136,6 +1170,22 @@ fn main() {
         if let Some(source) = smoke::preview_source() {
             entity.update(cx, |r, cx| {
                 r.start_file_transcription(source, false, false);
+                let mut args = std::env::args();
+                if args.any(|arg| arg == "--ui-page") {
+                    r.meeting_page = match args.next().as_deref() {
+                        Some("minutes") => workspace::MeetingPage::Minutes,
+                        Some("notes") => workspace::MeetingPage::Notes,
+                        Some("library") => workspace::MeetingPage::Library,
+                        _ => workspace::MeetingPage::Transcript,
+                    };
+                }
+                let mut args = std::env::args();
+                if args.any(|arg| arg == "--ui-search")
+                    && let Some(query) = args.next()
+                {
+                    r.transcript_view
+                        .update(cx, |view, _| view.set_query(query));
+                }
                 cx.notify();
             });
         }

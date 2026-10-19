@@ -24,8 +24,11 @@ impl Recorder {
             || self.ai.document_task.is_some()
             || self.ai.credentials_busy
             || self.speaker_task.is_some()
+            || self.transcript_sync.is_some()
+            || self.voice_busy
     }
     pub(super) fn start_live_asr(&mut self) -> Option<crossbeam_channel::Sender<PcmAudio>> {
+        self.text_document = None;
         // Start a new workspace only after recording preflight has succeeded.
         // A recording without ASR must not show the preceding meeting's words.
         self.transcript = Transcript::default();
@@ -133,6 +136,7 @@ impl Recorder {
         realtime: bool,
         backfill: bool,
     ) {
+        self.text_document = None;
         if source
             .file_name()
             .is_some_and(|name| name.to_string_lossy().ends_with(".transcript.json"))
@@ -143,8 +147,9 @@ impl Recorder {
             {
                 Ok(transcript) => {
                     let name = source.file_name().unwrap().to_string_lossy();
-                    self.transcript_output =
-                        Some(source.with_file_name(name.trim_end_matches(".transcript.json")));
+                    self.transcript_output = Some(opencap_core::meeting_base(
+                        &source.with_file_name(name.trim_end_matches(".transcript.json")),
+                    ));
                     self.transcript = transcript;
                     self.transcript_dirty = true;
                     self.transcript_new_document = true;
@@ -174,6 +179,7 @@ impl Recorder {
                 }
             }
         };
+        let output = opencap_core::meeting_base(&output);
         match AsrSession::file_with_revision(
             model_root(),
             if realtime {
@@ -273,7 +279,13 @@ impl Recorder {
                         "转录尚未完整完成，原文件保留，可重新导入"
                     }
                     .into();
-                    self.transcript = t;
+                    if !t.output_warnings.is_empty() {
+                        self.transcription_status = format!(
+                            "识别已完成；{} 个文件未同步，可关闭外部编辑器后重试",
+                            t.output_warnings.len()
+                        );
+                    }
+                    self.transcript = *t;
                     self.transcript_dirty = true;
                     self.transcription_progress = 1.0;
                     self.remember_meeting();
@@ -352,13 +364,44 @@ impl Recorder {
                     self.transcript = t;
                     self.transcript_dirty = true;
                     self.remember_meeting();
-                    self.transcription_status = format!(
-                        "分为 {speakers} 个说话人组，请核对（自动人数可能偏多，可填写已知人数重试）；编号仅适用于本场会议，多人交替的句子会标注歧义。可重新生成纪要。"
-                    );
+                    self.transcription_status = if self.transcript.output_warnings.is_empty() {
+                        format!(
+                            "说话人分析完成 · {speakers} 组 · 已同步逐字稿 JSON、TXT、字幕和 Word。AI 纪要可在对话中要求更新。"
+                        )
+                    } else {
+                        format!(
+                            "说话人分析完成 · {speakers} 组；部分文件未同步，结果已显示，可重试同步。"
+                        )
+                    };
                 }
                 Err(e) => {
                     self.transcription_status = format!("说话人分析未完成；已有稿件保留：{e:#}")
                 }
+            }
+        }
+        if let Some(result) = self
+            .transcript_sync
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(t) => Some(Ok(t)),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err(())),
+                Err(crossbeam_channel::TryRecvError::Empty) => None,
+            })
+        {
+            self.transcript_sync = None;
+            changed = true;
+            match result {
+                Ok(t) => {
+                    self.transcript = t;
+                    self.transcript_dirty = true;
+                    self.transcription_status = if self.transcript.output_warnings.is_empty() {
+                        "逐字稿与说话人已同步到全部文件".into()
+                    } else {
+                        "部分文件仍未同步，请检查文件占用或文件夹权限".into()
+                    };
+                    self.remember_meeting();
+                }
+                Err(()) => self.transcription_status = "同步线程已退出，已有分析结果保留".into(),
             }
         }
         if let Some(rx) = &self.ai.progress {
@@ -372,6 +415,22 @@ impl Recorder {
             }
         }
         changed
+    }
+    pub(super) fn retry_transcript_sync(&mut self) {
+        if self.active() || self.transcription_busy() {
+            return;
+        }
+        let Some(base) = self.transcript_output.clone() else {
+            return;
+        };
+        let mut transcript = self.transcript.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.transcript_sync = Some(rx);
+        self.transcription_status = "正在同步文档，无需重新识别…".into();
+        std::thread::spawn(move || {
+            transcript.sync_outputs(&base);
+            let _ = tx.send(transcript);
+        });
     }
     pub(super) fn start_speakers(&mut self, cx: &App) {
         if self.active() || self.transcription_busy() || !self.transcript.complete {
@@ -510,10 +569,43 @@ impl Recorder {
             )
     }
     pub(super) fn transcription_view(&self, width: f32, cx: &Context<Self>) -> Div {
+        if let Some(document) = &self.text_document {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    button("close-text-document", "返回逐字稿", false).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.text_document = None;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(div().h(px(560.)).child(document.clone()));
+        }
         let busy = self.transcription_busy();
         let ready = self.transcript.complete && !self.transcript.cancelled;
         let speakers = self.transcript.speaker_count();
         let mut toolbar = div().flex().flex_wrap().items_center().gap_2();
+        if !self.transcript.output_warnings.is_empty() {
+            toolbar = toolbar.child(
+                div()
+                    .w_full()
+                    .p_3()
+                    .bg(rgb(SOFT))
+                    .rounded_lg()
+                    .child(label(self.transcript.output_warnings.join("\n")))
+                    .child(
+                        button("retry-transcript-sync", "重试同步文件", false)
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.retry_transcript_sync();
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
         if let Some(base) = &self.transcript_output {
             let word = base.with_extension("transcript.docx");
             let plain = base.with_extension("transcript.txt");
@@ -552,11 +644,12 @@ impl Recorder {
                             }),
                     )
                     .child(
-                        button("open-transcript", "打开纯文本 TXT", false)
+                        button("open-transcript", "查看纯文本 TXT", false)
                             .disabled(!plain.exists())
-                            .on_click(move |_, _, _| {
-                                let _ = opencap_platform::open_path(&plain);
-                            }),
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_text_document(plain.clone(), window, cx);
+                                cx.notify();
+                            })),
                     )
                     .child(
                         button("open-subtitles", "打开字幕 SRT", false)
@@ -712,7 +805,11 @@ impl Recorder {
                         })),
                 )
             })
-            .child(label("分析完成后，生成的纪要可按说话人组织。"));
+            .child(label(
+                "分析完成后，生成的纪要可按说话人组织。重新分析可能改变分组，请核对姓名。",
+            ))
+            .child(label(self.transcript.speaker_memory_status.clone()))
+            .child(self.speakers_view.clone());
         div().flex().flex_col().gap_4().child(toolbar).child(
             div()
                 .flex()

@@ -1,6 +1,7 @@
 use super::*;
 use gpui::component::{
-    input::{Input, Textarea, TextareaState},
+    input::{Input, InputEvent, Textarea, TextareaState},
+    resizable::{h_resizable, resizable_panel},
     text::TextView,
 };
 use opencap_asr::{
@@ -37,6 +38,10 @@ pub(super) struct AiWorkspace {
     ask_only: bool,
     history_expanded: bool,
     conversation_tab: bool,
+    artifact_open: bool,
+    artifact_version: Option<u64>,
+    stream_artifact: bool,
+    file_preview: Option<(String, Entity<text_document::TextDocument>)>,
     format: MinutesFormat,
     format_expanded: bool,
     format_guidance: Entity<TextareaState>,
@@ -80,6 +85,35 @@ impl AiWorkspace {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let chat = cx.new(|_| ai_chat::ChatView::new());
+        cx.subscribe(&chat, |this, _, event, cx| {
+            let ai_chat::ChatEvent::OpenArtifact(number) = event;
+            this.ai.artifact_version = (*number != 0).then_some(*number);
+            this.ai.file_preview = None;
+            this.ai.artifact_open = true;
+            this.ai.conversation_tab = false;
+            cx.notify();
+        })
+        .detach();
+        let instruction = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("输入要求，继续完善会议纪要…")
+                .submit_on_enter(true)
+                .auto_grow(2, 5)
+        });
+        cx.subscribe(&instruction, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                let action = if this.ai.ask_only {
+                    MinutesAction::Ask
+                } else if this.ai.history.latest().is_empty() {
+                    MinutesAction::Generate
+                } else {
+                    MinutesAction::Revise
+                };
+                this.request_minutes(action, cx);
+            }
+        })
+        .detach();
         Self {
             format_guidance: cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -104,13 +138,7 @@ impl AiWorkspace {
                     .placeholder("API Key；留空使用已保存密钥")
                     .masked(true)
             }),
-            instruction: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder(
-                        "给 AI 提修改建议，例如：第二段再简短些，按公司的历史纪要格式调整。",
-                    )
-                    .auto_grow(3, 8)
-            }),
+            instruction,
             stream: String::new(),
             pending_request: String::new(),
             events: None,
@@ -128,13 +156,17 @@ impl AiWorkspace {
             key_origin: None,
             credential_status: "尚未检查密钥".into(),
             pending_key: None,
-            chat: cx.new(|_| ai_chat::ChatView::new()),
+            chat,
             chat_dirty: true,
             chat_reset: true,
             clear_composer: false,
             ask_only: false,
             history_expanded: false,
             conversation_tab: true,
+            artifact_open: true,
+            artifact_version: None,
+            stream_artifact: false,
+            file_preview: None,
             config,
             history: MinutesHistory::default(),
             status,
@@ -216,8 +248,11 @@ impl Recorder {
                     &self.ai.history,
                     &self.ai.pending_request,
                     &self.ai.stream,
-                    self.summary_task.is_some(),
-                    self.ai.chat_reset,
+                    ai_chat::ReplyState {
+                        busy: self.summary_task.is_some(),
+                        reset: self.ai.chat_reset,
+                        artifact: self.ai.stream_artifact,
+                    },
                     cx,
                 )
             });
@@ -380,6 +415,8 @@ impl Recorder {
                 self.ai.draft_saved.clear();
                 self.ai.editor_sync = true;
                 self.ai.editing = false;
+                self.ai.artifact_version = None;
+                self.ai.file_preview = None;
                 self.ai.chat_dirty = true;
                 self.ai.status = "正文、Word 与修订版本已同步；可继续对话修改。".into();
                 self.remember_meeting();
@@ -451,6 +488,10 @@ impl Recorder {
         self.ai.events = None;
         self.ai.chat_dirty = true;
         self.ai.chat_reset = true;
+        self.ai.artifact_version = None;
+        self.ai.stream_artifact = false;
+        self.ai.file_preview = None;
+        self.ai.conversation_tab = true;
     }
     pub(super) fn load_minutes(&mut self) {
         if let Some(output) = &self.transcript_output {
@@ -568,6 +609,8 @@ impl Recorder {
     }
     pub(super) fn request_minutes(&mut self, action: MinutesAction, cx: &mut Context<Self>) {
         if self.active()
+            || self.summary_task.is_some()
+            || self.ai.credentials_busy
             || self.transcription_busy()
             || self.ai.document_task.is_some()
             || !self.transcript.complete
@@ -667,6 +710,12 @@ impl Recorder {
         self.ai.events = Some(progress_rx);
         self.ai.stream.clear();
         self.ai.pending_request = instruction.clone();
+        self.ai.stream_artifact = action != MinutesAction::Ask;
+        if self.ai.stream_artifact {
+            self.ai.artifact_open = true;
+            self.ai.artifact_version = None;
+            self.ai.file_preview = None;
+        }
         self.ai.chat_dirty = true;
         self.ai_clock.start();
         self.summary_task = Some(rx);
@@ -798,7 +847,7 @@ impl Recorder {
                 })),
             )
     }
-    pub(super) fn minutes_view(&self, width: f32, height: f32, cx: &Context<Self>) -> Div {
+    pub(super) fn minutes_view(&self, width: f32, _height: f32, cx: &Context<Self>) -> Div {
         let busy = self.active() || self.transcription_busy();
         let ready = self.transcript.complete && !self.transcript.text().is_empty();
         let has_minutes = !self.ai.history.latest().is_empty();
@@ -858,24 +907,37 @@ impl Recorder {
         }
 
         let editor = ui::card()
-            .gap_2()
-            .min_w(px(0.))
+            .h_full()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .gap_3()
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(ui::section_title("与 AI 一起改稿", ""))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("AI 对话"))
                     .child(
-                        button("open-ai-config", "配置", false)
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings = true;
-                                this.settings_page = settings::SettingsPage::Ai;
-                                this.page_scroll.set_offset(point(px(0.), px(0.)));
-                                cx.notify();
-                            })),
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                button("minutes-format-settings", "模板", self.ai.format_expanded)
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.ai.format_expanded = !this.ai.format_expanded;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(button("open-ai-config", "配置", false).ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.settings = true;
+                                    this.settings_page = settings::SettingsPage::Ai;
+                                    this.page_scroll.set_offset(point(px(0.), px(0.)));
+                                    cx.notify();
+                                }),
+                            )),
                     ),
             )
             .child(label(format!(
@@ -889,17 +951,20 @@ impl Recorder {
             )))
             .child(
                 div()
-                    .h(px((height - 740.).clamp(110., 300.)))
+                    .flex_1()
+                    .min_h(px(100.))
                     .w_full()
                     .child(self.ai.chat.clone()),
             )
+            .child(Textarea::new(&self.ai.instruction).disabled(busy).w_full())
             .child(
                 div()
                     .flex()
                     .flex_wrap()
+                    .items_center()
                     .gap_2()
                     .child(
-                        button("conversation-revise-mode", "修改正文", !self.ai.ask_only)
+                        button("conversation-revise-mode", "改正文", !self.ai.ask_only)
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.ai.ask_only = false;
@@ -907,102 +972,68 @@ impl Recorder {
                             })),
                     )
                     .child(
-                        button("conversation-ask-mode", "只问问题", self.ai.ask_only)
+                        button("conversation-ask-mode", "只提问", self.ai.ask_only)
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.ai.ask_only = true;
                                 cx.notify();
                             })),
-                    ),
-            )
-            .child(Textarea::new(&self.ai.instruction).disabled(busy).w_full())
-            .when(self.summary_task.is_none(), |d| {
-                d.child(
-                    primary_button(
-                        "send-minutes-message",
-                        if self.ai.ask_only {
-                            "发送问题"
-                        } else if has_minutes {
-                            "发送修改要求"
-                        } else {
-                            "生成会议纪要"
-                        },
                     )
-                    .w_full()
-                    .disabled(busy || !ready || self.ai.editing)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let action = if this.ai.ask_only {
-                            MinutesAction::Ask
-                        } else if this.ai.history.latest().is_empty() {
-                            MinutesAction::Generate
-                        } else {
-                            MinutesAction::Revise
-                        };
-                        this.request_minutes(action, cx);
-                    })),
-                )
-            })
-            .when(self.summary_task.is_some(), |d| {
-                d.child(
-                    button("cancel-summary", "停止生成", false)
-                        .danger()
-                        .w_full()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.ai.cancelled.store(true, Ordering::Relaxed);
-                            this.ai.status = "正在停止生成；已有版本保留…".into();
-                            cx.notify();
-                        })),
-                )
-            })
-            .child(label(self.ai.status.clone()))
-            .when(
-                self.ai_clock.has_run()
-                    || self
-                        .ai
-                        .history
-                        .versions
-                        .last()
-                        .and_then(|v| v.elapsed_seconds)
-                        .is_some(),
-                |d| {
-                    d.child(label(format!(
-                        "AI 已用时 {}",
-                        task::duration_text(if self.ai_clock.has_run() {
-                            self.ai_clock.elapsed()
-                        } else {
-                            task::saved_duration(
-                                self.ai
-                                    .history
-                                    .versions
-                                    .last()
-                                    .and_then(|v| v.elapsed_seconds),
+                    .when(self.summary_task.is_none(), |d| {
+                        d.child(
+                            primary_button(
+                                "send-minutes-message",
+                                if self.ai.ask_only {
+                                    "发送问题"
+                                } else if has_minutes {
+                                    "发送修改"
+                                } else {
+                                    "生成纪要"
+                                },
                             )
-                        })
-                    )))
-                },
+                            .disabled(busy || !ready || self.ai.editing)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let action = if this.ai.ask_only {
+                                    MinutesAction::Ask
+                                } else if this.ai.history.latest().is_empty() {
+                                    MinutesAction::Generate
+                                } else {
+                                    MinutesAction::Revise
+                                };
+                                this.request_minutes(action, cx);
+                            })),
+                        )
+                    })
+                    .when(self.summary_task.is_some(), |d| {
+                        d.child(
+                            button("cancel-summary", "停止生成", false)
+                                .danger()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.ai.cancelled.store(true, Ordering::Relaxed);
+                                    this.ai.status = "正在停止生成；已有版本保留…".into();
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
-            .child(
-                button(
-                    "minutes-format-settings",
-                    format!(
-                        "模板与内容格式 · {} 个参考文件",
-                        self.ai.format.references.len()
-                    ),
-                    self.ai.format_expanded,
+            .child(label(if self.ai_clock.has_run() {
+                format!(
+                    "{} · 已用时 {}",
+                    self.ai.status,
+                    task::duration_text(self.ai_clock.elapsed())
                 )
-                .ghost()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.ai.format_expanded = !this.ai.format_expanded;
-                    this.ai.format.guidance = this.ai.format_guidance.read(cx).value().to_string();
-                    if let Err(e) = this.save_minutes_format() {
-                        this.ai.status = e.to_string();
-                    }
-                    cx.notify();
-                })),
-            )
-            .when(self.ai.format_expanded, |d| {
-                d.child(
-                    div().flex().flex_wrap().gap_2().children(
+            } else {
+                self.ai.status.clone()
+            }));
+        let format_options = ui::card()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .children(
                         ["正式纪要", "阅读摘要", "行动清单"]
                             .into_iter()
                             .enumerate()
@@ -1014,123 +1045,198 @@ impl Recorder {
                                         cx.notify();
                                     }))
                             }),
-                    ),
-                )
-                .child(self.minutes_format_options(busy, cx))
-                .when(has_minutes, |d| {
-                    d.child(
-                        button("regenerate-minutes", "按模板重新生成", false)
-                            .disabled(busy || !ready || self.ai.editing)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.request_minutes(MinutesAction::Generate, cx)
-                            })),
                     )
-                })
-            })
-            .child(label("修改成功后自动保存正文和 Word，旧版本保留。"));
-        let mut document = ui::card()
-            .flex_1()
-            .min_w(px(0.))
-            .min_h(px(440.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(ui::section_title(
-                        "会议纪要正文",
-                        if self.ai.editing {
-                            "手动修改中 · 保存后可继续与 AI 对话"
-                        } else {
-                            "每轮修改完成后同步到这里"
-                        },
-                    ))
-                    .child(ui::badge(
-                        format!("{} 个版本", self.ai.history.versions.len()),
-                        MUTED,
-                        BG,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        button(
-                            "edit-minutes-body",
-                            if self.ai.editing {
-                                "放弃本次手动修改"
-                            } else if has_minutes {
-                                "手动编辑"
-                            } else {
-                                "自己编写纪要"
-                            },
-                            self.ai.editing,
-                        )
-                        .disabled(busy || self.transcript_output.is_none())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.ai.editor.update(cx, |s, cx| {
-                                s.set_value(this.summary_text.clone(), window, cx)
-                            });
-                            if this.ai.editing {
-                                if let Some(base) = &this.ai.editor_base {
-                                    let _ = std::fs::remove_file(
-                                        base.with_extension("summary.draft.md"),
-                                    );
-                                }
-                                this.ai.draft_saved.clear();
-                            }
-                            this.ai.editing = !this.ai.editing;
-                            cx.notify();
-                        })),
-                    )
-                    .when(self.ai.editing, |d| {
+                    .when(has_minutes, |d| {
                         d.child(
-                            primary_button("save-minutes-body", "保存正文与 Word")
-                                .disabled(busy)
+                            button("regenerate-minutes", "按模板重新生成", false)
+                                .disabled(busy || !ready || self.ai.editing)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.request_minutes(MinutesAction::Generate, cx)
+                                })),
+                        )
+                    }),
+            )
+            .child(self.minutes_format_options(busy, cx));
+        let mut document =
+            ui::card()
+                .h_full()
+                .overflow_hidden()
+                .flex_1()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(ui::section_title(
+                            &self
+                                .ai
+                                .file_preview
+                                .as_ref()
+                                .map(|(title, _)| title.clone())
+                                .unwrap_or_else(|| {
+                                    self.ai
+                                        .artifact_version
+                                        .map(|n| format!("会议纪要 · v{n} 预览"))
+                                        .unwrap_or_else(|| "会议纪要正文".into())
+                                }),
+                            if self.ai.file_preview.is_some() {
+                                "应用内预览 · 可以选择、复制和搜索"
+                            } else if self.ai.editing {
+                                "手动修改中 · 保存后可继续与 AI 对话"
+                            } else {
+                                "每轮修改完成后同步到这里"
+                            },
+                        ))
+                        .child(button("close-artifact", "收起", false).ghost().on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.ai.artifact_open = false;
+                                this.ai.conversation_tab = true;
+                                cx.notify();
+                            }),
+                        )),
+                )
+                .child(div().flex().flex_wrap().gap_2().when(
+                    self.ai.file_preview.is_none(),
+                    |d| {
+                        d.child(
+                            button(
+                                "edit-minutes-body",
+                                if self.ai.editing {
+                                    "放弃本次手动修改"
+                                } else if has_minutes {
+                                    "编辑纪要"
+                                } else {
+                                    "自己编写纪要"
+                                },
+                                self.ai.editing,
+                            )
+                            .disabled(busy || self.transcript_output.is_none())
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.ai.file_preview = None;
+                                    this.ai.artifact_version = None;
+                                    this.ai.editor.update(cx, |s, cx| {
+                                        s.set_value(this.summary_text.clone(), window, cx)
+                                    });
+                                    if this.ai.editing {
+                                        if let Some(base) = &this.ai.editor_base {
+                                            let _ = std::fs::remove_file(
+                                                base.with_extension("summary.draft.md"),
+                                            );
+                                        }
+                                        this.ai.draft_saved.clear();
+                                    }
+                                    this.ai.editing = !this.ai.editing;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .when(self.ai.editing, |d| {
+                            d.child(
+                                primary_button("save-minutes-body", "保存正文与 Word")
+                                    .disabled(busy)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.save_manual_minutes(cx)),
+                                    ),
+                            )
+                        })
+                        .child(
+                            button("sync-minutes-file", "同步文件修改…", false)
+                                .disabled(
+                                    busy || self.ai.editing || self.transcript_output.is_none(),
+                                )
                                 .on_click(
-                                    cx.listener(|this, _, _, cx| this.save_manual_minutes(cx)),
+                                    cx.listener(|this, _, _, cx| this.import_minutes_file(cx)),
                                 ),
                         )
-                    })
-                    .child(
-                        button("sync-minutes-file", "同步文件修改…", false)
-                            .disabled(busy || self.ai.editing || self.transcript_output.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| this.import_minutes_file(cx))),
-                    )
-                    .child(
-                        button(
-                            "toggle-minutes-versions",
-                            "修订历史",
-                            self.ai.history_expanded,
+                        .child(
+                            button(
+                                "toggle-minutes-versions",
+                                "修订历史",
+                                self.ai.history_expanded,
+                            )
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ai.history_expanded = !this.ai.history_expanded;
+                                cx.notify();
+                            })),
                         )
-                        .ghost()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.ai.history_expanded = !this.ai.history_expanded;
-                            cx.notify();
-                        })),
-                    ),
+                    },
+                ));
+        let mut file_tabs = div().flex().flex_wrap().gap_2().child(
+            button(
+                "artifact-summary-tab",
+                "纪要正文",
+                self.ai.file_preview.is_none(),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.ai.file_preview = None;
+                this.ai.artifact_version = None;
+                cx.notify();
+            })),
+        );
+        if let Some(base) = &self.transcript_output {
+            for (id, title, ext) in [
+                ("artifact-transcript-tab", "逐字稿 TXT", "transcript.txt"),
+                ("artifact-notes-tab", "笔记 TXT", "notes.txt"),
+            ] {
+                let path = base.with_extension(ext);
+                file_tabs = file_tabs.child(
+                    button(
+                        id,
+                        title,
+                        self.ai
+                            .file_preview
+                            .as_ref()
+                            .is_some_and(|(selected, _)| selected == title),
+                    )
+                    .disabled(!path.exists() || self.ai.editing)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.ai.file_preview = Some((
+                            title.to_owned(),
+                            this.create_text_document(path.clone(), window, cx),
+                        ));
+                        cx.notify();
+                    })),
+                );
+            }
+        }
+        document = document.child(file_tabs);
+        document = document.when(self.ai.file_preview.is_none(), |d| d.child(toolbar));
+        if let Some((_, preview)) = &self.ai.file_preview {
+            document = document.child(div().flex_1().min_h(px(0.)).child(preview.clone()));
+        } else if self.ai.editing {
+            document = document.child(
+                Textarea::new(&self.ai.editor)
+                    .disabled(busy)
+                    .w_full()
+                    .flex_1(),
             );
-        if self.ai.editing {
-            document = document.child(Textarea::new(&self.ai.editor).disabled(busy).w_full());
         } else {
-            let streaming =
-                self.summary_task.is_some() && !self.ai.ask_only && !self.ai.stream.is_empty();
+            let streaming = self.ai.artifact_version.is_none()
+                && self.ai.stream_artifact
+                && !self.ai.pending_request.is_empty()
+                && !self.ai.stream.is_empty();
             let text = if streaming {
                 self.ai.stream.clone()
             } else {
-                self.summary_text.clone()
+                self.ai
+                    .artifact_version
+                    .and_then(|n| self.ai.history.versions.iter().find(|v| v.number == n))
+                    .map(|v| v.markdown.clone())
+                    .unwrap_or_else(|| self.summary_text.clone())
             };
             if streaming {
                 document = document.child(label("正在生成预览 · 完整完成后自动保存"));
             }
-            document = document.child(div().id("minutes-document-scroll").max_h(px(if ui::two_columns(width) { 660. } else { 420. })).overflow_y_scroll()
+            document = document.child(div().id("minutes-document-scroll").flex_1().min_h(px(0.)).overflow_y_scroll()
                 .when(text.is_empty(), |d| d.child(div().py_8().flex().flex_col().gap_3()
                     .child(div().text_lg().child("从一份会议纪要开始"))
                     .child(label("在对话框中生成初稿，或自己编写正文。可以给修改建议、添加历史样式，直到内容满意。"))))
-                .when(!text.is_empty(), |d| d.child(TextView::markdown("meeting-summary", text))));
+                .when(!text.is_empty(), |d| d.child(TextView::markdown("meeting-summary", text).selectable(true))));
         }
         if self.ai.history_expanded {
             let mut versions = div()
@@ -1150,6 +1256,17 @@ impl Recorder {
                         .child(
                             label(format!("v{} · {}", version.number, version.instruction))
                                 .flex_1(),
+                        )
+                        .child(
+                            button(("preview-minutes-version", version.number), "查看", false)
+                                .on_click(cx.listener({
+                                    let number = version.number;
+                                    move |this, _, _, cx| {
+                                        this.ai.artifact_version = Some(number);
+                                        this.ai.file_preview = None;
+                                        cx.notify();
+                                    }
+                                })),
                         )
                         .child(
                             button(
@@ -1174,40 +1291,72 @@ impl Recorder {
             }
             document = document.child(versions);
         }
-        let mut body = div().flex().items_start().gap_5().w_full();
-        if ui::two_columns(width) {
-            body = body
-                .child(document)
-                .child(editor.w(px(370.)).flex_shrink_0());
-        } else {
-            body = body
-                .flex_col()
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            button("minutes-compact-chat", "对话修改", self.ai.conversation_tab)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.ai.conversation_tab = true;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            button(
-                                "minutes-compact-body",
-                                "查看正文",
-                                !self.ai.conversation_tab,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.ai.conversation_tab = false;
-                                cx.notify();
-                            })),
-                        ),
+        let wide = width >= 860.;
+        let showing_document = self.ai.artifact_open && (wide || !self.ai.conversation_tab);
+        let tabs = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                label("对话与产出 · Enter 发送，Shift+Enter 换行")
+                    .flex_1()
+                    .min_w(px(0.)),
+            )
+            .child(
+                button(
+                    "toggle-artifact",
+                    if showing_document {
+                        "只看对话"
+                    } else {
+                        "打开文档"
+                    },
+                    showing_document,
                 )
-                .when(self.ai.conversation_tab, |d| d.child(editor.w_full()))
-                .when(!self.ai.conversation_tab, |d| d.child(document.w_full()));
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.ai.artifact_open = !showing_document;
+                    this.ai.conversation_tab = showing_document;
+                    cx.notify();
+                })),
+            );
+        let mut body = div().w_full().flex_1().min_h(px(0.));
+        if wide && self.ai.artifact_open {
+            body = body.child(
+                h_resizable("minutes-workspace-split")
+                    .child(
+                        resizable_panel()
+                            .size(px(width * 0.48))
+                            .size_range(px(320.)..px(width - 350.))
+                            .child(editor),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(width * 0.52))
+                            .size_range(px(340.)..px(width - 330.))
+                            .child(document),
+                    ),
+            );
+        } else if self.ai.artifact_open && !self.ai.conversation_tab {
+            body = body.child(document.w_full());
+        } else {
+            body = body.child(editor.w_full());
         }
-        div().flex().flex_col().gap_4().child(toolbar).child(body)
+        div()
+            .h_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(tabs)
+            .when(self.ai.format_expanded, |d| {
+                d.child(
+                    div()
+                        .id("minutes-format-scroll")
+                        .max_h(px(280.))
+                        .overflow_y_scroll()
+                        .child(format_options),
+                )
+            })
+            .child(body)
     }
 }

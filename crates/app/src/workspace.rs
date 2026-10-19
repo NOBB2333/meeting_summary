@@ -61,6 +61,13 @@ fn index_path() -> PathBuf {
 }
 /// Scan only application artifacts, plus explicitly remembered imports. No media decoding.
 pub(super) fn discover(root: &Path) -> Vec<MeetingFile> {
+    let remembered = std::fs::read(index_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<PathBuf>>(&b).ok())
+        .unwrap_or_default();
+    discover_paths(root, remembered)
+}
+fn discover_paths(root: &Path, remembered: Vec<PathBuf>) -> Vec<MeetingFile> {
     fn scan(dir: &Path, depth: usize, bases: &mut BTreeSet<PathBuf>) {
         if depth == 0 {
             return;
@@ -81,13 +88,12 @@ pub(super) fn discover(root: &Path) -> Vec<MeetingFile> {
             }
         }
     }
-    let mut bases = std::fs::read(index_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<PathBuf>>(&b).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let mut bases = remembered.into_iter().collect::<BTreeSet<_>>();
     scan(root, 3, &mut bases);
+    let bases: BTreeSet<_> = bases
+        .iter()
+        .map(|path| opencap_core::meeting_base(path))
+        .collect();
     let mut files = Vec::new();
     for base in bases {
         let transcript = base.with_extension("transcript.json");
@@ -444,6 +450,18 @@ impl Recorder {
                             }),
                     )
                     .child(
+                        button(
+                            "toggle-meeting-locations",
+                            "文件位置",
+                            self.locations_expanded,
+                        )
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.locations_expanded = !this.locations_expanded;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
                         button("rename-current-meeting", "重命名", false)
                             .ghost()
                             .disabled(self.active())
@@ -474,7 +492,9 @@ impl Recorder {
                     }),
                 ),
             );
-        if let Some(base) = &self.transcript_output {
+        if self.locations_expanded
+            && let Some(base) = &self.transcript_output
+        {
             let folder = base.parent().unwrap_or(Path::new(".")).to_path_buf();
             let open = folder.clone();
             let copy_folder = folder.clone();
@@ -508,7 +528,8 @@ impl Recorder {
                     ),
             );
         }
-        if let (Some(source), Some(base)) = (&self.transcript.source, &self.transcript_output)
+        if self.locations_expanded
+            && let (Some(source), Some(base)) = (&self.transcript.source, &self.transcript_output)
             && source.parent() != base.parent()
             && let Some(folder) = source.parent()
         {
@@ -816,6 +837,32 @@ impl Recorder {
 #[cfg(test)]
 mod export_tests {
     use super::{copy_export, meeting_details};
+    #[test]
+    fn one_meeting_with_media_and_prefix_aliases_is_listed_once_without_moving_files() {
+        let root =
+            std::env::temp_dir().join(format!("opencap-library-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("一场会议")).unwrap();
+        let base = root.join("一场会议/会议");
+        let media = base.with_extension("m4a");
+        std::fs::write(&media, b"preserved recording").unwrap();
+        std::fs::write(base.with_extension("recording.json"), b"{}").unwrap();
+        let t = opencap_asr::Transcript {
+            source: Some(media.clone()),
+            complete: true,
+            ..Default::default()
+        };
+        t.checkpoint(&base).unwrap();
+        let alias = root.join("一场会议/../一场会议/会议");
+        let files = super::discover_paths(&root, vec![base.clone(), media.clone(), alias]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].media.as_ref().unwrap().canonicalize().unwrap(),
+            media.canonicalize().unwrap()
+        );
+        assert_eq!(files[0].complete, Some(true));
+        assert_eq!(std::fs::read(&media).unwrap(), b"preserved recording");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn meeting_preview_uses_saved_body_duration_and_actual_media_size() {
         let dir =

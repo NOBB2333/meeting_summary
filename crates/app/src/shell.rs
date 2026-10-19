@@ -454,6 +454,15 @@ impl Render for Recorder {
         }
         self.sync_notes(window, cx);
         self.sync_ai_view(window, cx);
+        self.speakers_view.update(cx, |view, cx| {
+            view.replace(
+                &self.transcript,
+                self.transcript_new_document,
+                self.active() || self.transcription_busy(),
+                window,
+                cx,
+            )
+        });
         if self.transcript_dirty {
             self.transcript_view.update(cx, |view, cx| {
                 view.replace(&self.transcript, self.transcript_new_document, cx)
@@ -474,6 +483,30 @@ impl Render for Recorder {
         } else {
             self.recording_view(width, cx)
         };
+        let ai_workspace = self.transcription_tab
+            && !self.settings
+            && self.meeting_page == workspace::MeetingPage::Minutes;
+        let page_content = if ai_workspace {
+            div()
+                .size_full()
+                .min_h(px(0.))
+                .px(px(28.))
+                .py_4()
+                .child(content)
+        } else {
+            widgets::scrollable(
+                "page-scroll",
+                div()
+                    .w_full()
+                    .min_h_full()
+                    .p(px(28.))
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .child(content),
+                &self.page_scroll,
+            )
+        };
         let mut workspace = div()
             .flex_1()
             .min_w(px(0.))
@@ -483,20 +516,7 @@ impl Render for Recorder {
             .child(self.topbar(compact, cx))
             .when(documents, |d| d.child(self.meeting_header(cx)))
             .when_some(self.task_banner(), |d, banner| d.child(banner))
-            .child(
-                div().flex_1().min_h(px(0.)).child(widgets::scrollable(
-                    "page-scroll",
-                    div()
-                        .w_full()
-                        .min_h_full()
-                        .p(px(28.))
-                        .flex()
-                        .flex_col()
-                        .gap_5()
-                        .child(content),
-                    &self.page_scroll,
-                )),
-            );
+            .child(div().flex_1().min_h(px(0.)).child(page_content));
         if let Some(notice) = self.notification(cx) {
             workspace = workspace.child(notice);
         }

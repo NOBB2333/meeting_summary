@@ -1,6 +1,10 @@
 //! Cache transcript presentation and lay out only visible, variable-height rows.
 use super::*;
-use gpui::component::scroll::Scrollbar;
+use gpui::component::{
+    input::Input,
+    scroll::Scrollbar,
+    text::{SelectionFormat, TextView},
+};
 use opencap_asr::{Segment, Transcript};
 
 #[derive(Clone, PartialEq)]
@@ -60,6 +64,12 @@ pub(super) struct TranscriptView {
     rows: Rc<Vec<Rc<Row>>>,
     live: bool,
     speaker_turns: Vec<(u64, u64, u32)>,
+    speaker_names: Vec<(u32, String)>,
+    search_input: Option<Entity<InputState>>,
+    search_subscription: Option<Subscription>,
+    query: String,
+    matches: Vec<(usize, std::ops::Range<usize>)>,
+    active_match: usize,
     #[cfg(feature = "ui-smoke")]
     pub measured_rows: Rc<std::cell::RefCell<std::collections::BTreeSet<usize>>>,
 }
@@ -70,6 +80,12 @@ impl TranscriptView {
             rows: Rc::new(Vec::new()),
             live: false,
             speaker_turns: Vec::new(),
+            speaker_names: Vec::new(),
+            search_input: None,
+            search_subscription: None,
+            query: String::new(),
+            matches: Vec::new(),
+            active_match: 0,
             #[cfg(feature = "ui-smoke")]
             measured_rows: Rc::new(std::cell::RefCell::new(Default::default())),
         }
@@ -84,7 +100,13 @@ impl TranscriptView {
             .iter()
             .map(|s| (s.start_ms, s.end_ms, s.speaker))
             .collect();
-        let labels_changed = new_document || self.speaker_turns != speakers;
+        let names: Vec<_> = transcript
+            .speaker_names
+            .keys()
+            .map(|id| (*id, transcript.speaker_name(*id)))
+            .collect();
+        let labels_changed =
+            new_document || self.speaker_turns != speakers || self.speaker_names != names;
         // Retain every segment while live. Shared strings avoid rebuilding all
         // history and its metadata whenever the current hypothesis changes.
         let rows: Vec<Rc<Row>> = transcript
@@ -134,11 +156,101 @@ impl TranscriptView {
         }
         self.live = live;
         self.speaker_turns = speakers;
+        self.speaker_names = names;
         self.rows = Rc::new(rows);
+        self.refresh_matches();
+    }
+    fn refresh_matches(&mut self) {
+        if self.query.is_empty() {
+            self.matches.clear();
+            self.active_match = 0;
+            return;
+        }
+        self.matches = self
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(i, row)| {
+                match_ranges(&row.text, &self.query)
+                    .into_iter()
+                    .map(move |range| (i, range))
+            })
+            .collect();
+        self.active_match = self.active_match.min(self.matches.len().saturating_sub(1));
+    }
+    pub(super) fn set_query(&mut self, query: String) {
+        if self.query == query {
+            return;
+        }
+        self.query = query;
+        self.active_match = 0;
+        self.refresh_matches();
+        self.reveal_match();
+    }
+    fn reveal_match(&self) {
+        if let Some((row, _)) = self.matches.get(self.active_match) {
+            self.state.set_follow_mode(FollowMode::Normal);
+            self.state.scroll_to(ListOffset {
+                item_ix: *row,
+                offset_in_item: px(0.),
+            });
+        }
+    }
+    fn step_match(&mut self, backwards: bool) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.active_match = if backwards {
+            (self.active_match + self.matches.len() - 1) % self.matches.len()
+        } else {
+            (self.active_match + 1) % self.matches.len()
+        };
+        self.reveal_match();
     }
 }
+fn match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    text.to_ascii_lowercase()
+        .match_indices(&query.to_ascii_lowercase())
+        .map(|(start, word)| start..start + word.len())
+        .collect()
+}
+fn selectable_html(text: &str, query: &str) -> String {
+    fn escape(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\n', "<br/>")
+    }
+    let mut html = String::from("<p>");
+    let mut end = 0;
+    for range in match_ranges(text, query) {
+        html.push_str(&escape(&text[end..range.start]));
+        html.push_str("<mark>");
+        html.push_str(&escape(&text[range.clone()]));
+        html.push_str("</mark>");
+        end = range.end;
+    }
+    html.push_str(&escape(&text[end..]));
+    html.push_str("</p>");
+    html
+}
 impl Render for TranscriptView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.search_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("搜索逐字稿…")
+                    .default_value(self.query.clone())
+            });
+            self.search_subscription = Some(cx.observe(&input, |this, input, cx| {
+                this.set_query(input.read(cx).value().to_string());
+                cx.notify();
+            }));
+            self.search_input = Some(input);
+        }
         if self.rows.is_empty() {
             return div()
                 .size_full()
@@ -146,6 +258,8 @@ impl Render for TranscriptView {
         }
         let rows = self.rows.clone();
         let following = self.state.is_following_tail();
+        let query = self.query.clone();
+        let copy_rows = rows.clone();
         #[cfg(feature = "ui-smoke")]
         let measured = self.measured_rows.clone();
         div()
@@ -153,6 +267,59 @@ impl Render for TranscriptView {
             .flex()
             .flex_col()
             .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(
+                        Input::new(self.search_input.as_ref().unwrap())
+                            .flex_1()
+                            .min_w(px(100.)),
+                    )
+                    .child(label(if self.query.is_empty() {
+                        "搜索原文".into()
+                    } else {
+                        format!(
+                            "{}/{}",
+                            if self.matches.is_empty() {
+                                0
+                            } else {
+                                self.active_match + 1
+                            },
+                            self.matches.len()
+                        )
+                    }))
+                    .child(
+                        button("transcript-prev", "上一处", false)
+                            .ghost()
+                            .disabled(self.matches.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_match(true);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button("transcript-next", "下一处", false)
+                            .ghost()
+                            .disabled(self.matches.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_match(false);
+                                cx.notify();
+                            })),
+                    )
+                    .child(button("copy-transcript", "复制全文", false).on_click(
+                        move |_, _, cx| {
+                            let text = copy_rows
+                                .iter()
+                                .map(|row| row.text.as_ref())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        },
+                    )),
+            )
             .child(
                 div()
                     .flex()
@@ -195,6 +362,7 @@ impl Render for TranscriptView {
                             #[cfg(feature = "ui-smoke")]
                             measured.borrow_mut().insert(index);
                             let row = &rows[index];
+                            let text = row.text.clone();
                             div()
                                 .w_full()
                                 .pr_3()
@@ -202,12 +370,42 @@ impl Render for TranscriptView {
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .child(label(row.metadata.clone()))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(label(row.metadata.clone()))
+                                        .child(
+                                            button(
+                                                ("copy-transcript-row", row.id as usize),
+                                                "复制此段",
+                                                false,
+                                            )
+                                            .ghost()
+                                            .on_click(
+                                                move |_, _, cx| {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(text.to_string()),
+                                                    )
+                                                },
+                                            ),
+                                        ),
+                                )
                                 .child(
                                     div()
                                         .text_base()
                                         .text_color(rgb(if row.finalized { TEXT } else { ACCENT }))
-                                        .child(row.text.clone()),
+                                        .child(
+                                            TextView::html(
+                                                ("transcript-text", row.id as usize),
+                                                selectable_html(&row.text, &query),
+                                            )
+                                            .selectable(true)
+                                            .selection_format(SelectionFormat::Plain)
+                                            .scrollable(false),
+                                        ),
                                 )
                                 .into_any()
                         })
@@ -223,6 +421,27 @@ mod tests {
     use super::TranscriptView;
     use gpui::{ListOffset, px};
     use opencap_asr::{Segment, Transcript};
+    #[test]
+    fn chinese_search_navigates_history_and_highlights_literal_text_without_changing_copy() {
+        let mut transcript = live_transcript(50);
+        transcript.segments[3].text = "研发预算 A&B <减少>".into();
+        transcript.segments[40].text = "确认预算不能增加".into();
+        let mut view = TranscriptView::new();
+        view.update_rows(&transcript, true);
+        view.set_query("预算".into());
+        assert_eq!(view.matches.len(), 2);
+        assert_eq!(view.state.logical_scroll_top().item_ix, 3);
+        view.step_match(false);
+        assert_eq!(view.state.logical_scroll_top().item_ix, 40);
+        assert!(!view.state.is_following_tail());
+        let html = super::selectable_html(&transcript.segments[3].text, "预算");
+        assert!(html.contains("<mark>预算</mark>") && html.contains("A&amp;B &lt;减少&gt;"));
+        assert_eq!(view.rows[3].text.as_ref(), "研发预算 A&B <减少>");
+        assert_eq!(super::match_ranges("会议 API api", "API").len(), 2);
+        view.set_query("不存在".into());
+        view.step_match(true);
+        assert!(view.matches.is_empty());
+    }
     #[test]
     fn background_sentence_correction_replaces_its_row_while_next_sentence_stays_visible() {
         let mut transcript = live_transcript(2);

@@ -26,10 +26,18 @@ pub struct Transcript {
     pub segments: Vec<Segment>,
     #[serde(default)]
     pub speaker_turns: Vec<SpeakerTurn>,
+    #[serde(default)]
+    pub speaker_names: std::collections::BTreeMap<u32, crate::SpeakerName>,
+    #[serde(default)]
+    pub speaker_voiceprints: std::collections::BTreeMap<u32, crate::Voiceprint>,
+    #[serde(default)]
+    pub speaker_memory_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processing_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_analysis_seconds: Option<f64>,
+    #[serde(default)]
+    pub output_warnings: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeakerTurn {
@@ -38,6 +46,18 @@ pub struct SpeakerTurn {
     pub speaker: u32,
 }
 impl Transcript {
+    pub fn speaker_name(&self, id: u32) -> String {
+        self.speaker_names
+            .get(&id)
+            .map(|n| {
+                if n.matched {
+                    format!("{}（声纹匹配待核对）", n.name)
+                } else {
+                    n.name.clone()
+                }
+            })
+            .unwrap_or_else(|| format!("说话人 {id}"))
+    }
     pub fn speaker_count(&self) -> usize {
         self.speaker_turns
             .iter()
@@ -98,11 +118,12 @@ impl Transcript {
             return String::new();
         }
         let mut md = String::from(
-            "\n\n## 说话人索引（本地分析）\n\n编号来自本机声纹聚类，仅用于本场会议，不代表姓名。交替或重叠句子的归属需结合逐字稿核实。\n\n| 说话人 | 首次发言 | 累计发言 |\n| --- | --- | --- |\n",
+            "\n\n## 说话人索引（本地分析）\n\n未命名编号仅用于本场会议；姓名来自用户命名或本地声纹匹配，需核对。交替或重叠句子的归属需结合逐字稿核实。\n\n| 说话人 | 首次发言 | 累计发言 |\n| --- | --- | --- |\n",
         );
         for (speaker, (start, duration)) in people {
             md.push_str(&format!(
-                "| 说话人 {speaker} | {} | {:.1} 秒 |\n",
+                "| {} | {} | {:.1} 秒 |\n",
+                escape_markdown(&self.speaker_name(speaker)).replace('|', "\\|"),
                 timestamp(start, '.'),
                 duration as f64 / 1000.
             ));
@@ -134,7 +155,7 @@ impl Transcript {
             // Keep substantial short turns rather than assigning all words to
             // the dominant speaker; we do not have word-level alignment.
             .filter(|(_, ms)| **ms >= 250 || **ms as f64 / total as f64 >= 0.15)
-            .map(|(id, _)| format!("说话人 {id}"))
+            .map(|(id, _)| self.speaker_name(*id))
             .collect::<Vec<_>>();
         if labels.len() == 1 {
             labels[0].clone()
@@ -175,7 +196,27 @@ impl Transcript {
         )
     }
     pub fn save(&self, base: &Path) -> Result<()> {
-        self.checkpoint(base)?;
+        let warnings = self.write_outputs(base);
+        anyhow::ensure!(warnings.is_empty(), "{}", warnings.join("；"));
+        Ok(())
+    }
+    /// Preserve completed analysis even when an external editor locks a derived file.
+    /// Callers show these warnings and offer retry without rerunning inference.
+    pub fn sync_outputs(&mut self, base: &Path) {
+        self.output_warnings.clear();
+        self.output_warnings = self.write_outputs(base);
+        if let Err(error) = self.checkpoint(base) {
+            let message = format!("转写数据未同步：{error:#}");
+            if !self.output_warnings.contains(&message) {
+                self.output_warnings.push(message);
+            }
+        }
+    }
+    fn write_outputs(&self, base: &Path) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Err(error) = self.checkpoint(base) {
+            warnings.push(format!("转写数据未同步：{error:#}"));
+        }
         let mut md = String::from("# 转录\n\n");
         if !self.complete {
             md.push_str("转录尚未完整完成；原媒体保留，可重新转录。\n\n");
@@ -198,7 +239,6 @@ impl Transcript {
                 format!("{} {}", self.speaker_label(s.start_ms, s.end_ms), s.text).trim()
             ));
         }
-        atomic_write(&base.with_extension("transcript.md"), md.as_bytes())?;
         let mut plain = format!("{} · 逐字稿\n\n", self.title());
         for s in self.segments.iter().filter(|s| s.finalized) {
             let speaker = self.speaker_label(s.start_ms, s.end_ms);
@@ -213,12 +253,23 @@ impl Transcript {
                 s.text
             ));
         }
-        atomic_write(&base.with_extension("transcript.txt"), plain.as_bytes())?;
-        atomic_write(&base.with_extension("srt"), srt.as_bytes())?;
-        if self.complete {
-            self.export_word(base)?;
+        for (extension, bytes) in [
+            ("transcript.md", md.as_bytes()),
+            ("transcript.txt", plain.as_bytes()),
+            ("srt", srt.as_bytes()),
+        ] {
+            if let Err(error) = atomic_write(&base.with_extension(extension), bytes) {
+                warnings.push(format!(
+                    "{extension} 未同步（可能正被其他应用占用）：{error:#}"
+                ));
+            }
         }
-        Ok(())
+        if self.complete
+            && let Err(error) = self.export_word(base)
+        {
+            warnings.push(format!("Word 未同步（可能正被其他应用占用）：{error:#}"));
+        }
+        warnings
     }
 }
 pub fn escape_markdown(text: &str) -> String {
@@ -238,11 +289,12 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         path.extension().unwrap_or_default().to_string_lossy()
     ));
     std::fs::write(&temporary, bytes)?;
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    // std::fs::rename replaces an existing file on Windows too. Never delete
+    // the old artifact before the replacement has succeeded.
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
     }
-    std::fs::rename(temporary, path)?;
     Ok(())
 }
 pub fn timestamp(ms: u64, separator: char) -> String {
@@ -257,6 +309,63 @@ pub fn timestamp(ms: u64, separator: char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_blocked_word_export_keeps_analysis_and_syncs_other_outputs_then_retries() {
+        let root =
+            std::env::temp_dir().join(format!("opencap-speaker-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let base = root.join("会议");
+        let word = base.with_extension("transcript.docx");
+        std::fs::create_dir_all(&word).unwrap(); // Inject a derived-file write failure.
+        let mut transcript = Transcript {
+            complete: true,
+            segments: vec![s(1, "预算不能增加", true)],
+            speaker_turns: vec![SpeakerTurn {
+                start_ms: 0,
+                end_ms: 5000,
+                speaker: 1,
+            }],
+            ..Default::default()
+        };
+        transcript.speaker_names.insert(
+            1,
+            crate::SpeakerName {
+                name: "张三".into(),
+                matched: false,
+                profile_id: None,
+            },
+        );
+        transcript.sync_outputs(&base);
+        assert_eq!(transcript.speaker_count(), 1);
+        assert!(
+            transcript
+                .output_warnings
+                .iter()
+                .any(|w| w.contains("Word"))
+        );
+        let saved: Transcript =
+            serde_json::from_slice(&std::fs::read(base.with_extension("transcript.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.speaker_count(), 1);
+        assert_eq!(saved.speaker_name(1), "张三");
+        assert!(!saved.output_warnings.is_empty());
+        for ext in ["transcript.txt", "transcript.md", "srt"] {
+            let text = std::fs::read_to_string(base.with_extension(ext)).unwrap();
+            assert!(
+                text.contains("张三") && text.contains("预算不能增加"),
+                "{ext}: {text}"
+            );
+        }
+        std::fs::remove_dir(&word).unwrap();
+        transcript.sync_outputs(&base);
+        assert!(transcript.output_warnings.is_empty());
+        assert!(word.is_file());
+        let saved: Transcript =
+            serde_json::from_slice(&std::fs::read(base.with_extension("transcript.json")).unwrap())
+                .unwrap();
+        assert!(saved.output_warnings.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn speaker_count_counts_groups_instead_of_the_largest_label() {
         let transcript = Transcript {

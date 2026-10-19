@@ -270,10 +270,13 @@ pub struct MicDenoiser {
     release: f32,
     gate_attack: f32,
     gate_release: f32,
+    gate_hold_frames: u32,
+    gate_hold_remaining: u32,
     comp_attack: f32,
     comp_release: f32,
     envelope: f32,
     floor: f32,
+    warmup_remaining: usize,
     block_sum: f64,
     block_count: u32,
     block_len: u32,
@@ -309,11 +312,14 @@ impl MicDenoiser {
             high_pass_a: 1.0 / (1.0 + std::f32::consts::TAU * cutoff / fs),
             release: one_pole(0.060, fs),
             gate_attack: one_pole(0.004, fs),
-            gate_release: one_pole(0.150, fs),
+            gate_release: one_pole(0.450, fs),
+            gate_hold_frames: (fs * 0.20) as u32,
+            gate_hold_remaining: 0,
             comp_attack: one_pole(0.005, fs),
             comp_release: one_pole(0.200, fs),
             envelope: 0.0,
             floor: 0.0,
+            warmup_remaining: FFT_SIZE * 3,
             block_sum: 0.0,
             block_count: 0,
             block_len: block_len as u32,
@@ -323,7 +329,7 @@ impl MicDenoiser {
             comp_gain: 1.0,
             gate_close: db_to_linear(3.5),
             gate_open: db_to_linear(9.0),
-            min_gain: db_to_linear(-24.0),
+            min_gain: db_to_linear(-15.0),
             comp_threshold: db_to_linear(-18.0),
             comp_slope: 1.0 - 1.0 / 3.0,
             makeup: db_to_linear(3.0),
@@ -332,7 +338,7 @@ impl MicDenoiser {
             agc_release: one_pole(2.0, fs),
             agc_min: db_to_linear(-18.0),
             agc_max: db_to_linear(18.0),
-            agc_target: db_to_linear(-20.0),
+            agc_target: db_to_linear(-17.0),
         }
     }
 
@@ -375,8 +381,15 @@ impl MicDenoiser {
                 self.envelope + (envelope_input - self.envelope) * self.release
             };
 
-            self.block_sum += f64::from(self.envelope);
-            self.block_count += 1;
+            // The overlap-add startup contains synthetic zeros, not a quiet
+            // room. Learning them would treat background noise as speech for
+            // the full minimum-statistics window and amplify it through AGC.
+            if self.warmup_remaining > 0 {
+                self.warmup_remaining -= 1;
+            } else {
+                self.block_sum += f64::from(self.envelope);
+                self.block_count += 1;
+            }
             if self.block_count >= self.block_len {
                 let average = (self.block_sum / f64::from(self.block_count)) as f32;
                 self.block_sum = 0.0;
@@ -392,14 +405,24 @@ impl MicDenoiser {
 
             let close = self.floor * self.gate_close;
             let open = self.floor * self.gate_open;
-            let target = if self.envelope >= open {
+            // Preserve room tone through short pauses. The spectral stage
+            // already removes steady noise; another deep, fast gate audibly
+            // switches the room on and off at every syllable.
+            let speech = self.envelope >= open && self.floor > 0.0;
+            if speech {
+                self.gate_hold_remaining = self.gate_hold_frames;
+            } else {
+                self.gate_hold_remaining = self.gate_hold_remaining.saturating_sub(1);
+            }
+            let target = if speech || self.gate_hold_remaining > 0 {
                 1.0
             } else if self.envelope <= close {
                 self.min_gain
             } else {
                 let span = (open - close).max(1e-9);
                 let t = ((self.envelope - close) / span).clamp(0.0, 1.0);
-                self.min_gain + (1.0 - self.min_gain) * t
+                let smooth = t * t * (3.0 - 2.0 * t);
+                self.min_gain + (1.0 - self.min_gain) * smooth
             };
             let gate_coefficient = if target > self.gate_gain {
                 self.gate_attack
@@ -424,7 +447,7 @@ impl MicDenoiser {
             // Slow speech-level normalisation, the way conferencing clients keep a
             // quiet array microphone audible. Gain rises on a ~2 s release so room
             // noise is not pumped up, and falls on ~100 ms so shouts never clip.
-            if self.gate_gain > 0.5 {
+            if speech {
                 let desired = (self.agc_target / level.max(1e-6)).clamp(self.agc_min, self.agc_max);
                 let coefficient = if desired < self.agc_gain {
                     self.agc_attack
@@ -572,6 +595,66 @@ mod tests {
         assert!(
             processed_bed < 0.02,
             "quiet tail leaked at {processed_bed:.5}"
+        );
+    }
+
+    #[test]
+    fn continuous_room_tone_survives_pauses_without_agc_chasing_the_noise() {
+        let mut source = noise(2.0, 0.003);
+        let mut voice = interleave(
+            (0..48_000).map(|i| (std::f32::consts::TAU * 440. * i as f32 / RATE).sin() * 0.1),
+        );
+        let bed = noise(1.0, 0.003);
+        for (v, n) in voice.iter_mut().zip(bed) {
+            *v += n;
+        }
+        source.extend(voice.clone());
+        let pause_start = source.len();
+        source.extend(noise(2.0, 0.003));
+        let resume = source.len();
+        source.extend(voice);
+        let mut denoiser = MicDenoiser::new(48_000);
+        let mut output = source.clone();
+        let mut during_pause = Vec::new();
+        for (index, packet) in output.chunks_mut(960).enumerate() {
+            denoiser.process(packet);
+            let offset = index * 960;
+            if offset >= pause_start + 19_200 && offset < resume {
+                during_pause.push((denoiser.gate_gain(), denoiser.agc_gain));
+            }
+        }
+        // The first 200 ms keeps the room open; no gate chop between clauses.
+        assert!(
+            during_pause[0].0 > 0.9,
+            "short pause closed the room abruptly: {:?}",
+            during_pause[0]
+        );
+        let agc_start = during_pause[20].1;
+        let agc_end = during_pause.last().unwrap().1;
+        assert!(
+            (agc_end / agc_start - 1.).abs() < 0.02,
+            "AGC amplified silence: {agc_start} -> {agc_end}"
+        );
+        // Twenty-millisecond windows of an actual nonzero noise bed remain
+        // audible rather than collapsing by tens of dB at a gate boundary.
+        let windows: Vec<_> = output[pause_start + 48_000..resume]
+            .chunks_exact(1920)
+            .map(rms)
+            .collect();
+        assert!(windows.iter().all(|level| *level > 0.00001));
+        for pair in windows.windows(2) {
+            let change = 20. * (pair[1] / pair[0]).log10();
+            assert!(
+                change.abs() < 4.,
+                "room tone stepped by {change:.1} dB in 20 ms"
+            );
+        }
+        let delay = MicDenoiser::LATENCY_FRAMES * 2;
+        let onset = rms(&output[resume + delay..resume + delay + 3840]);
+        let established = rms(&output[resume + delay + 9600..resume + delay + 13440]);
+        assert!(
+            onset > established * 0.65,
+            "speech onset was swallowed: {onset} vs {established}"
         );
     }
     #[test]

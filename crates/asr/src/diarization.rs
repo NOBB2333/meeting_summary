@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const SEGMENTATION: &str = "sherpa-onnx-pyannote-segmentation-3-0";
-const EMBEDDING: &str = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
+pub(crate) const EMBEDDING: &str = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
 pub fn speakers_ready(root: &Path) -> bool {
     [
         root.join("diarization/model.int8.onnx"),
@@ -195,8 +195,27 @@ pub fn distinguish_speakers_with_threads(
         !transcript.speaker_turns.is_empty(),
         "未检测到可区分的说话人；请检查音轨和声音大小"
     );
+    drop(result);
+    drop(diarizer);
+    transcript.speaker_names.clear();
+    transcript.speaker_voiceprints.clear();
+    status("提取独立发言声纹并匹配本机已保存姓名…".into());
+    transcript.speaker_memory_status = match crate::speaker_memory::extract_and_match(
+        &mut transcript,
+        &samples,
+        root,
+        threads,
+        cancelled,
+    ) {
+        Ok(()) => format!(
+            "已匹配 {} 个姓名；未匹配者保留本场编号",
+            transcript.speaker_names.len()
+        ),
+        Err(e) => format!("分析已保留，声纹记忆暂不可用：{e:#}"),
+    };
+    anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "已取消；已有结果保留");
     transcript.speaker_analysis_seconds = Some(began.elapsed().as_secs_f64());
-    transcript.save(output)?;
+    transcript.sync_outputs(output);
     Ok(transcript)
 }
 #[cfg(test)]

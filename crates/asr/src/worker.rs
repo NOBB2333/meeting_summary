@@ -24,7 +24,7 @@ pub enum AsrEvent {
     Segment(Segment),
     Progress(f64),
     Gap(u64, u64),
-    Finished(Transcript),
+    Finished(Box<Transcript>),
     Error(String),
 }
 pub struct AsrSession {
@@ -335,9 +335,9 @@ impl AsrSession {
                             if transcript.source.is_none() {
                                 transcript.source = Some(base.clone());
                             }
-                            transcript.save(&base)?;
+                            transcript.sync_outputs(&base);
                         }
-                        let _ = tx.send(AsrEvent::Finished(transcript));
+                        let _ = tx.send(AsrEvent::Finished(Box::new(transcript)));
                         if !worker_cancelled.load(Ordering::Relaxed) {
                             read_result?;
                         }

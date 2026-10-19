@@ -2,6 +2,33 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+/// One identity for a media path and the corresponding artifact prefix.
+/// Resolve existing parent aliases without moving or renaming user files.
+pub fn meeting_base(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let stem = [
+        ".transcript.json",
+        ".recording.json",
+        ".partial.mp4",
+        ".partial.m4a",
+        ".mp4",
+        ".m4a",
+    ]
+    .into_iter()
+    .find_map(|suffix| name.strip_suffix(suffix))
+    .unwrap_or(&name);
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf())
+        .join(stem)
+}
+
 fn folder_name(label: &str) -> String {
     let cleaned: String = label
         .chars()

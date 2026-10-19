@@ -7,6 +7,16 @@ struct Message {
     user: bool,
     text: String,
     pending: bool,
+    artifact: bool,
+    version: Option<u64>,
+}
+pub(super) enum ChatEvent {
+    OpenArtifact(u64),
+}
+pub(super) struct ReplyState {
+    pub busy: bool,
+    pub reset: bool,
+    pub artifact: bool,
 }
 pub(super) struct ChatView {
     state: ListState,
@@ -28,11 +38,17 @@ impl ChatView {
         history: &opencap_asr::MinutesHistory,
         request: &str,
         stream: &str,
-        busy: bool,
-        reset: bool,
+        state: ReplyState,
         cx: &mut Context<Self>,
     ) {
-        self.update_rows(history, request, stream, busy, reset);
+        self.update_rows(
+            history,
+            request,
+            stream,
+            state.busy,
+            state.reset,
+            state.artifact,
+        );
         cx.notify();
     }
     fn update_rows(
@@ -42,30 +58,59 @@ impl ChatView {
         stream: &str,
         busy: bool,
         reset: bool,
+        artifact_reply: bool,
     ) {
         self.running = busy;
         let mut rows = Vec::new();
         for turn in &history.conversation {
             rows.push(Message {
                 user: true,
-                text: turn.request.clone(),
+                text: display_request(&turn.request),
                 pending: false,
+                artifact: false,
+                version: None,
             });
+            let version = history
+                .versions
+                .iter()
+                .rev()
+                .find(|version| {
+                    version.markdown == turn.reply && version.instruction == turn.request
+                })
+                .or_else(|| {
+                    history
+                        .versions
+                        .iter()
+                        .find(|version| version.markdown == turn.reply)
+                })
+                .map(|v| v.number);
             rows.push(Message {
                 user: false,
-                text: turn.reply.clone(),
+                text: version
+                    .map(|number| format!("会议纪要 · v{number}"))
+                    .unwrap_or_else(|| turn.reply.clone()),
                 pending: false,
+                artifact: version.is_some(),
+                version,
             });
         }
         if !request.is_empty() {
             rows.push(Message {
                 user: true,
-                text: request.into(),
+                text: display_request(request),
                 pending: false,
+                artifact: false,
+                version: None,
             });
             rows.push(Message {
                 user: false,
-                text: if stream.is_empty() {
+                text: if artifact_reply {
+                    if busy {
+                        format!("正在整理文档 · 已收到 {} 字", stream.chars().count())
+                    } else {
+                        "生成未完成 · 可查看未保存预览".into()
+                    }
+                } else if stream.is_empty() {
                     if busy {
                         "正在等待正文…"
                     } else {
@@ -76,6 +121,8 @@ impl ChatView {
                     stream.into()
                 },
                 pending: true,
+                artifact: artifact_reply,
+                version: None,
             });
         }
         if reset {
@@ -97,10 +144,26 @@ impl ChatView {
         self.rows = Rc::new(rows);
     }
 }
+impl EventEmitter<ChatEvent> for ChatView {}
+fn display_request(request: &str) -> String {
+    if ["标准会议纪要正文：", "阅读摘要：", "行动清单："]
+        .iter()
+        .any(|prefix| request.starts_with(prefix))
+        && let Some((_, text)) = request.split_once("\n用户补充要求：")
+    {
+        return if text.trim().is_empty() {
+            "生成会议纪要".into()
+        } else {
+            text.trim().into()
+        };
+    }
+    request.into()
+}
 impl Render for ChatView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows.clone();
         let running = self.running;
+        let entity = cx.entity().downgrade();
         div()
             .size_full()
             .flex()
@@ -160,20 +223,36 @@ impl Render for ChatView {
                                     } else {
                                         "AI"
                                     }));
-                                if row.user {
+                                if row.artifact {
+                                    let version = row.version.unwrap_or(0);
+                                    let entity = entity.clone();
                                     message = message.child(
-                                        div()
-                                            .p_3()
-                                            .rounded_lg()
-                                            .bg(rgb(SOFT))
-                                            .text_sm()
-                                            .child(row.text.clone()),
+                                        button(("chat-artifact", index), row.text.clone(), false)
+                                            .w_full()
+                                            .on_click(move |_, _, cx| {
+                                                let _ = entity.update(cx, |_, cx| {
+                                                    cx.emit(ChatEvent::OpenArtifact(version))
+                                                });
+                                            }),
+                                    );
+                                } else if row.user {
+                                    message = message.child(
+                                        div().p_3().rounded_lg().bg(rgb(SOFT)).text_sm().child(
+                                            TextView::markdown(
+                                                ("chat-user", index),
+                                                opencap_asr::escape_markdown(&row.text),
+                                            )
+                                            .selectable(true),
+                                        ),
                                     );
                                 } else {
-                                    message = message.child(TextView::markdown(
-                                        ("chat-message", index),
-                                        row.text.clone(),
-                                    ));
+                                    message = message.child(
+                                        TextView::markdown(
+                                            ("chat-message", index),
+                                            row.text.clone(),
+                                        )
+                                        .selectable(true),
+                                    );
                                 }
                                 message.into_any_element()
                             })
@@ -199,7 +278,7 @@ mod tests {
             });
         }
         let mut view = ChatView::new();
-        view.update_rows(&history, "下一轮", "当前正文", true, true);
+        view.update_rows(&history, "下一轮", "当前正文", true, true, false);
         assert_eq!(view.rows.len(), 502);
         assert!(view.rows[0].text.contains("修改要求 0"));
         view.state.set_follow_mode(FollowMode::Normal);
@@ -207,7 +286,7 @@ mod tests {
             item_ix: 12,
             offset_in_item: px(18.),
         });
-        view.update_rows(&history, "下一轮", "当前正文继续增加", true, false);
+        view.update_rows(&history, "下一轮", "当前正文继续增加", true, false, false);
         let anchor = view.state.logical_scroll_top();
         assert_eq!(anchor.item_ix, 12);
         assert_eq!(anchor.offset_in_item, px(18.));
@@ -215,9 +294,42 @@ mod tests {
             request: "下一轮".into(),
             reply: "完整正文".into(),
         });
-        view.update_rows(&history, "", "", false, false);
+        view.update_rows(&history, "", "", false, false, false);
         assert_eq!(view.rows.len(), 502);
         assert_eq!(view.rows.last().unwrap().text, "完整正文");
         assert_eq!(view.state.logical_scroll_top().item_ix, 12);
+    }
+    #[test]
+    fn generated_documents_are_version_cards_while_questions_stream_in_chat() {
+        let history = opencap_asr::MinutesHistory {
+            versions: vec![opencap_asr::MinutesVersion {
+                number: 1,
+                created_unix: 0,
+                instruction: "初稿".into(),
+                markdown: "# 正文\n预算不能增加。".into(),
+                elapsed_seconds: None,
+            }],
+            conversation: vec![opencap_asr::MinutesTurn {
+                request: "标准会议纪要正文：模板要求\n用户补充要求：请简短一些".into(),
+                reply: "# 正文\n预算不能增加。".into(),
+            }],
+        };
+        let mut view = ChatView::new();
+        view.update_rows(&history, "继续修改", "# 新正文", true, true, true);
+        assert_eq!(view.rows[0].text, "请简短一些");
+        assert_eq!(view.rows[1].version, Some(1));
+        assert!(view.rows[1].artifact);
+        assert!(view.rows[3].artifact);
+        assert!(!view.rows[3].text.contains("# 新正文"));
+        view.update_rows(
+            &history,
+            "预算是多少？",
+            "原文没有明确金额。",
+            true,
+            false,
+            false,
+        );
+        assert!(!view.rows[3].artifact);
+        assert_eq!(view.rows[3].text, "原文没有明确金额。");
     }
 }
