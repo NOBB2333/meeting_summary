@@ -10,7 +10,15 @@ impl Recorder {
         {
             return None; // The conversation shows its own status and timer without moving the document.
         }
-        let progress = if self.speaker_task.is_some() {
+        let progress = if self.ai.correction_task.is_some() {
+            ui::task_progress(
+                "correction-task-progress",
+                "正在校正转写全文",
+                &self.ai.status,
+                &self.ai_clock,
+                None,
+            )
+        } else if self.speaker_task.is_some() {
             ui::task_progress(
                 "speaker-task-progress",
                 "正在区分说话人",

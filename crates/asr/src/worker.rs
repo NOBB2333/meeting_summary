@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use opencap_core::PcmAudio;
+use opencap_core::{PcmAudio, TranscriptionLanguage};
 use sherpa_onnx::*;
 use std::{
     path::{Path, PathBuf},
@@ -51,6 +51,7 @@ impl AsrSession {
             false,
             hotwords,
             revision,
+            TranscriptionLanguage::default(),
         )
     }
     /// The caller selects only installed models; sentence mode uses the same VAD
@@ -60,6 +61,14 @@ impl AsrSession {
         hotwords: String,
         plan: crate::LiveModelPlan,
     ) -> Result<Self> {
+        Self::live_with_plan_language(root, hotwords, plan, TranscriptionLanguage::default())
+    }
+    pub fn live_with_plan_language(
+        root: PathBuf,
+        hotwords: String,
+        plan: crate::LiveModelPlan,
+        language: TranscriptionLanguage,
+    ) -> Result<Self> {
         Self::spawn(
             root,
             plan.kind,
@@ -68,6 +77,7 @@ impl AsrSession {
             false,
             hotwords,
             plan.context_revision,
+            language,
         )
     }
     pub fn file(
@@ -105,6 +115,28 @@ impl AsrSession {
         hotwords: String,
         revision: bool,
     ) -> Result<Self> {
+        Self::file_with_language(
+            root,
+            kind,
+            source,
+            output,
+            realtime,
+            hotwords,
+            revision,
+            TranscriptionLanguage::default(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn file_with_language(
+        root: PathBuf,
+        kind: ModelKind,
+        source: PathBuf,
+        output: PathBuf,
+        realtime: bool,
+        hotwords: String,
+        revision: bool,
+        language: TranscriptionLanguage,
+    ) -> Result<Self> {
         Self::spawn(
             root,
             kind,
@@ -113,8 +145,10 @@ impl AsrSession {
             realtime,
             hotwords,
             revision,
+            language,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         root: PathBuf,
         kind: ModelKind,
@@ -123,6 +157,7 @@ impl AsrSession {
         realtime: bool,
         hotwords: String,
         context_revision: bool,
+        language: TranscriptionLanguage,
     ) -> Result<Self> {
         let (input, rx) = bounded(1400); // about 30 seconds of mixed recording PCM
         let (tx, events) = unbounded();
@@ -170,6 +205,7 @@ impl AsrSession {
                             kind,
                             &kind.path(&root),
                             &hotwords,
+                            language,
                             revision.as_deref(),
                             worker_cancelled.clone(),
                             &tx,
@@ -382,11 +418,14 @@ impl AsrSession {
         self.worker.is_finished()
     }
 }
-pub(crate) fn sense_voice(dir: &Path) -> Result<OfflineRecognizer> {
+pub(crate) fn sense_voice(
+    dir: &Path,
+    language: TranscriptionLanguage,
+) -> Result<OfflineRecognizer> {
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
         model: Some(dir.join("model.int8.onnx").to_string_lossy().into_owned()),
-        language: Some("auto".into()),
+        language: Some(language.code().into()),
         use_itn: true,
     };
     config.model_config.tokens = Some(dir.join("tokens.txt").to_string_lossy().into_owned());
@@ -428,6 +467,7 @@ impl Engine {
         kind: ModelKind,
         dir: &Path,
         hotwords: &str,
+        language: TranscriptionLanguage,
         revision_dir: Option<&Path>,
         cancelled: Arc<AtomicBool>,
         events: &Sender<AsrEvent>,
@@ -488,7 +528,9 @@ impl Engine {
                     end: 0,
                     committed: false,
                     correction: revision_dir
-                        .map(|dir| Reviser::new(dir.to_path_buf(), cancelled, events.clone()))
+                        .map(|dir| {
+                            Reviser::new(dir.to_path_buf(), language, cancelled, events.clone())
+                        })
                         .transpose()?,
                     utterance_audio: revision_dir.map(|_| Vec::new()),
                 })
@@ -497,7 +539,7 @@ impl Engine {
                 let mut config = OfflineRecognizerConfig::default();
                 config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
                     model: file("model.int8.onnx"),
-                    language: Some("auto".into()),
+                    language: Some(language.code().into()),
                     use_itn: true,
                 };
                 config.model_config.tokens = file("tokens.txt");

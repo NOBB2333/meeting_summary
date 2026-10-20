@@ -17,6 +17,8 @@ pub struct Segment {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Transcript {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<crate::TranscriptCorrection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_duration_ms: Option<u64>,
     pub source: Option<PathBuf>,
     pub model: String,
@@ -72,10 +74,12 @@ impl Transcript {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "会议录音".into())
     }
-    /// Human-readable verbatim output: never send it through an LLM.
+    /// Human-readable output, with explicit provenance for optional AI proofreading.
     pub fn document_markdown(&self) -> String {
         let mut text = format!("# {} · 逐字稿\n\n", escape_markdown(&self.title()));
-        text.push_str(if self.complete {
+        text.push_str(if self.correction.is_some() {
+            "本稿经过 AI 全文语义校正，原始识别文字保留，可在应用内恢复。请核对重要内容。\n\n"
+        } else if self.complete {
             "本稿为语音识别原文，未经过 AI 改写。\n\n"
         } else {
             "转录未完成，以下仅为已确认原文。\n\n"
@@ -218,6 +222,9 @@ impl Transcript {
             warnings.push(format!("转写数据未同步：{error:#}"));
         }
         let mut md = String::from("# 转录\n\n");
+        if self.correction.is_some() {
+            md.push_str("AI 全文语义校正稿；原始识别文字保留，可在应用内恢复。\n\n");
+        }
         if !self.complete {
             md.push_str("转录尚未完整完成；原媒体保留，可重新转录。\n\n");
         }
@@ -240,6 +247,9 @@ impl Transcript {
             ));
         }
         let mut plain = format!("{} · 逐字稿\n\n", self.title());
+        if self.correction.is_some() {
+            plain.push_str("AI 全文语义校正稿；原始识别文字保留，可在应用内恢复。\n\n");
+        }
         for s in self.segments.iter().filter(|s| s.finalized) {
             let speaker = self.speaker_label(s.start_ms, s.end_ms);
             plain.push_str(&format!(

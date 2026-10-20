@@ -24,6 +24,9 @@ enum Command {
         realtime: bool,
         #[arg(long,default_value=DEFAULT_HOTWORDS)]
         hotwords: String,
+        /// Language hint: zh (Chinese with English terms), en, or auto (five languages).
+        #[arg(long, default_value = "zh", value_parser = ["zh", "en", "auto"])]
+        language: String,
     },
     Summary {
         transcript: PathBuf,
@@ -81,15 +84,23 @@ fn main() -> Result<()> {
             model,
             realtime,
             hotwords,
+            language,
         } => {
             let input = input.canonicalize()?;
-            let session = AsrSession::file_with_hotwords(
+            let language = match language.as_str() {
+                "en" => opencap_core::TranscriptionLanguage::English,
+                "auto" => opencap_core::TranscriptionLanguage::Auto,
+                _ => opencap_core::TranscriptionLanguage::Chinese,
+            };
+            let session = AsrSession::file_with_language(
                 model_root(),
                 model,
                 input,
                 output,
                 realtime,
                 hotwords,
+                true,
+                language,
             )?;
             let mut complete = false;
             while let Ok(event) = session.events.recv() {

@@ -1,4 +1,5 @@
 mod audio;
+mod correction;
 mod diarization;
 mod document;
 mod meeting;
@@ -11,6 +12,7 @@ mod summary;
 mod summary_stream;
 mod transcript;
 mod worker;
+pub use correction::*;
 pub use diarization::*;
 pub use document::*;
 pub use meeting::*;

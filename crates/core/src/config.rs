@@ -7,6 +7,31 @@ use std::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TranscriptionLanguage {
+    #[default]
+    Chinese,
+    English,
+    Auto,
+}
+impl TranscriptionLanguage {
+    pub const ALL: [Self; 3] = [Self::Chinese, Self::English, Self::Auto];
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Chinese => "zh",
+            Self::English => "en",
+            Self::Auto => "auto",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chinese => "中文为主（含英文术语）",
+            Self::English => "英文为主",
+            Self::Auto => "自动（含中英日韩粤）",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Preset {
     #[default]
     Space,
@@ -62,6 +87,7 @@ pub struct RecordingConfig {
     pub monitor_levels: bool,
     pub realtime_transcription: bool,
     pub transcription_hotwords: String,
+    pub transcription_language: TranscriptionLanguage,
     pub transcription_context_revision: bool,
     pub show_floating_controls: bool,
     pub show_capture_border: bool,
@@ -102,6 +128,7 @@ impl Default for RecordingConfig {
             monitor_levels: false,
             realtime_transcription: true,
             transcription_hotwords: "录屏,语音转录,会议纪要,实时字幕".into(),
+            transcription_language: TranscriptionLanguage::default(),
             transcription_context_revision: false,
             show_floating_controls: false,
             show_capture_border: !cfg!(target_os = "linux"),
@@ -227,6 +254,20 @@ pub fn config_path() -> PathBuf {
 #[cfg(test)]
 mod border_tests {
     use super::*;
+    #[test]
+    fn language_defaults_to_chinese_and_explicit_english_or_auto_survive_save() {
+        let old: RecordingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.transcription_language, TranscriptionLanguage::Chinese);
+        for language in TranscriptionLanguage::ALL {
+            let config = RecordingConfig {
+                transcription_language: language,
+                ..Default::default()
+            };
+            let loaded: RecordingConfig =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(loaded.transcription_language, language);
+        }
+    }
     #[test]
     fn legacy_switch_and_timed_border() {
         let old: RecordingConfig =

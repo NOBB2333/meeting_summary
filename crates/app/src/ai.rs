@@ -1,4 +1,9 @@
+#[cfg(feature = "ui-smoke")]
+mod checks;
+mod correction;
 use super::*;
+#[cfg(feature = "ui-smoke")]
+pub(super) use checks::chat_benchmark;
 use gpui::component::{
     input::{Input, InputEvent, Textarea, TextareaState},
     resizable::{h_resizable, resizable_panel},
@@ -13,6 +18,8 @@ use std::sync::{
 };
 
 pub(super) struct AiWorkspace {
+    #[cfg(feature = "ui-smoke")]
+    send_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     pub config: AiConfig,
     url: Entity<InputState>,
     model: Entity<InputState>,
@@ -35,6 +42,9 @@ pub(super) struct AiWorkspace {
     pub chat_dirty: bool,
     chat_reset: bool,
     pub clear_composer: bool,
+    submitted_composer: String,
+    pub correction_task:
+        Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::Transcript>>>,
     ask_only: bool,
     history_expanded: bool,
     conversation_tab: bool,
@@ -117,6 +127,8 @@ impl AiWorkspace {
         })
         .detach();
         Self {
+            #[cfg(feature = "ui-smoke")]
+            send_bounds: Rc::new(std::cell::Cell::new(None)),
             terminology: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .placeholder("每行一条，例如：\n欧盆盖 => OpenCap\n统信 UOS\n张伟")
@@ -169,6 +181,8 @@ impl AiWorkspace {
             chat_dirty: true,
             chat_reset: true,
             clear_composer: false,
+            submitted_composer: String::new(),
+            correction_task: None,
             ask_only: false,
             history_expanded: false,
             conversation_tab: true,
@@ -213,9 +227,11 @@ impl Recorder {
             self.ai.editor_sync = false;
         }
         if self.ai.clear_composer {
-            self.ai
-                .instruction
-                .update(cx, |s, cx| s.set_value("", window, cx));
+            if self.ai.instruction.read(cx).value().as_str() == self.ai.submitted_composer {
+                self.ai
+                    .instruction
+                    .update(cx, |s, cx| s.set_value("", window, cx));
+            }
             self.ai.clear_composer = false;
         }
         if let Some((origin, key)) = self.ai.pending_key.take()
@@ -512,6 +528,22 @@ impl Recorder {
                     self.ai.editor_sync = true;
                     self.ai.chat_dirty = true;
                     self.ai.chat_reset = true;
+                    if let Ok(bytes) = std::fs::read(output.with_extension("summary.request.json"))
+                        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    {
+                        let request = value["request"].as_str().unwrap_or_default();
+                        if !self
+                            .ai
+                            .history
+                            .conversation
+                            .last()
+                            .is_some_and(|turn| turn.request == request)
+                        {
+                            self.ai.pending_request = request.into();
+                            self.ai.stream_artifact = value["artifact"].as_bool().unwrap_or(false);
+                            self.ai.status = "上次发送尚未完成，要求已保留；可重试本轮。".into();
+                        }
+                    }
                 }
                 Err(_) => {
                     self.ai.status = "已有纪要无法载入；文件保留，请检查保存目录".into();
@@ -633,6 +665,8 @@ impl Recorder {
             || self.ai.document_task.is_some()
             || !self.transcript.complete
         {
+            self.ai.status = "当前任务尚未完成或转录未就绪，输入内容保留，请稍后发送。".into();
+            cx.notify();
             return;
         }
         let config = match self.ai_config_from_inputs(cx) {
@@ -640,6 +674,7 @@ impl Recorder {
             Err(e) => {
                 self.ai.status = e.to_string();
                 self.settings = true;
+                self.settings_page = settings::SettingsPage::Ai;
                 self.page_scroll.set_offset(point(px(0.), px(0.)));
                 cx.notify();
                 return;
@@ -650,6 +685,7 @@ impl Recorder {
             cx.notify();
             return;
         }
+        self.ai.submitted_composer = self.ai.instruction.read(cx).value().to_string();
         let mut instruction =
             instruction.unwrap_or_else(|| self.ai.instruction.read(cx).value().to_string());
         if action != MinutesAction::Generate && instruction.trim().is_empty() {
@@ -700,6 +736,7 @@ impl Recorder {
                     Ok(None) => {
                         this.ai.status = "尚未保存 API Key，请在 AI 配置中填写并保存".into();
                         this.settings = true;
+                        this.settings_page = settings::SettingsPage::Ai;
                         this.page_scroll.set_offset(point(px(0.), px(0.)));
                     }
                     Err(_) => this.ai.status = "系统凭据库读取失败，请重新填写并保存密钥".into(),
@@ -718,8 +755,19 @@ impl Recorder {
         instruction: String,
     ) {
         let Some(output) = self.transcript_output.clone() else {
+            self.ai.status = "会议保存位置不可用，未发送；输入内容保留".into();
             return;
         };
+        let pending = serde_json::json!({"request":instruction,"artifact":action != MinutesAction::Ask,"draft":self.ai.submitted_composer});
+        if let Err(e) = opencap_asr::atomic_write(
+            &output.with_extension("summary.request.json"),
+            pending.to_string().as_bytes(),
+        ) {
+            self.ai.status = format!("无法保存本轮请求，尚未发送：{e}");
+            return;
+        }
+        self.ai.clear_composer = true;
+        self.ai.conversation_tab = true;
         let transcript = self.transcript.clone();
         let history = self.ai.history.clone();
         let format = self.ai.format.clone();
@@ -930,7 +978,7 @@ impl Recorder {
             .h_full()
             .min_h(px(0.))
             .overflow_hidden()
-            .gap_3()
+            .gap_2()
             .child(
                 div()
                     .flex()
@@ -988,6 +1036,23 @@ impl Recorder {
                     .child(self.ai.chat.clone()),
             )
             .child(Textarea::new(&self.ai.instruction).disabled(busy).w_full())
+            .when(!busy && !self.ai.pending_request.is_empty(), |d| {
+                d.child(
+                    button("retry-minutes-message", "重试上次发送", false).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            let action = if !this.ai.stream_artifact {
+                                MinutesAction::Ask
+                            } else if this.ai.history.latest().is_empty() {
+                                MinutesAction::Generate
+                            } else {
+                                MinutesAction::Revise
+                            };
+                            let request = ai_chat::display_request(&this.ai.pending_request);
+                            this.request_minutes_with_instruction(action, Some(request), cx);
+                        },
+                    )),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1011,17 +1076,7 @@ impl Recorder {
                             })),
                     )
                     .when(self.summary_task.is_none(), |d| {
-                        d.child(
-                            primary_button(
-                                "send-minutes-message",
-                                if self.ai.ask_only {
-                                    "发送问题"
-                                } else if has_minutes {
-                                    "发送修改"
-                                } else {
-                                    "生成纪要"
-                                },
-                            )
+                        let send = primary_button("send-minutes-message", "发送")
                             .disabled(busy || !ready || self.ai.editing)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let action = if this.ai.ask_only {
@@ -1032,8 +1087,13 @@ impl Recorder {
                                     MinutesAction::Revise
                                 };
                                 this.request_minutes(action, cx);
-                            })),
-                        )
+                            }));
+                        #[cfg(feature = "ui-smoke")]
+                        let send = div().child(send).on_children_prepainted({
+                            let bounds = self.ai.send_bounds.clone();
+                            move |children, _, _| bounds.set(children.first().copied())
+                        });
+                        d.child(send)
                     })
                     .when(self.summary_task.is_some(), |d| {
                         d.child(
@@ -1267,7 +1327,7 @@ impl Recorder {
                 .when(text.is_empty(), |d| d.child(div().py_8().flex().flex_col().gap_3()
                     .child(div().text_lg().child("从一份会议纪要开始"))
                     .child(label("在对话框中生成初稿，或自己编写正文。可以给修改建议、添加历史样式，直到内容满意。"))))
-                .when(!text.is_empty(), |d| d.child(TextView::markdown("meeting-summary", text).selectable(true))));
+                .when(!text.is_empty(), |d| d.child(TextView::markdown("meeting-summary", text).selectable(true).scrollable(false))));
         }
         if self.ai.history_expanded {
             let mut versions = div()
@@ -1381,9 +1441,9 @@ impl Recorder {
             .child(tabs)
             .when(self.ai.terminology_expanded, |d| {
                 d.child(ui::card().id("minutes-keyword-scroll").max_h(px(260.)).overflow_y_scroll().flex_shrink_0().gap_2()
-                    .child(label("关键词修订 · 保存后用于所有会议的 AI 提取、生成和修订"))
+                    .child(label("关键词修订 · 保存后用于全文语义校正，也用于纪要生成和修订"))
                     .child(Textarea::new(&self.ai.terminology).disabled(busy))
-                    .child(label("一行一个标准词，或“误识别词 => 正确词”。AI 按上下文修正，已有稿件会保存为新版本。"))
+                    .child(label("一行一个标准词，或“误识别词 => 正确词”。AI 结合整场上下文校正转写，保留原文、时间与说话人；不是固定词替换。"))
                     .child(div().flex().flex_wrap().gap_2()
                         .child(button("save-minutes-keywords", "保存关键词", false).disabled(busy)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1394,13 +1454,9 @@ impl Recorder {
                                 };
                                 cx.notify();
                             })))
-                        .child(primary_button("revise-with-keywords", "按关键词修订正文")
-                            .disabled(busy || !has_minutes || !ready || self.ai.editing || self.ai.terminology.read(cx).value().trim().is_empty())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let instruction = format!("根据已保存的关键词词表，核对并修正当前纪要中的人名、公司名、专业词及明确的同音误识别。保留其他内容、格式和已核对事实，返回完整正文。\n补充要求：{}", this.ai.instruction.read(cx).value());
-                                this.ai.ask_only = false;
-                                this.request_minutes_with_instruction(MinutesAction::Revise, Some(instruction), cx);
-                            })))))
+                        .child(primary_button("revise-with-keywords", "AI 校正转写全文")
+                            .disabled(busy || !ready || self.ai.editing)
+                            .on_click(cx.listener(|this, _, _, cx| this.request_transcript_correction(cx))))))
             })
             .when(self.ai.format_expanded, |d| {
                 d.child(

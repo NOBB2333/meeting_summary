@@ -461,13 +461,13 @@ pub(super) fn check_cancel(cancelled: &AtomicBool) -> Result<()> {
     );
     Ok(())
 }
-struct AiClient<'a> {
+pub(crate) struct AiClient<'a> {
     client: reqwest::blocking::Client,
     config: &'a AiConfig,
     key: &'a str,
 }
 impl<'a> AiClient<'a> {
-    fn new(config: &'a AiConfig, key: &'a str) -> Result<Self> {
+    pub(crate) fn new(config: &'a AiConfig, key: &'a str) -> Result<Self> {
         let builder = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -564,7 +564,7 @@ impl<'a> AiClient<'a> {
         check_cancel(cancelled)?;
         parse_reply(provider, &value)
     }
-    fn generate_streamed(
+    pub(crate) fn generate_streamed(
         &self,
         system: &str,
         prompt: &str,
@@ -739,7 +739,7 @@ pub fn summarize(transcript: &Transcript, model: Option<&str>, output: &Path) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn keywords_reach_long_transcript_extraction_and_revision_and_save_new_document_versions() {
@@ -1067,8 +1067,8 @@ mod tests {
         net::TcpListener,
         sync::{Arc, Mutex},
     };
-    type Requests = Arc<Mutex<Vec<(String, Value)>>>;
-    fn mock(responses: Vec<Value>) -> (String, Requests, std::thread::JoinHandle<()>) {
+    pub(crate) type Requests = Arc<Mutex<Vec<(String, Value)>>>;
+    pub(crate) fn mock(responses: Vec<Value>) -> (String, Requests, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1117,7 +1117,7 @@ mod tests {
         });
         (url, requests, thread)
     }
-    fn reply(provider: AiProvider, text: &str) -> Value {
+    pub(crate) fn reply(provider: AiProvider, text: &str) -> Value {
         match provider {
             AiProvider::Responses => {
                 json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":text}]}]})

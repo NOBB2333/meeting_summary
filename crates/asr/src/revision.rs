@@ -29,11 +29,12 @@ pub(crate) struct Reviser {
 impl Reviser {
     pub fn new(
         dir: PathBuf,
+        language: opencap_core::TranscriptionLanguage,
         cancelled: Arc<AtomicBool>,
         events: Sender<AsrEvent>,
     ) -> anyhow::Result<Self> {
         Self::spawn(cancelled, move || {
-            let model = super::worker::sense_voice(&dir);
+            let model = super::worker::sense_voice(&dir, language);
             if let Err(e) = &model {
                 let _ = events.send(AsrEvent::Status(format!(
                     "整句校正不可用，继续显示流式原文：{e:#}"

@@ -22,6 +22,7 @@ impl Recorder {
             || self.preparing_model.is_some()
             || self.summary_task.is_some()
             || self.ai.document_task.is_some()
+            || self.ai.correction_task.is_some()
             || self.ai.credentials_busy
             || self.speaker_task.is_some()
             || self.transcript_sync.is_some()
@@ -52,10 +53,11 @@ impl Recorder {
                 "未找到本地语音模型；请在设置下载。录制文件会正常保存".into();
             return None;
         };
-        match AsrSession::live_with_plan(
+        match AsrSession::live_with_plan_language(
             model_root(),
             self.config.transcription_hotwords.clone(),
             plan,
+            self.config.transcription_language,
         ) {
             Ok(asr) => {
                 let sender = asr.audio_sender();
@@ -180,7 +182,7 @@ impl Recorder {
             }
         };
         let output = opencap_core::meeting_base(&output);
-        match AsrSession::file_with_revision(
+        match AsrSession::file_with_language(
             model_root(),
             if realtime {
                 ModelKind::Streaming
@@ -192,6 +194,7 @@ impl Recorder {
             realtime,
             self.config.transcription_hotwords.clone(),
             self.config.transcription_context_revision,
+            self.config.transcription_language,
         ) {
             Ok(asr) => {
                 self.transcription_clock.start();
@@ -306,7 +309,12 @@ impl Recorder {
         if let Some(rx) = &self.ai.events {
             for event in rx.try_iter() {
                 match event {
-                    opencap_asr::MinutesEvent::Status(status) => self.ai.status = status,
+                    opencap_asr::MinutesEvent::Status(status) => {
+                        if self.ai.correction_task.is_some() {
+                            self.transcription_status = status.clone();
+                        }
+                        self.ai.status = status;
+                    }
                     opencap_asr::MinutesEvent::Delta(text) => self.ai.stream.push_str(&text),
                 }
                 self.ai.chat_dirty = true;
@@ -335,13 +343,59 @@ impl Recorder {
                     self.ai.history = history;
                     self.ai.stream.clear();
                     self.ai.pending_request.clear();
-                    self.ai.clear_composer = true;
+                    if let Some(output) = &self.transcript_output {
+                        let _ = std::fs::remove_file(output.with_extension("summary.request.json"));
+                    }
                     self.ai.editor_sync = true;
                     self.remember_meeting();
                     self.ai.status = "AI 结果已保存，可继续提问或修改；旧版本保留".into();
                 }
                 Err(e) => self.ai.status = format!("AI 处理未完成，已有稿件保留：{e:#}"),
             }
+        }
+        if let Some(result) = self
+            .ai
+            .correction_task
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    Some(Err(anyhow::anyhow!("全文校正线程已退出；原文保留")))
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => None,
+            })
+        {
+            self.ai.correction_task = None;
+            self.ai.events = None;
+            self.ai_clock.finish();
+            match result {
+                Ok(transcript) => {
+                    let status = if let Some(c) = &transcript.correction {
+                        format!(
+                            "全文校正完成 · 本次修改 {} 段 · 原文可恢复。之后生成纪要会使用校正稿；已有纪要需发送修改要求更新。",
+                            c.changed_segments
+                        )
+                    } else {
+                        "已恢复原始识别文字，转写文件已同步".into()
+                    };
+                    self.ai.status = if transcript.output_warnings.is_empty() {
+                        status
+                    } else {
+                        format!(
+                            "{status}；部分文件未同步：{}",
+                            transcript.output_warnings.join("；")
+                        )
+                    };
+                    self.transcript = transcript;
+                    self.transcript_dirty = true;
+                    self.transcript_new_document = true;
+                    self.text_document = None;
+                    self.remember_meeting();
+                }
+                Err(e) => self.ai.status = format!("全文校正未完成，原文保留：{e:#}"),
+            }
+            self.transcription_status = self.ai.status.clone();
+            changed = true;
         }
         if let Some(result) = self
             .speaker_task
@@ -662,33 +716,62 @@ impl Recorder {
             );
         }
 
-        toolbar =
-            toolbar.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        primary_button("to-minutes", "生成 AI 纪要")
-                            .disabled(!ready || self.active() || busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.meeting_page = workspace::MeetingPage::Minutes;
-                                this.page_scroll.set_offset(point(px(0.), px(0.)));
-                                cx.notify();
-                            })),
+        toolbar = toolbar.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    primary_button("to-minutes", "AI 对话与纪要")
+                        .disabled(!ready || self.active() || busy)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.meeting_page = workspace::MeetingPage::Minutes;
+                            this.page_scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    button("correct-transcript", "AI 校正全文", false)
+                        .disabled(!ready || self.active() || busy)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.request_transcript_correction(cx)),
+                        ),
+                )
+                .when(self.transcript.correction.is_some(), |d| {
+                    d.child(
+                        button("restore-transcript-original", "恢复识别原文", false)
+                            .disabled(busy || self.active())
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.restore_transcript_original(cx)),
+                            ),
                     )
-                    .when(self.asr.as_ref().is_some_and(|a| !a.finished()), |d| {
-                        d.child(button("cancel-asr", "取消转录", false).danger().on_click(
+                })
+                .when(self.ai.correction_task.is_some(), |d| {
+                    d.child(
+                        button("cancel-transcript-correction", "停止校正", false).on_click(
                             cx.listener(|this, _, _, cx| {
+                                this.ai
+                                    .cancelled
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                })
+                .when(self.asr.as_ref().is_some_and(|a| !a.finished()), |d| {
+                    d.child(
+                        button("cancel-asr", "取消转录", false)
+                            .danger()
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(asr) = &mut this.asr {
                                     asr.cancel();
                                 }
                                 cx.notify();
-                            }),
-                        ))
-                    }),
-            );
+                            })),
+                    )
+                }),
+        );
         let document = ui::card()
             .flex_1()
             .child(
@@ -699,7 +782,11 @@ impl Recorder {
                     .gap_3()
                     .child(ui::section_title(
                         "逐字稿",
-                        "语音识别原文，保留时间与说话人标记",
+                        if self.transcript.correction.is_some() {
+                            "AI 全文校正稿 · 时间与说话人保留，可恢复识别原文"
+                        } else {
+                            "语音识别原文，保留时间与说话人标记"
+                        },
                     ))
                     .child(ui::badge(
                         format!("{} 句", self.transcript.segments.len()),
@@ -855,6 +942,14 @@ impl Recorder {
                 .child(button("download-asr", if ready { "流式模型已就绪" } else if !streaming { "下载流式模型 · 边说边显示" } else { "下载整句校正模型" }, false).disabled(busy || ready).on_click(cx.listener(|this,_,_,cx| { this.prepare_streaming_model(); cx.notify(); }))))
             .child(label(plan.map(|p| p.description()).unwrap_or("尚未安装语音模型")))
             .child(label(format!("流式模型：{} · 文件转录模型：{}", if streaming { "已安装" } else { "未安装" }, if offline { "已安装，可逐句实时识别" } else { "未安装" })))
+            .child(label("识别语言（下次转录生效；中英混说建议选中文为主）"))
+            .child(div().flex().flex_wrap().gap_2().children(TranscriptionLanguage::ALL.into_iter().map(|language| {
+                button(("asr-language", language as usize), language.label(), self.config.transcription_language == language)
+                    .disabled(busy).on_click(cx.listener(move |this, _, _, cx| {
+                        this.config.transcription_language = language; this.save(); cx.notify();
+                    }))
+            })))
+            .child(label("语言提示可减少误判，不是字符过滤；纯英文建议选英文。流式预览使用中文模型，整句校正与文件识别使用此语言。已经识别错的文字可运行 AI 全文校正。"))
             .child(label("流式模型会边说边出字并更新当前句；整句校正在独立队列运行。关闭校正可降低 CPU 和内存；校正积压或连续发言超过 30 秒时保留流式原文。仅文件模型时停顿后显示，不能逐字更新。"))
             .child(div().flex().flex_wrap().gap_2().child(Input::new(&self.hotwords_input).flex_1()).child(primary_button("apply-hotwords", "保存术语").disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_hotwords=this.hotwords_input.read(cx).value().to_string(); this.save(); cx.notify(); }))))
             .child(button("stream-file-demo", "试播文件，观察实时修正", false).ghost().disabled(busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(true,cx))))

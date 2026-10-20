@@ -434,7 +434,7 @@ impl Recorder {
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
         let mut needs_render = false;
-        let task_second = if self.summary_task.is_some() {
+        let task_second = if self.summary_task.is_some() || self.ai.correction_task.is_some() {
             self.ai_clock.elapsed().as_secs()
         } else if self.speaker_task.is_some() {
             self.speaker_clock.elapsed().as_secs()
@@ -1191,6 +1191,8 @@ fn main() {
         }
         #[cfg(feature = "ui-smoke")]
         smoke::scroll_benchmark(main_window, entity.clone(), cx);
+        #[cfg(feature = "ui-smoke")]
+        ai::chat_benchmark(main_window, entity.clone(), cx);
         #[cfg(feature = "ui-smoke")]
         if let Some(path) = smoke::output_dir() {
             smoke::run(main_window, entity, path, cx);
