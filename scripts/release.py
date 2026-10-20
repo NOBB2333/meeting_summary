@@ -253,7 +253,11 @@ def publish(tag, output):
         verify_uploaded(release, paths)
         print(release["html_url"])
         return
-    details = {"tag_name": tag, "target_commitish": manifest["commit"], "name": f"OpenCap {tag}",
+    # The existing tag was resolved and verified above. Sending target_commitish
+    # makes GitHub check workflows:write for historical workflow changes, even
+    # though the release token already has contents:write. Always resend tag_name:
+    # GitHub otherwise detaches drafts from their tags during metadata updates.
+    details = {"tag_name": tag, "name": f"OpenCap {tag}",
                "body": (output / "release-notes.md").read_text(encoding="utf-8"),
                "draft": True, "prerelease": False}
     if release:
@@ -262,10 +266,12 @@ def publish(tag, output):
         release = api(f'{endpoint}/releases/{release["id"]}', "PATCH", details)
     else:
         release = api(f"{endpoint}/releases", "POST", details)
+    require(release["tag_name"] == tag and release["draft"], "Release draft lost its version tag")
     subprocess.run(["gh", "release", "upload", tag, "--repo", repository, "--clobber",
                     *map(str, paths)], check=True)
     for attempt in range(6):
         release = api(f'{endpoint}/releases/{release["id"]}')
+        require(release["tag_name"] == tag and release["draft"], "Release draft changed during upload")
         try:
             verify_uploaded(release, paths)
             break
@@ -273,8 +279,9 @@ def publish(tag, output):
             if attempt == 5:
                 raise
             time.sleep(5)
-    release = api(f'{endpoint}/releases/{release["id"]}', "PATCH", {"draft": False, "make_latest": "true"})
-    require(not release["draft"], "Release remains a draft")
+    release = api(f'{endpoint}/releases/{release["id"]}', "PATCH",
+                  {"tag_name": tag, "draft": False, "make_latest": "true"})
+    require(not release["draft"] and release["tag_name"] == tag, "Release was not published under its version tag")
     print(release["html_url"])
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:

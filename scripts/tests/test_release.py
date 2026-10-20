@@ -140,7 +140,39 @@ class ReleaseTests(unittest.TestCase):
         published = {**remote, "draft": False}
         with patch.object(release, "api", side_effect=[ref, [remote], remote, remote, published]) as api:
             release.publish("v1.2", self.root)
-        self.assertEqual(api.call_args.args[2], {"draft": False, "make_latest": "true"})
+        metadata = api.call_args_list[2].args[2]
+        self.assertNotIn("target_commitish", metadata)
+        self.assertEqual(metadata["tag_name"], "v1.2")
+        self.assertEqual(api.call_args.args[2], {"tag_name": "v1.2", "draft": False, "make_latest": "true"})
+
+    def test_create_uses_existing_verified_tag_without_target_commitish(self):
+        remote = self.publish_fixture()
+        ref = {"object": {"type": "commit", "sha": "a" * 40}}
+        published = {**remote, "draft": False}
+        with patch.object(release, "api", side_effect=[ref, [], remote, remote, published]) as api:
+            release.publish("v1.2", self.root)
+        creation = api.call_args_list[2]
+        self.assertEqual(creation.args[1], "POST")
+        self.assertEqual(creation.args[2]["tag_name"], "v1.2")
+        self.assertNotIn("target_commitish", creation.args[2])
+
+    def test_detached_draft_is_rejected_before_upload(self):
+        remote = self.publish_fixture()
+        ref = {"object": {"type": "commit", "sha": "a" * 40}}
+        detached = {**remote, "tag_name": "untagged-placeholder"}
+        with patch.object(release, "api", side_effect=[ref, [remote], detached]):
+            with patch.object(release.subprocess, "run") as upload:
+                with self.assertRaisesRegex(ValueError, "lost its version tag"):
+                    release.publish("v1.2", self.root)
+        upload.assert_not_called()
+
+    def test_publish_response_must_retain_version_tag(self):
+        remote = self.publish_fixture()
+        ref = {"object": {"type": "commit", "sha": "a" * 40}}
+        wrong = {**remote, "draft": False, "tag_name": "untagged-placeholder"}
+        with patch.object(release, "api", side_effect=[ref, [remote], remote, remote, wrong]):
+            with self.assertRaisesRegex(ValueError, "under its version tag"):
+                release.publish("v1.2", self.root)
 
     def test_public_release_is_never_overwritten(self):
         remote = self.publish_fixture()
