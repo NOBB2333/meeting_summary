@@ -12,7 +12,9 @@ crossbeam-channel.workspace = true
 opencap-core.workspace = true
 clap.workspace = true
 sherpa-onnx = "=1.13.8"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "system-proxy"] }
+tokio = { version = "1", features = ["rt", "time"] }
+sha2 = "0.10"
 tar = "0.4"
 bzip2 = "0.6"
 ffmpeg-next = { version = "=9.0.0", default-features = false, features = ["codec", "format", "software-resampling"] }

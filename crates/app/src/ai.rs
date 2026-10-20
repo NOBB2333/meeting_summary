@@ -45,6 +45,8 @@ pub(super) struct AiWorkspace {
     format: MinutesFormat,
     format_expanded: bool,
     format_guidance: Entity<TextareaState>,
+    terminology: Entity<TextareaState>,
+    terminology_expanded: bool,
     pub history: MinutesHistory,
     pub status: String,
     pub credentials_busy: bool,
@@ -115,6 +117,13 @@ impl AiWorkspace {
         })
         .detach();
         Self {
+            terminology: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("每行一条，例如：\n欧盆盖 => OpenCap\n统信 UOS\n张伟")
+                    .default_value(format.terminology.clone())
+                    .auto_grow(3, 6)
+            }),
+            terminology_expanded: false,
             format_guidance: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .placeholder("例如：按议题分段，使用‘会议议定’，最后列责任部门；只输出正文。")
@@ -426,6 +435,7 @@ impl Recorder {
         true
     }
     fn save_minutes_format(&self) -> anyhow::Result<()> {
+        self.ai.format.terminology_prompt()?;
         if let Some(parent) = format_path().parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -608,6 +618,14 @@ impl Recorder {
         cx.notify();
     }
     pub(super) fn request_minutes(&mut self, action: MinutesAction, cx: &mut Context<Self>) {
+        self.request_minutes_with_instruction(action, None, cx);
+    }
+    fn request_minutes_with_instruction(
+        &mut self,
+        action: MinutesAction,
+        instruction: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.active()
             || self.summary_task.is_some()
             || self.ai.credentials_busy
@@ -632,7 +650,8 @@ impl Recorder {
             cx.notify();
             return;
         }
-        let mut instruction = self.ai.instruction.read(cx).value().to_string();
+        let mut instruction =
+            instruction.unwrap_or_else(|| self.ai.instruction.read(cx).value().to_string());
         if action != MinutesAction::Generate && instruction.trim().is_empty() {
             self.ai.status = "请填写修改要求或问题".into();
             cx.notify();
@@ -651,6 +670,7 @@ impl Recorder {
             instruction = format!("{template}\n用户补充要求：{instruction}");
         }
         self.ai.format.guidance = self.ai.format_guidance.read(cx).value().to_string();
+        self.ai.format.terminology = self.ai.terminology.read(cx).value().to_string();
         if let Err(e) = self.save_minutes_format() {
             self.ai.status = e.to_string();
             cx.notify();
@@ -923,10 +943,21 @@ impl Recorder {
                             .flex()
                             .gap_1()
                             .child(
+                                button("minutes-keywords", "关键词", self.ai.terminology_expanded)
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.ai.terminology_expanded =
+                                            !this.ai.terminology_expanded;
+                                        this.ai.format_expanded = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
                                 button("minutes-format-settings", "模板", self.ai.format_expanded)
                                     .ghost()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.ai.format_expanded = !this.ai.format_expanded;
+                                        this.ai.terminology_expanded = false;
                                         cx.notify();
                                     })),
                             )
@@ -1348,6 +1379,29 @@ impl Recorder {
             .flex_col()
             .gap_3()
             .child(tabs)
+            .when(self.ai.terminology_expanded, |d| {
+                d.child(ui::card().id("minutes-keyword-scroll").max_h(px(260.)).overflow_y_scroll().flex_shrink_0().gap_2()
+                    .child(label("关键词修订 · 保存后用于所有会议的 AI 提取、生成和修订"))
+                    .child(Textarea::new(&self.ai.terminology).disabled(busy))
+                    .child(label("一行一个标准词，或“误识别词 => 正确词”。AI 按上下文修正，已有稿件会保存为新版本。"))
+                    .child(div().flex().flex_wrap().gap_2()
+                        .child(button("save-minutes-keywords", "保存关键词", false).disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ai.format.terminology = this.ai.terminology.read(cx).value().to_string();
+                                this.ai.status = match this.save_minutes_format() {
+                                    Ok(()) => "关键词已保存；后续 AI 提取、生成和修订会使用。".into(),
+                                    Err(e) => e.to_string(),
+                                };
+                                cx.notify();
+                            })))
+                        .child(primary_button("revise-with-keywords", "按关键词修订正文")
+                            .disabled(busy || !has_minutes || !ready || self.ai.editing || self.ai.terminology.read(cx).value().trim().is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let instruction = format!("根据已保存的关键词词表，核对并修正当前纪要中的人名、公司名、专业词及明确的同音误识别。保留其他内容、格式和已核对事实，返回完整正文。\n补充要求：{}", this.ai.instruction.read(cx).value());
+                                this.ai.ask_only = false;
+                                this.request_minutes_with_instruction(MinutesAction::Revise, Some(instruction), cx);
+                            })))))
+            })
             .when(self.ai.format_expanded, |d| {
                 d.child(
                     div()

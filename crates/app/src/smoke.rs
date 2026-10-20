@@ -70,7 +70,56 @@ pub fn scroll_benchmark(
                     samples.push(serde_json::json!({"width":width,"index":index,"distinct_rows_requested":measured}));
                 }
             }
-            std::fs::write(path.join("scroll-benchmark.json"), serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"source_rows":count,"samples":samples,"definition":"distinct row layout requests per programmed scroll position; not FPS"}))?)?;
+            let mut wheel_checks = Vec::new();
+            main.update(cx, |_, window, _| window.resize(size(px(1100.), px(760.))))?;
+            for transcript_page in [true, false] {
+                entity.update(cx, |r, cx| {
+                    r.settings = false;
+                    r.transcription_tab = transcript_page;
+                    r.meeting_page = workspace::MeetingPage::Transcript;
+                    r.page_scroll.set_offset(point(px(0.), px(0.)));
+                    r.transcript_view.update(cx, |view, cx| {
+                        view.state.scroll_to(ListOffset { item_ix: 10.min(count - 1), offset_in_item: px(0.) });
+                        cx.notify();
+                    });
+                    cx.notify();
+                });
+                futures_timer::Delay::new(Duration::from_millis(200)).await;
+                entity.update(cx, |r, cx| {
+                    let top = r.transcript_view.read(cx).state.viewport_bounds().top();
+                    r.page_scroll.set_offset(point(px(0.), px(190.) - top));
+                    cx.notify();
+                });
+                futures_timer::Delay::new(Duration::from_millis(200)).await;
+                let (position, parent_before, row_before) = entity.read_with(cx, |r, cx| {
+                    let state = &r.transcript_view.read(cx).state;
+                    let bounds = state.viewport_bounds();
+                    let top = bounds.top().max(px(160.));
+                    let bottom = bounds.bottom().min(px(650.));
+                    (point(bounds.center().x, (top + bottom) / 2.), r.page_scroll.offset(), state.logical_scroll_top().item_ix)
+                });
+                for _ in 0..30 {
+                    main.update(cx, |_, window, cx| {
+                        window.dispatch_event(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position, delta: ScrollDelta::Pixels(point(px(0.), px(240.))), ..Default::default()
+                        }), cx);
+                    })?;
+                    futures_timer::Delay::new(Duration::from_millis(16)).await;
+                }
+                let (parent_after, row_after) = entity.read_with(cx, |r, cx| (r.page_scroll.offset(), r.transcript_view.read(cx).state.logical_scroll_top().item_ix));
+                anyhow::ensure!(row_before > 0 && row_after == 0, "wheel did not reach transcript top: {row_before} -> {row_after}");
+                anyhow::ensure!(parent_before == parent_after, "transcript wheel moved outer page: {parent_before:?} -> {parent_after:?}");
+                main.update(cx, |_, window, cx| {
+                    window.dispatch_event(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position, delta: ScrollDelta::Pixels(point(px(0.), px(-240.))), ..Default::default()
+                    }), cx);
+                })?;
+                futures_timer::Delay::new(Duration::from_millis(100)).await;
+                let down = entity.read_with(cx, |r, cx| r.transcript_view.read(cx).state.logical_scroll_top().item_ix);
+                anyhow::ensure!(down > 0 && entity.read_with(cx, |r, _| r.page_scroll.offset()) == parent_before, "downward transcript wheel escaped its viewport");
+                wheel_checks.push(serde_json::json!({"page": if transcript_page {"transcript"} else {"live_text"}, "row_before":row_before,"row_after_up":row_after,"row_after_down":down,"parent_unchanged":true}));
+            }
+            std::fs::write(path.join("scroll-benchmark.json"), serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"source_rows":count,"samples":samples,"wheel_checks":wheel_checks,"definition":"actual wheel containment and distinct row layout requests; not FPS"}))?)?;
             Ok::<(), anyhow::Error>(())
         }.await;
         if let Err(error) = result { let _ = std::fs::write(path.join("scroll-benchmark-error.txt"), format!("{error:#}")); }

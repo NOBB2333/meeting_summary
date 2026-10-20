@@ -1,5 +1,5 @@
 //! Explicit local enrollment and conservative matching of clean, non-overlapping speech.
-use crate::{SpeakerTurn, Transcript, atomic_write, diarization::EMBEDDING};
+use crate::{SpeakerTurn, Transcript, atomic_write, speaker_models::EMBEDDING};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};

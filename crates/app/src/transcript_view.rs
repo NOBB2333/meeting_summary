@@ -264,6 +264,8 @@ impl Render for TranscriptView {
         let measured = self.measured_rows.clone();
         div()
             .size_full()
+            // Lists process the wheel first; consume the bubble before the outer page.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .flex()
             .flex_col()
             .gap_2()
@@ -362,7 +364,6 @@ impl Render for TranscriptView {
                             #[cfg(feature = "ui-smoke")]
                             measured.borrow_mut().insert(index);
                             let row = &rows[index];
-                            let text = row.text.clone();
                             div()
                                 .w_full()
                                 .pr_3()
@@ -376,22 +377,7 @@ impl Render for TranscriptView {
                                         .items_center()
                                         .justify_between()
                                         .gap_2()
-                                        .child(label(row.metadata.clone()))
-                                        .child(
-                                            button(
-                                                ("copy-transcript-row", row.id as usize),
-                                                "复制此段",
-                                                false,
-                                            )
-                                            .ghost()
-                                            .on_click(
-                                                move |_, _, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(text.to_string()),
-                                                    )
-                                                },
-                                            ),
-                                        ),
+                                        .child(label(row.metadata.clone())),
                                 )
                                 .child(
                                     div()

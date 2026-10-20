@@ -312,6 +312,7 @@ pub fn edit_minutes_with_events(
     );
     event(MinutesEvent::Status("读取正文格式与历史参考…".into()));
     let format_prompt = format.prompt()?;
+    let terminology_prompt = format.terminology_prompt()?;
     let budget = source_chunk_chars(config);
     let mut group_len = 0;
     let mut groups = Vec::new();
@@ -351,7 +352,7 @@ pub fn edit_minutes_with_events(
             )));
             partials.push(client.generate(
                 EXTRACT,
-                &format!("<转录>\n{group}\n</转录>"),
+                &format!("{terminology_prompt}<转录>\n{group}\n</转录>"),
                 cancelled,
             )?);
         }
@@ -361,7 +362,7 @@ pub fn edit_minutes_with_events(
                 next.push(client.generate(
                     EXTRACT,
                     &format!(
-                        "合并分段资料，去重但保留事实与引用：\n{}",
+                        "{terminology_prompt}合并分段资料，去重但保留事实与引用：\n{}",
                         chunk.join("\n\n")
                     ),
                     cancelled,
@@ -740,6 +741,90 @@ pub fn summarize(transcript: &Transcript, model: Option<&str>, output: &Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keywords_reach_long_transcript_extraction_and_revision_and_save_new_document_versions() {
+        let response = "# 纪要\n\nOpenCap 本周不能上线，预算两万元。";
+        let (url, requests, server) = mock(
+            (0..6)
+                .map(|_| reply(AiProvider::ChatCompletions, response))
+                .collect(),
+        );
+        let config = AiConfig {
+            provider: AiProvider::ChatCompletions,
+            base_url: url,
+            model: "fixture".into(),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "opencap-keyword-revision-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base = dir.join("meeting");
+        let transcript = Transcript {
+            complete: true,
+            segments: (0..2)
+                .map(|id| crate::Segment {
+                    id,
+                    revision: 1,
+                    start_ms: id * 1000,
+                    end_ms: id * 1000 + 1000,
+                    text: "欧盆盖本周不能上线。".repeat(1300),
+                    finalized: true,
+                    correcting: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let format = MinutesFormat {
+            terminology: "欧盆盖 => OpenCap\n统信 UOS".into(),
+            ..Default::default()
+        };
+        let mut history = MinutesHistory::default();
+        for (action, instruction) in [
+            (MinutesAction::Generate, "生成纪要"),
+            (MinutesAction::Revise, "按关键词核对正文"),
+        ] {
+            history = edit_minutes_with_format(
+                &transcript,
+                &config,
+                "",
+                history,
+                action,
+                instruction,
+                &format,
+                &base,
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        }
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests.iter().all(|(_, body)| {
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("关键词修订词表")
+        }));
+        assert!(
+            requests.last().unwrap().1["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("<当前纪要>")
+        );
+        assert_eq!(MinutesHistory::load(&base).unwrap().versions.len(), 2);
+        assert!(
+            crate::read_minutes_document(&base.with_extension("summary.docx"))
+                .unwrap()
+                .contains("OpenCap")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn streaming_arrives_before_completion_and_interruption_preserves_latest() {
         let dir = std::env::temp_dir().join(format!("opencap-real-stream-{}", std::process::id()));

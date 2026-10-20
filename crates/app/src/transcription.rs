@@ -733,6 +733,7 @@ impl Recorder {
             .child(div().h(px(440.)).child(self.transcript_view.clone()));
         let speaker_panel = ui::card()
             .child(ui::section_title("说话人分析", "会后在本机完成，可选步骤"))
+            .child(label("首次需下载约 41 MB 模型；下载完成后直接在本机使用。"))
             .child(ui::badge(
                 if speakers == 0 {
                     "尚未分析".into()
@@ -794,6 +795,20 @@ impl Recorder {
                         cx.notify();
                     })),
             )
+            .child(
+                button("open-speaker-models", "模型文件夹", false)
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let path = model_root().join("diarization");
+                        if let Err(e) = std::fs::create_dir_all(&path)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|_| opencap_platform::open_path(&path))
+                        {
+                            this.transcription_status = format!("无法打开模型文件夹：{e:#}");
+                        }
+                        cx.notify();
+                    })),
+            )
             .when(self.speaker_task.is_some(), |d| {
                 d.child(
                     button("cancel-speakers", "取消分析", false)
@@ -801,6 +816,7 @@ impl Recorder {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.speaker_cancelled
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            this.transcription_status = "正在取消；已完成模型和原稿保留…".into();
                             cx.notify();
                         })),
                 )

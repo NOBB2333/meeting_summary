@@ -38,6 +38,7 @@ impl Render for TextDocument {
         }
         let input = self.input.clone();
         ui::card()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .h_full()
             .min_h(px(0.))
             .w_full()
