@@ -84,6 +84,39 @@ class ReleaseTests(unittest.TestCase):
             release.prepare("v1.2", self.root, self.root / "output")
         self.assertFalse((self.root / "output").exists())
 
+    def source_fixture(self):
+        self.patched(patch.dict(os.environ, {"GH_REPO": "owner/repo"}))
+        self.patched(patch.object(release, "current_commit", return_value="a" * 40))
+        run = {"status": "completed", "event": "push", "path": ".github/workflows/release.yml",
+               "head_branch": "v1.2", "head_sha": "a" * 40, "conclusion": "failure"}
+        names = ["Windows / build", "macOS / build (macos-14, arm64)",
+                 "macOS / build (macos-15-intel, x64)", "Linux / build"]
+        jobs = [{"id": index, "name": name, "status": "completed", "conclusion": "success"}
+                for index, name in enumerate(names)]
+        jobs.append({"id": 5, "name": "Publish v1.2", "status": "completed", "conclusion": "failure"})
+        return run, jobs
+
+    def test_publish_failure_can_reuse_all_successful_builds(self):
+        run, jobs = self.source_fixture()
+        with patch.object(release, "api", side_effect=[run, {"jobs": jobs}]):
+            results = release.verify_source_run("v1.2", "123")
+        self.assertEqual(set(results), {"windows", "macos", "linux"})
+        self.assertTrue(all(row["result"] == "success" for row in results.values()))
+
+    def test_reuse_rejects_packages_from_another_commit(self):
+        run, _ = self.source_fixture()
+        run["head_sha"] = "b" * 40
+        with patch.object(release, "api", return_value=run):
+            with self.assertRaisesRegex(ValueError, "original version tag"):
+                release.verify_source_run("v1.2", "123")
+
+    def test_reuse_requires_both_mac_architectures_to_succeed(self):
+        run, jobs = self.source_fixture()
+        jobs[2]["conclusion"] = "failure"
+        with patch.object(release, "api", side_effect=[run, {"jobs": jobs}]):
+            with self.assertRaisesRegex(ValueError, "successful macOS builds"):
+                release.verify_source_run("v1.2", "123")
+
     def test_tampered_local_asset_never_reaches_github(self):
         self.publish_fixture()
         next(self.root.glob("*.zip")).write_bytes(b"changed")

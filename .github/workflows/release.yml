@@ -1,27 +1,44 @@
 name: Release
-run-name: OpenCap ${{ github.ref_name }}
+run-name: OpenCap ${{ inputs.tag || github.ref_name }}
 on:
   push:
     tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to publish without rebuilding"
+        type: string
+        required: true
+        default: v1.2
+      artifact_run:
+        description: "Completed Release run ID with all platform builds successful"
+        type: string
+        required: true
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 jobs:
   windows:
+    if: github.event_name == 'push'
     name: Windows
     uses: ./.github/workflows/windows.yml
   macos:
+    if: github.event_name == 'push'
     name: macOS
     uses: ./.github/workflows/macos.yml
   linux:
+    if: github.event_name == 'push'
     name: Linux
     uses: ./.github/workflows/linux.yml
   publish:
-    name: Publish ${{ github.ref_name }}
+    name: Publish ${{ inputs.tag || github.ref_name }}
     needs: [windows, macos, linux]
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'workflow_dispatch' ||
+          (needs.windows.result == 'success' && needs.macos.result == 'success' && needs.linux.result == 'success')) }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -29,14 +46,30 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      ARTIFACT_RUN: ${{ inputs.artifact_run || github.run_id }}
+      SOURCE_RUN: ${{ inputs.artifact_run }}
+      RELEASE_SOURCE_ROOT: ${{ github.event_name == 'workflow_dispatch' && format('{0}/target/release-source', github.workspace) || github.workspace }}
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Check out the original tagged source for a publish retry
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          path: target/release-source
       - name: Download packages from this run
-        run: gh run download "$GITHUB_RUN_ID" --dir target/release-artifacts
+        # Buildx also uploads non-ZIP .dockerbuild records. Download only release inputs.
+        run: >-
+          gh run download "$ARTIFACT_RUN" --dir target/release-artifacts
+          --name OpenCap-windows-x64
+          --name OpenCap-macos-arm64
+          --name OpenCap-macos-x64
+          --name OpenCap-linux-x64
+          --name Linux-validation
       - name: Verify packages, versions and runtime evidence
         env:
           BUILD_RESULTS: ${{ toJSON(needs) }}
-        run: python3 scripts/release.py prepare --tag "$RELEASE_TAG" --artifacts target/release-artifacts --output target/release-assets
+        run: python3 scripts/release.py prepare --tag "$RELEASE_TAG" --source-run "$SOURCE_RUN" --artifacts target/release-artifacts --output target/release-assets
       - name: Upload verified packages and publish release
         run: python3 scripts/release.py publish --tag "$RELEASE_TAG" --output target/release-assets

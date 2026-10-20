@@ -16,7 +16,7 @@ import tarfile
 import time
 import zipfile
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("RELEASE_SOURCE_ROOT", Path(__file__).resolve().parents[1]))
 PACKAGES = (
     "windows-x64.zip", "macos-arm64.zip", "macos-x64.zip",
     "linux-x64.tar.gz", "linux-x64.deb",
@@ -128,12 +128,31 @@ def verify_packages(paths, version, report):
 
 
 def current_commit():
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    require(os.environ.get("GITHUB_SHA", commit) == commit, "Checkout and workflow commits differ")
-    return commit
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
 
-def prepare(tag, artifacts, output):
+def verify_source_run(tag, source_run):
+    require(re.fullmatch(r"[1-9]\d*", source_run), "Source run ID must be numeric")
+    repository = os.environ["GH_REPO"]
+    endpoint = f"repos/{repository}/actions/runs/{source_run}"
+    run = api(endpoint)
+    require(run["status"] == "completed" and run["event"] == "push" and
+            run["path"] == ".github/workflows/release.yml" and run["head_branch"] == tag and
+            run["head_sha"] == current_commit(), "Source run does not match the original version tag")
+    jobs = api(f"{endpoint}/jobs?per_page=100&filter=latest")["jobs"]
+    platforms = {"windows": "Windows", "macos": "macOS", "linux": "Linux"}
+    results = {}
+    for key, name in platforms.items():
+        builds = [job for job in jobs if job["name"] == f"{name} / build" or
+                  job["name"].startswith(f"{name} / build (")]
+        require(len(builds) == (2 if key == "macos" else 1) and
+                all(job["status"] == "completed" and job["conclusion"] == "success" for job in builds),
+                f"Source run must have successful {name} builds")
+        results[key] = {"result": "success", "jobs": [job["id"] for job in builds]}
+    return results
+
+
+def prepare(tag, artifacts, output, source_run=""):
     version = check_version(tag)
     paths = {}
     for suffix in PACKAGES:
@@ -143,12 +162,18 @@ def prepare(tag, artifacts, output):
     reports = list(artifacts.rglob("linux-smoke/report.json"))
     require(len(reports) == 1, "Expected one Linux runtime report from this run")
     checks = verify_packages(paths, version, reports[0])
-    results = json.loads(os.environ.get("BUILD_RESULTS", "{}"))
+    results = (verify_source_run(tag, source_run) if source_run else
+               json.loads(os.environ.get("BUILD_RESULTS", "{}")))
     if os.environ.get("GITHUB_ACTIONS") == "true":
         require(set(results) == {"windows", "macos", "linux"} and
                 all(job["result"] == "success" for job in results.values()),
                 "All three platform builds must succeed in this Release run")
-        require(os.environ.get("GITHUB_REF") == f"refs/tags/{tag}", "Release must run on its version tag")
+        if source_run:
+            require(os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch",
+                    "Reusing a build requires an explicit publish retry")
+        else:
+            require(os.environ.get("GITHUB_REF") == f"refs/tags/{tag}", "Release must run on its version tag")
+            require(current_commit() == os.environ["GITHUB_SHA"], "Checkout and workflow commits differ")
     output.mkdir(parents=True, exist_ok=True)
     records = []
     for suffix, source in paths.items():
@@ -161,6 +186,9 @@ def prepare(tag, artifacts, output):
     run_url = f"https://github.com/{repository}/actions/runs/{run_id}" if run_id else None
     manifest = {"tag": tag, "version": version, "commit": current_commit(), "run_id": run_id,
                 "run_url": run_url, "build_results": results, "checks": checks, "assets": records}
+    if source_run:
+        manifest.update(source_run_id=source_run,
+                        source_run_url=f"https://github.com/{repository}/actions/runs/{source_run}")
     (output / "build-validation.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     sums = [f'{row["sha256"]}  {row["name"]}' for row in records]
@@ -169,6 +197,8 @@ def prepare(tag, artifacts, output):
     notes = (ROOT / "docs/releases" / f"{tag}.md").read_text(encoding="utf-8")
     if run_url:
         notes += f'\n构建来源：[OpenCap {tag}]({run_url})，提交 `{manifest["commit"]}`。\n'
+    if source_run:
+        notes += f'\n本次仅重试发布，安装包复用[原构建]({manifest["source_run_url"]})，未重新编译。\n'
     notes += (f'\n已验证 Mac 最低版本：Apple Silicon {checks["macos_arm64"]["minimum_macos"]}，'
               f'Intel {checks["macos_x64"]["minimum_macos"]}；Linux glibc {checks["linux"]["maximum_glibc"]}+。\n')
     (output / "release-notes.md").write_text(notes, encoding="utf-8")
@@ -257,12 +287,13 @@ def main():
     parser.add_argument("--tag", required=True)
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--source-run", default="", help="Reuse a completed version-tag build for a publish retry")
     args = parser.parse_args()
     if args.command == "check-version":
         print(f"{args.tag}: application and macOS bundle version {check_version(args.tag)}")
     elif args.command == "prepare":
         require(args.artifacts and args.output, "prepare needs --artifacts and --output")
-        prepare(args.tag, args.artifacts, args.output)
+        prepare(args.tag, args.artifacts, args.output, args.source_run)
     else:
         require(args.output, "publish needs --output")
         publish(args.tag, args.output)

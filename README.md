@@ -327,6 +327,8 @@ Linux 首先支持 Intel / x86_64 的统信 UOS：X11 显示器、窗口和区�
 
 只有 `v1.2`、`v1.2.1` 这样的版本标签触发一个 `Release` 工作流，任务名显示版本号；Windows、Mac 双架构和 Linux 在同一轮中构建。全部成功后校验安装包版本、架构和 Linux 运行记录，上传五个带版本号的包、`build-validation.json` 和 `SHA256SUMS`，核对远端校验值后才公开 Release。失败时不会公开不完整的发布，也不需要额外推送来取包。Linux 的手动诊断入口仅复用已有失败构建产物，不触发整套发布构建。
 
+如果三端构建已经成功、只有发布步骤失败，在 Actions → Release → Run workflow 选择 `main`，填入原版本标签和原构建的 `artifact_run` ID，即可只重试发布。该入口会检查原构建提交和标签一致、四个平台包均构建成功，复用现成安装包并跳过编译；不会移动版本标签。旧任务的“重新运行”仍使用旧提交中的工作流，修复发布脚本后请使用这个入口。
+
 Release 提供 Windows x64、Mac Apple Silicon / Intel 和 Linux x64 安装包。Linux 在 Debian 10 / glibc 2.28 基线上构建，私有捆绑 FFmpeg、C++、字体等依赖并审计 ELF 符号版本，不替换系统 glibc 或显卡驱动。图形界面使用宿主 Vulkan / OpenGL 驱动；Linux 当前提供软件 H.264 / AAC 路径，UOS 实机性能仍需按设备验证。
 
 当前 Actions 的 Mac Apple Silicon 包要求 macOS 14+，Intel 包要求 macOS 15+；本机 Homebrew 打包的最低版本单独计算，不能把本机 macOS 26 的要求套到云端包。Linux 的 CPU 窗口渲染优先选择 OpenGL，以避开已复现的软件 Vulkan 空白窗口；硬件 GPU 和无窗口计算保留原排序。
