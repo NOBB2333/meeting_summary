@@ -99,12 +99,12 @@ struct Recorder {
     rename_base: Option<PathBuf>,
     rename_input: Entity<InputState>,
     meeting_title: String,
-    locations_expanded: bool,
+    speaker_panel_open: bool,
+    transcript_tools_open: bool,
     notes: Entity<gpui::component::input::TextareaState>,
     notes_status: String,
     notes_base: Option<PathBuf>,
     notes_saved: String,
-    minutes_style: usize,
     recording_registered: bool,
 }
 #[cfg(target_os = "macos")]
@@ -327,12 +327,12 @@ impl Recorder {
             rename_base: None,
             rename_input: cx.new(|cx| InputState::new(window, cx).placeholder("会议名称")),
             meeting_title: String::new(),
-            locations_expanded: false,
+            speaker_panel_open: false,
+            transcript_tools_open: false,
             notes,
             notes_status: String::new(),
             notes_base: None,
             notes_saved: String::new(),
-            minutes_style: 0,
             recording_registered: false,
         }
     }

@@ -53,13 +53,15 @@ pub(crate) fn chat_benchmark(
                 cx.notify();
             });
             let mut measurements = Vec::new();
-            for width in [1200., 700.] {
-                cx.update_window(main.into(), |_, window, _| window.resize(size(px(width), px(820.))))?;
+            for (width, height) in [(1200., 820.), (700., 820.), (620., 480.)] {
+                cx.update_window(main.into(), |_, window, _| window.resize(size(px(width), px(height))))?;
                 entity.update(cx, |r, cx| { r.ai.conversation_tab = true; r.ai.chat.update(cx, |chat, cx| { let state = chat.smoke_state(); state.set_follow_mode(FollowMode::Tail); state.scroll_to_end(); cx.notify(); }); cx.notify(); });
                 futures_timer::Delay::new(Duration::from_millis(300)).await;
                 let (state, parent, rows) = entity.read_with(cx, |r, cx| (r.ai.chat.read(cx).smoke_state(), r.page_scroll.offset(), r.ai.chat.read(cx).smoke_rows()));
                 let bounds = state.viewport_bounds();
                 anyhow::ensure!(bounds.size.height > px(100.) && rows == 304, "chat viewport is not usable: {bounds:?}, rows={rows}");
+                let send = entity.read_with(cx, |r, _| r.ai.send_bounds.get()).ok_or_else(|| anyhow::anyhow!("send button missing"))?;
+                anyhow::ensure!(send.bottom() <= px(height) && send.top() >= bounds.bottom(), "composer escaped viewport at {width}x{height}: {send:?}");
                 let before = state.logical_scroll_top().item_ix;
                 let position = bounds.center();
                 for _ in 0..400 {
@@ -70,7 +72,7 @@ pub(crate) fn chat_benchmark(
                 let after = state.logical_scroll_top().item_ix;
                 anyhow::ensure!(before > 0 && after == 0, "cannot scroll to first conversation: {before} -> {after}, bounds={bounds:?}");
                 anyhow::ensure!(entity.read_with(cx, |r, _| r.page_scroll.offset()) == parent, "chat scroll escaped into outer page");
-                measurements.push(serde_json::json!({"width":width,"rows":rows,"before":before,"after":after,"height":f32::from(bounds.size.height),"parent_unchanged":true}));
+                measurements.push(serde_json::json!({"width":width,"height":height,"rows":rows,"before":before,"after":after,"chat_height":f32::from(bounds.size.height),"composer_inside_window":true,"parent_unchanged":true}));
             }
             std::fs::write(path.join("chat-check.json"), serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"sent_rounds":2,"first_sent_via":"native Enter event","second_sent_via":"native mouse click","streamed_text_visible_before_completion":true,"scroll":measurements}))?)?;
             Ok::<(), anyhow::Error>(())

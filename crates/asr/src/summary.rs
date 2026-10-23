@@ -118,7 +118,9 @@ fn is_loopback(url: &reqwest::Url) -> bool {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MinutesHistory {
+    #[serde(default)]
     pub versions: Vec<MinutesVersion>,
+    #[serde(default)]
     pub conversation: Vec<MinutesTurn>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -741,6 +743,23 @@ pub fn summarize(transcript: &Transcript, model: Option<&str>, output: &Path) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn legacy_history_without_conversation_remains_available() {
+        let dir = std::env::temp_dir().join(format!("opencap-legacy-chat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("meeting");
+        let value = json!({"versions":[{"number":1,"created_unix":0,"instruction":"早期纪要","markdown":"旧文档正文仍然需要可读"}]});
+        std::fs::write(
+            base.with_extension("summary.history.json"),
+            value.to_string(),
+        )
+        .unwrap();
+        let loaded = MinutesHistory::load(&base).unwrap();
+        assert_eq!(loaded.versions.len(), 1);
+        assert!(loaded.conversation.is_empty());
+        assert_eq!(loaded.latest(), "旧文档正文仍然需要可读");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn keywords_reach_long_transcript_extraction_and_revision_and_save_new_document_versions() {
         let response = "# 纪要\n\nOpenCap 本周不能上线，预算两万元。";

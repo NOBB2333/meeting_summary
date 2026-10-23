@@ -5,6 +5,7 @@ use gpui::component::{scroll::Scrollbar, text::TextView};
 #[derive(Clone, PartialEq)]
 struct Message {
     user: bool,
+    historical: bool,
     text: String,
     pending: bool,
     artifact: bool,
@@ -23,6 +24,7 @@ pub(super) struct ChatView {
     rows: Rc<Vec<Message>>,
     running: bool,
     request: String,
+    turn_starts: Vec<usize>,
 }
 impl ChatView {
     #[cfg(feature = "ui-smoke")]
@@ -46,7 +48,22 @@ impl ChatView {
             rows: Rc::new(Vec::new()),
             running: false,
             request: String::new(),
+            turn_starts: Vec::new(),
         }
+    }
+    fn jump_turn(&self, turn: usize) {
+        if let Some(&item_ix) = self.turn_starts.get(turn) {
+            self.state.set_follow_mode(FollowMode::Normal);
+            self.state.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: px(0.),
+            });
+        }
+    }
+    fn current_turn(&self) -> usize {
+        self.turn_starts
+            .partition_point(|&start| start <= self.state.logical_scroll_top().item_ix)
+            .saturating_sub(1)
     }
     pub fn replace(
         &mut self,
@@ -79,9 +96,27 @@ impl ChatView {
         self.request = request.into();
         self.running = busy;
         let mut rows = Vec::new();
+        let mut turn_starts = Vec::new();
+        // Some older files saved document versions without conversation turns.
+        // Expose the actual saved content without fabricating a user exchange.
+        if history.conversation.is_empty() {
+            for version in &history.versions {
+                turn_starts.push(rows.len());
+                rows.push(Message {
+                    user: false,
+                    historical: true,
+                    text: version.markdown.clone(),
+                    pending: false,
+                    artifact: true,
+                    version: Some(version.number),
+                });
+            }
+        }
         for turn in &history.conversation {
+            turn_starts.push(rows.len());
             rows.push(Message {
                 user: true,
+                historical: false,
                 text: display_request(&turn.request),
                 pending: false,
                 artifact: false,
@@ -103,6 +138,7 @@ impl ChatView {
                 .map(|v| v.number);
             rows.push(Message {
                 user: false,
+                historical: false,
                 text: turn.reply.clone(),
                 pending: false,
                 artifact: version.is_some(),
@@ -110,8 +146,10 @@ impl ChatView {
             });
         }
         if !request.is_empty() {
+            turn_starts.push(rows.len());
             rows.push(Message {
                 user: true,
+                historical: false,
                 text: display_request(request),
                 pending: false,
                 artifact: false,
@@ -119,6 +157,7 @@ impl ChatView {
             });
             rows.push(Message {
                 user: false,
+                historical: false,
                 text: if stream.is_empty() {
                     if busy {
                         "正在等待正文…"
@@ -150,6 +189,7 @@ impl ChatView {
                 );
             }
         }
+        self.turn_starts = turn_starts;
         self.rows = Rc::new(rows);
         if new_request {
             self.state.set_follow_mode(FollowMode::Tail);
@@ -188,20 +228,41 @@ impl Render for ChatView {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap_1()
                     .flex_shrink_0()
-                    .child(label(if self.state.is_following_tail() {
-                        "跟随最新回复"
-                    } else {
-                        "正在查看历史"
-                    }))
+                    .child(label(format!("对话 · {} 轮", self.turn_starts.len())).text_xs())
                     .child(
-                        button("chat-latest", "回到最新", false)
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.set_follow_mode(FollowMode::Tail);
-                                this.state.scroll_to_end();
-                                cx.notify();
-                            })),
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                button("chat-previous", "上一轮", false)
+                                    .ghost()
+                                    .disabled(self.turn_starts.is_empty())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.jump_turn(this.current_turn().saturating_sub(1));
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                button("chat-next", "下一轮", false)
+                                    .ghost()
+                                    .disabled(self.turn_starts.is_empty())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.jump_turn(
+                                            (this.current_turn() + 1)
+                                                .min(this.turn_starts.len().saturating_sub(1)),
+                                        );
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(button("chat-latest", "最新", false).ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.state.set_follow_mode(FollowMode::Tail);
+                                    this.state.scroll_to_end();
+                                    cx.notify();
+                                }),
+                            )),
                     ),
             )
             .child(
@@ -226,7 +287,9 @@ impl Render for ChatView {
                                     .flex()
                                     .flex_col()
                                     .gap_2()
-                                    .child(label(if row.user {
+                                    .child(label(if row.historical {
+                                        "历史文档（原始对话未记录）"
+                                    } else if row.user {
                                         "你"
                                     } else if row.pending {
                                         if running {
@@ -291,6 +354,29 @@ impl Render for ChatView {
 mod tests {
     use super::ChatView;
     use gpui::{FollowMode, ListOffset, px};
+    #[test]
+    fn saved_document_without_turns_is_readable_and_round_navigation_keeps_full_text() {
+        let text = "历史长段落。".repeat(3000);
+        let history = opencap_asr::MinutesHistory {
+            versions: vec![opencap_asr::MinutesVersion {
+                number: 1,
+                created_unix: 0,
+                instruction: "旧文档".into(),
+                markdown: text.clone(),
+                elapsed_seconds: None,
+            }],
+            conversation: vec![],
+        };
+        let mut view = ChatView::new();
+        view.update_rows(&history, "新一轮", "新正文", true, true, true);
+        assert_eq!(view.rows[0].text, text);
+        assert!(view.rows[0].historical && !view.rows[0].user);
+        assert_eq!(view.turn_starts, vec![0, 1]);
+        view.jump_turn(0);
+        assert_eq!(view.state.logical_scroll_top().item_ix, 0);
+        view.jump_turn(1);
+        assert_eq!(view.state.logical_scroll_top().item_ix, 1);
+    }
     #[test]
     fn full_conversation_and_streaming_keep_the_reading_anchor() {
         let mut history = opencap_asr::MinutesHistory::default();

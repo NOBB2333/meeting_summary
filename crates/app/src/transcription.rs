@@ -636,7 +636,9 @@ impl Recorder {
                         },
                     )),
                 )
-                .child(div().h(px(560.)).child(document.clone()));
+                .h_full()
+                .min_h(px(0.))
+                .child(div().flex_1().min_h(px(0.)).child(document.clone()));
         }
         let busy = self.transcription_busy();
         let ready = self.transcript.complete && !self.transcript.cancelled;
@@ -660,7 +662,9 @@ impl Recorder {
                     ),
             );
         }
-        if let Some(base) = &self.transcript_output {
+        if self.transcript_tools_open
+            && let Some(base) = &self.transcript_output
+        {
             let word = base.with_extension("transcript.docx");
             let plain = base.with_extension("transcript.txt");
             let srt = base.with_extension("srt");
@@ -772,8 +776,37 @@ impl Recorder {
                     )
                 }),
         );
+        toolbar = toolbar
+            .child(
+                button("transcript-files", "导出与文件", self.transcript_tools_open)
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.transcript_tools_open = !this.transcript_tools_open;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                button(
+                    "toggle-speaker-panel",
+                    if self.speaker_panel_open {
+                        "返回文字".to_owned()
+                    } else {
+                        format!("说话人 · {speakers} 组")
+                    },
+                    self.speaker_panel_open,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.speaker_panel_open = !this.speaker_panel_open;
+                    cx.notify();
+                })),
+            );
         let document = ui::card()
             .flex_1()
+            .h_full()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .p_3()
+            .gap_2()
             .child(
                 div()
                     .flex()
@@ -794,15 +827,22 @@ impl Recorder {
                         BG,
                     )),
             )
-            .child(label(format!(
-                "{}{}",
-                self.transcription_status,
-                if self.transcription_progress > 0.0 && self.transcription_progress < 1.0 {
-                    format!(" · {:.0}%", self.transcription_progress * 100.)
-                } else {
-                    String::new()
-                }
-            )))
+            .child(
+                div()
+                    .id("transcript-status-scroll")
+                    .max_h(px(36.))
+                    .overflow_y_scroll()
+                    .flex_shrink_0()
+                    .child(label(format!(
+                        "{}{}",
+                        self.transcription_status,
+                        if self.transcription_progress > 0.0 && self.transcription_progress < 1.0 {
+                            format!(" · {:.0}%", self.transcription_progress * 100.)
+                        } else {
+                            String::new()
+                        }
+                    ))),
+            )
             .when(
                 self.transcription_clock.has_run() || self.transcript.processing_seconds.is_some(),
                 |d| {
@@ -817,7 +857,23 @@ impl Recorder {
                     )))
                 },
             )
-            .child(div().h(px(440.)).child(self.transcript_view.clone()));
+            .when(
+                self.asr.as_ref().is_some_and(|a| !a.finished()) || self.preparing_model.is_some(),
+                |d| {
+                    d.child(
+                        gpui::component::progress::Progress::new("transcript-inline-progress")
+                            .value((self.transcription_progress * 100.) as f32)
+                            .loading(self.transcription_progress <= 0.),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(self.transcript_view.clone()),
+            );
         let speaker_panel = ui::card()
             .child(ui::section_title("说话人分析", "会后在本机完成，可选步骤"))
             .child(label("首次需下载约 41 MB 模型；下载完成后直接在本机使用。"))
@@ -913,17 +969,37 @@ impl Recorder {
             ))
             .child(label(self.transcript.speaker_memory_status.clone()))
             .child(self.speakers_view.clone());
-        div().flex().flex_col().gap_4().child(toolbar).child(
-            div()
-                .flex()
-                .items_start()
-                .gap_5()
-                .when(!ui::two_columns(width), |d| d.flex_col())
-                .child(document)
-                .child(
-                    speaker_panel.when(ui::two_columns(width), |d| d.w(px(280.)).flex_shrink_0()),
-                ),
-        )
+        let wide = ui::two_columns(width);
+        div()
+            .h_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .overflow_hidden()
+            .child(toolbar.flex_shrink_0())
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .gap_3()
+                    .overflow_hidden()
+                    .when(wide || !self.speaker_panel_open, |d| d.child(document))
+                    .when(self.speaker_panel_open, |d| {
+                        d.child(
+                            div()
+                                .id("speaker-panel-scroll")
+                                .h_full()
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .when(wide, |d| d.w(px(280.)).flex_shrink_0())
+                                .when(!wide, |d| d.flex_1())
+                                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                                .child(speaker_panel),
+                        )
+                    }),
+            )
     }
     pub(super) fn transcription_settings(&self, cx: &Context<Self>) -> Div {
         let busy = self.active() || self.transcription_busy();
@@ -942,16 +1018,8 @@ impl Recorder {
                 .child(button("download-asr", if ready { "流式模型已就绪" } else if !streaming { "下载流式模型 · 边说边显示" } else { "下载整句校正模型" }, false).disabled(busy || ready).on_click(cx.listener(|this,_,_,cx| { this.prepare_streaming_model(); cx.notify(); }))))
             .child(label(plan.map(|p| p.description()).unwrap_or("尚未安装语音模型")))
             .child(label(format!("流式模型：{} · 文件转录模型：{}", if streaming { "已安装" } else { "未安装" }, if offline { "已安装，可逐句实时识别" } else { "未安装" })))
-            .child(label("识别语言（下次转录生效；中英混说建议选中文为主）"))
-            .child(div().flex().flex_wrap().gap_2().children(TranscriptionLanguage::ALL.into_iter().map(|language| {
-                button(("asr-language", language as usize), language.label(), self.config.transcription_language == language)
-                    .disabled(busy).on_click(cx.listener(move |this, _, _, cx| {
-                        this.config.transcription_language = language; this.save(); cx.notify();
-                    }))
-            })))
-            .child(label("语言提示可减少误判，不是字符过滤；纯英文建议选英文。流式预览使用中文模型，整句校正与文件识别使用此语言。已经识别错的文字可运行 AI 全文校正。"))
             .child(label("流式模型会边说边出字并更新当前句；整句校正在独立队列运行。关闭校正可降低 CPU 和内存；校正积压或连续发言超过 30 秒时保留流式原文。仅文件模型时停顿后显示，不能逐字更新。"))
-            .child(div().flex().flex_wrap().gap_2().child(Input::new(&self.hotwords_input).flex_1()).child(primary_button("apply-hotwords", "保存术语").disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_hotwords=this.hotwords_input.read(cx).value().to_string(); this.save(); cx.notify(); }))))
+            .child(button("speech-vocabulary-settings", "配置全局词汇与语言", false).ghost().on_click(cx.listener(|this, _, _, cx| this.open_ai_settings(crate::settings::SettingsPage::Vocabulary, cx))))
             .child(button("stream-file-demo", "试播文件，观察实时修正", false).ghost().disabled(busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(true,cx))))
     }
 }

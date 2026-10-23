@@ -409,150 +409,146 @@ impl Recorder {
             Err(e) => self.notes_status = format!("笔记保存失败：{e}"),
         }
     }
-    pub(super) fn meeting_header(&self, cx: &Context<Self>) -> Div {
+    fn meeting_locations(&self, cx: &Context<Self>) -> gpui::component::popover::Popover {
+        let folder = self
+            .transcript_output
+            .as_ref()
+            .and_then(|p| p.parent())
+            .unwrap_or(&self.config.output_dir)
+            .to_path_buf();
+        let open = folder.clone();
+        let copy = folder.clone();
+        let mut content = div()
+            .w(px(340.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(label("会议文件夹"))
+            .child(label(folder.display().to_string()))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(button("copy-meeting-location", "复制路径", false).on_click(
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                copy.display().to_string(),
+                            ))
+                        },
+                    ))
+                    .child(button("meeting-location", "打开文件夹", false).on_click(
+                        move |_, _, _| {
+                            let _ = opencap_platform::open_path(&open);
+                        },
+                    )),
+            );
+        if let Some(source) = &self.transcript.source
+            && source.parent() != Some(folder.as_path())
+            && let Some(parent) = source.parent()
+        {
+            let path = parent.to_path_buf();
+            content = content.child(label("原音视频保留在原位置")).child(
+                button("original-media-location", "打开原文件位置", false).on_click(
+                    move |_, _, _| {
+                        let _ = opencap_platform::open_path(&path);
+                    },
+                ),
+            );
+        }
+        content = content.child(
+            button("rename-current-meeting", "重命名会议", false)
+                .disabled(self.active())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if let Some(base) = this.transcript_output.clone() {
+                        this.begin_rename(base, window, cx);
+                    }
+                })),
+        );
+        gpui::component::popover::Popover::new("meeting-locations-popover")
+            .anchor(Anchor::TopRight)
+            .trigger(button("toggle-meeting-locations", "文件位置", false).ghost())
+            .child(content)
+    }
+    pub(super) fn meeting_header(&self, compact: bool, cx: &Context<Self>) -> Div {
+        let back = button(
+            "back-meetings",
+            if compact { "列表" } else { "返回列表" },
+            false,
+        )
+        .icon(gpui::component::IconName::ArrowLeft)
+        .ghost()
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.meeting_page = MeetingPage::Library;
+            this.refresh_meetings();
+            this.page_scroll.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        }));
+        let title = div()
+            .flex_1()
+            .min_w(px(0.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .truncate()
+            .child(if self.meeting_title.is_empty() {
+                self.transcript.title()
+            } else {
+                self.meeting_title.clone()
+            });
+        let tabs = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_shrink_0()
+            .children(
+                [
+                    (MeetingPage::Transcript, "逐字稿"),
+                    (MeetingPage::Minutes, "AI 纪要"),
+                    (MeetingPage::Notes, "笔记"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (page, text))| {
+                    button(("meeting-section", i), text, self.meeting_page == page).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.meeting_page = page;
+                            this.page_scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        }),
+                    )
+                }),
+            );
         let mut header = div()
             .flex_shrink_0()
-            .px_6()
-            .py_4()
+            .px_4()
+            .py_2()
             .bg(rgb(SURFACE))
             .border_b_1()
             .border_color(rgb(BORDER))
             .flex()
             .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        button("back-meetings", "返回列表", false)
-                            .icon(gpui::component::IconName::ArrowLeft)
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.meeting_page = MeetingPage::Library;
-                                this.refresh_meetings();
-                                this.page_scroll.set_offset(point(px(0.), px(0.)));
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .truncate()
-                            .child(if self.meeting_title.is_empty() {
-                                self.transcript.title()
-                            } else {
-                                self.meeting_title.clone()
-                            }),
-                    )
-                    .child(
-                        button(
-                            "toggle-meeting-locations",
-                            "文件位置",
-                            self.locations_expanded,
-                        )
-                        .ghost()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.locations_expanded = !this.locations_expanded;
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        button("rename-current-meeting", "重命名", false)
-                            .ghost()
-                            .disabled(self.active())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(base) = this.transcript_output.clone() {
-                                    this.begin_rename(base, window, cx);
-                                }
-                            })),
-                    ),
-            )
-            .child(
-                div().flex().flex_wrap().items_center().gap_2().children(
-                    [
-                        (MeetingPage::Transcript, "逐字稿"),
-                        (MeetingPage::Minutes, "AI 纪要"),
-                        (MeetingPage::Notes, "个人笔记"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (page, title))| {
-                        button(("meeting-section", i), title, self.meeting_page == page).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.meeting_page = page;
-                                this.page_scroll.set_offset(point(px(0.), px(0.)));
-                                cx.notify();
-                            }),
-                        )
-                    }),
-                ),
-            );
-        if self.locations_expanded
-            && let Some(base) = &self.transcript_output
-        {
-            let folder = base.parent().unwrap_or(Path::new(".")).to_path_buf();
-            let open = folder.clone();
-            let copy_folder = folder.clone();
+            .gap_2();
+        if compact {
             header = header.child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(
-                        label(format!("会议文件夹：{}", folder.display()))
-                            .flex_1()
-                            .min_w(px(0.))
-                            .truncate(),
-                    )
-                    .child(
-                        button("copy-meeting-location", "复制路径", false)
-                            .ghost()
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    copy_folder.display().to_string(),
-                                ))
-                            }),
-                    )
-                    .child(
-                        button("meeting-location", "打开会议文件夹", false)
-                            .icon(gpui::component::IconName::FolderOpen)
-                            .ghost()
-                            .on_click(move |_, _, _| {
-                                let _ = opencap_platform::open_path(&open);
-                            }),
-                    ),
+                    .gap_1()
+                    .child(back)
+                    .child(title)
+                    .child(tabs)
+                    .child(self.meeting_locations(cx)),
             );
-        }
-        if self.locations_expanded
-            && let (Some(source), Some(base)) = (&self.transcript.source, &self.transcript_output)
-            && source.parent() != base.parent()
-            && let Some(folder) = source.parent()
-        {
-            let original_folder = folder.to_path_buf();
-            header = header.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        label(format!("原文件留在：{}", source.display()))
-                            .flex_1()
-                            .min_w(px(0.))
-                            .truncate(),
-                    )
-                    .child(
-                        button("original-media-location", "打开原文件位置", false)
-                            .ghost()
-                            .on_click(move |_, _, _| {
-                                let _ = opencap_platform::open_path(&original_folder);
-                            }),
-                    ),
-            );
+        } else {
+            header = header
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(back)
+                        .child(title)
+                        .child(self.meeting_locations(cx)),
+                )
+                .child(tabs);
         }
         if self.rename_base.is_some() && self.rename_base == self.transcript_output {
             header = header.child(self.rename_editor(cx));

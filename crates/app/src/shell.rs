@@ -3,12 +3,14 @@ use gpui::component::IconName;
 
 impl Recorder {
     fn task_banner(&self) -> Option<Div> {
-        if self.summary_task.is_some()
-            && self.transcription_tab
+        if self.transcription_tab
             && !self.settings
-            && self.meeting_page == workspace::MeetingPage::Minutes
+            && matches!(
+                self.meeting_page,
+                workspace::MeetingPage::Minutes | workspace::MeetingPage::Transcript
+            )
         {
-            return None; // The conversation shows its own status and timer without moving the document.
+            return None; // Bounded document panes show their own progress without shifting the reader.
         }
         let progress = if self.ai.correction_task.is_some() {
             ui::task_progress(
@@ -219,30 +221,31 @@ impl Recorder {
         };
         div()
             .flex_shrink_0()
-            .px_6()
-            .py_3()
+            .px_4()
+            .py_2()
             .bg(rgb(SURFACE))
             .border_b_1()
             .border_color(rgb(BORDER))
             .flex()
             .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(label(title))
-                    .child(ui::badge(
-                        self.recording_status(),
-                        if self.active() { RED } else { ui::SUCCESS },
-                        if self.active() { 0xffedf0 } else { 0xeaf6f0 },
-                    )),
-            )
+            .gap_1()
+            .when(!compact, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(label(title))
+                        .child(ui::badge(
+                            self.recording_status(),
+                            if self.active() { RED } else { ui::SUCCESS },
+                            if self.active() { 0xffedf0 } else { 0xeaf6f0 },
+                        )),
+                )
+            })
             .when(compact, |d| d.child(self.navigation(true, cx)))
     }
-
     fn recording_bar(&self, compact: bool, cx: &Context<Self>) -> Div {
         let active = self.active();
         let transitioning = matches!(
@@ -491,16 +494,14 @@ impl Render for Recorder {
         } else {
             self.recording_view(width, cx)
         };
-        let ai_workspace = self.transcription_tab
+        let bounded_document = self.transcription_tab
             && !self.settings
-            && self.meeting_page == workspace::MeetingPage::Minutes;
-        let page_content = if ai_workspace {
-            div()
-                .size_full()
-                .min_h(px(0.))
-                .px(px(28.))
-                .py_4()
-                .child(content)
+            && matches!(
+                self.meeting_page,
+                workspace::MeetingPage::Minutes | workspace::MeetingPage::Transcript
+            );
+        let page_content = if bounded_document {
+            div().size_full().min_h(px(0.)).px_4().py_2().child(content)
         } else {
             widgets::scrollable(
                 "page-scroll",
@@ -522,7 +523,7 @@ impl Render for Recorder {
             .flex()
             .flex_col()
             .child(self.topbar(compact, cx))
-            .when(documents, |d| d.child(self.meeting_header(cx)))
+            .when(documents, |d| d.child(self.meeting_header(compact, cx)))
             .when_some(self.task_banner(), |d, banner| d.child(banner))
             .child(div().flex_1().min_h(px(0.)).child(page_content));
         if let Some(notice) = self.notification(cx) {

@@ -3,6 +3,8 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsPage {
     Ai,
+    Vocabulary,
+    Templates,
     Transcription,
     Recording,
 }
@@ -13,12 +15,30 @@ impl Recorder {
             .flex()
             .flex_col()
             .gap_5()
-            .child(ui::heading("设置", "按工作流程管理服务、模型和录制偏好。"))
+            .child(ui::heading("全局设置", "服务、词汇和模板对所有会议生效。"))
+            .when(
+                self.transcription_tab && self.transcript_output.is_some(),
+                |d| {
+                    d.child(
+                        div().flex().child(
+                            button("settings-back-meeting", "返回当前会议", false)
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings = false;
+                                    this.page_scroll.set_offset(point(px(0.), px(0.)));
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                },
+            )
             .child(
                 div().flex().flex_wrap().gap_2().children(
                     [
                         (SettingsPage::Ai, "AI 服务"),
-                        (SettingsPage::Transcription, "语音转录"),
+                        (SettingsPage::Vocabulary, "词汇与语言"),
+                        (SettingsPage::Templates, "纪要模板"),
+                        (SettingsPage::Transcription, "识别模型"),
                         (SettingsPage::Recording, "录制偏好"),
                     ]
                     .into_iter()
@@ -40,6 +60,8 @@ impl Recorder {
                     .max_w(px(860.))
                     .child(match self.settings_page {
                         SettingsPage::Ai => self.ai_settings_view(cx),
+                        SettingsPage::Vocabulary => self.vocabulary_settings_view(cx),
+                        SettingsPage::Templates => self.template_settings_view(cx),
                         SettingsPage::Transcription => self.transcription_settings(cx),
                         SettingsPage::Recording => self.recording_settings(cx),
                     }),

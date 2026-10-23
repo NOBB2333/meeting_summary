@@ -7,9 +7,59 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MinutesStyle {
+    #[default]
+    Standard,
+    Digest,
+    Actions,
+}
+impl MinutesStyle {
+    pub const ALL: [Self; 3] = [Self::Standard, Self::Digest, Self::Actions];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "标准纪要",
+            Self::Digest => "阅读摘要",
+            Self::Actions => "行动清单",
+        }
+    }
+    pub fn instruction(self) -> &'static str {
+        match self {
+            Self::Standard => {
+                "标准会议纪要正文：会议主题、按议题组织的讨论结论、会议议定事项、后续工作和待确认事项。非必要的缺失栏目省略。"
+            }
+            Self::Digest => "阅读摘要：概括议题、主要结论和后续工作。",
+            Self::Actions => {
+                "行动清单：明确决策、工作事项、责任部门或负责人、期限和待确认事项；未知信息不得编造。"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+    #[test]
+    fn legacy_settings_and_saved_global_style_keep_vocabulary() {
+        let old: MinutesFormat =
+            serde_json::from_str(r#"{"terminology":"OpenCap\n统信 UOS"}"#).unwrap();
+        assert_eq!(old.style, MinutesStyle::Standard);
+        let changed = MinutesFormat {
+            style: MinutesStyle::Actions,
+            ..old
+        };
+        let loaded: MinutesFormat =
+            serde_json::from_slice(&serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(loaded.style, MinutesStyle::Actions);
+        assert_eq!(loaded.terminology, "OpenCap\n统信 UOS");
+        assert!(loaded.style.instruction().starts_with("行动清单："));
+    }
+}
+
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MinutesFormat {
+    pub style: MinutesStyle,
     pub guidance: String,
     /// Canonical names or "misrecognition => preferred spelling", one per line.
     pub terminology: String,
