@@ -15,6 +15,7 @@ pub(super) struct MeetingFile {
     pub media: Option<PathBuf>,
     pub modified: std::time::SystemTime,
     complete: Option<bool>,
+    model: Option<&'static str>,
     title: String,
     preview: String,
     details: String,
@@ -37,7 +38,7 @@ impl MeetingFile {
         self.title.clone()
     }
     fn status(&self) -> String {
-        [
+        let parts = [
             match self.complete {
                 Some(true) => "逐字稿已完成",
                 Some(false) => "逐字稿部分保存 · 可重新转录",
@@ -49,7 +50,10 @@ impl MeetingFile {
                 "AI 纪要未生成"
             },
         ]
-        .join("  ·  ")
+        .join("  ·  ");
+        self.model
+            .map(|model| format!("{parts}  ·  主模型：{model}"))
+            .unwrap_or(parts)
     }
 }
 fn index_path() -> PathBuf {
@@ -114,6 +118,12 @@ fn discover_paths(root: &Path, remembered: Vec<PathBuf>) -> Vec<MeetingFile> {
             None
         };
         let complete = saved.as_ref().map(|t| t.complete && !t.cancelled);
+        let model = saved.as_ref().and_then(|transcript| {
+            opencap_asr::ModelKind::ALL
+                .into_iter()
+                .find(|kind| kind.directory() == transcript.model)
+                .map(|kind| kind.label())
+        });
         let media = [base.with_extension("mp4"), base.with_extension("m4a")]
             .into_iter()
             .find(|p| p.exists())
@@ -124,6 +134,7 @@ fn discover_paths(root: &Path, remembered: Vec<PathBuf>) -> Vec<MeetingFile> {
             media,
             modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
             complete,
+            model,
             title,
             preview,
             details,
@@ -669,6 +680,7 @@ impl Recorder {
             let playable = media.as_ref().is_some_and(|p| p.exists());
             let selected = transcript.clone();
             let source = media.clone();
+            let retry_source = media.clone();
             let folder = meeting
                 .base
                 .parent()
@@ -775,6 +787,29 @@ impl Recorder {
                                         }
                                     }),
                             )
+                            .when(exists && playable, |d| {
+                                d.child(
+                                    button(
+                                        ("retranscribe-meeting", i),
+                                        "用当前模型另存重转",
+                                        false,
+                                    )
+                                    .ghost()
+                                    .disabled(busy)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if let Some(source) = &retry_source {
+                                                this.start_file_transcription(
+                                                    source.clone(),
+                                                    false,
+                                                    false,
+                                                );
+                                            }
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            })
                             .child(
                                 button(("meeting-folder", i), "会议文件夹", false)
                                     .ghost()
@@ -857,6 +892,38 @@ mod export_tests {
         );
         assert_eq!(files[0].complete, Some(true));
         assert_eq!(std::fs::read(&media).unwrap(), b"preserved recording");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn different_model_transcripts_of_the_same_recording_remain_separate() {
+        let root = std::env::temp_dir().join(format!(
+            "opencap-library-model-comparison-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let media = root.join("source.m4a");
+        std::fs::write(&media, b"original recording").unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        for (base, kind) in [
+            (&first, opencap_asr::ModelKind::Offline),
+            (&second, opencap_asr::ModelKind::ParaformerSmall),
+        ] {
+            opencap_asr::Transcript {
+                source: Some(media.clone()),
+                model: kind.directory().into(),
+                complete: true,
+                ..Default::default()
+            }
+            .checkpoint(base)
+            .unwrap();
+        }
+        let meetings = super::discover_paths(&root, vec![]);
+        assert_eq!(meetings.len(), 2);
+        assert!(meetings.iter().any(|m| m.status().contains("SenseVoice")));
+        assert!(meetings.iter().any(|m| m.status().contains("Paraformer")));
+        assert!(meetings.iter().all(|m| m.media.as_ref() == Some(&media)));
+        assert_eq!(std::fs::read(media).unwrap(), b"original recording");
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

@@ -247,6 +247,8 @@ fn run(
     let mut performance_samples = std::collections::VecDeque::new();
     let mut tick = Instant::now();
     let mut last_frames = 0;
+    let mut capture_received = 0u64;
+    let mut last_captured = 0u64;
     let mut last_bytes = 0;
     let mut meter = opencap_platform::ProcessMeter::default();
     let mut stop_reason = None;
@@ -364,6 +366,7 @@ fn run(
         }
         if !clock.is_paused() {
             while let Ok(mut frame) = video_rx.try_recv() {
+                capture_received += 1;
                 frame.pts_us = (frame.pts_us - video_epoch).max(0);
                 latest = Some(frame);
                 last_capture = Instant::now();
@@ -405,6 +408,14 @@ fn run(
             s.bitrate_kbps = bytes.saturating_sub(last_bytes) as f64 * 8.0 / 1000.0 / elapsed;
             s.bytes = bytes;
             s.dropped_frames = dropped.load(Ordering::Relaxed);
+            // Every queue eviction was also a completed capture. The bounded
+            // queue can shift up to two frames between adjacent samples.
+            let captured = capture_received.saturating_add(s.dropped_frames);
+            let capture_fps = if config.audio_only {
+                None
+            } else {
+                Some(captured.saturating_sub(last_captured) as f64 / elapsed)
+            };
             s.cpu_percent = cpu;
             s.peak_memory_bytes = memory;
             if performance_samples.len() == 1800 {
@@ -413,6 +424,7 @@ fn run(
             performance_samples.push_back(serde_json::json!({
                 "wall_seconds": began.elapsed().as_secs_f64(), "media_seconds": s.duration_seconds,
                 "cpu_percent": cpu, "peak_memory_bytes": memory, "fps": s.fps,
+                "capture_fps": capture_fps, "captured_frames": captured,
                 "dropped_frames": s.dropped_frames, "video_queue": video_rx.len(), "audio_queue": audio_rx.len(),
                 "asr_pending_packets": writer.asr_pending_packets(), "loop_max_ms": loop_max_ms,
                 "encode_max_ms": encode_max_ms, "preview_max_ms": preview_max_ms,
@@ -457,6 +469,7 @@ fn run(
                 idle_warned = true;
             }
             last_frames = writer.frames;
+            last_captured = captured;
             last_bytes = bytes;
             tick = Instant::now();
         }

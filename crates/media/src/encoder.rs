@@ -33,16 +33,31 @@ impl FfmpegVideoEncoder {
         context.set_max_b_frames(0);
         context.set_gop(config.gop_seconds * config.max_fps);
         context.set_flags(ff::codec::Flags::GLOBAL_HEADER);
-        // Bound the encoder's working set and CPU usage on very high core count machines.
+        let available_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        // Use fewer encoder workers in fast mode to reduce competition with
+        // desktop and audio work; this does not reserve a processor.
+        let encoder_threads = if config.fast_software_encoding && name.starts_with("libx26") {
+            available_threads.saturating_sub(1).clamp(1, 4)
+        } else {
+            available_threads.min(8)
+        };
         context.set_threading(ff::codec::threading::Config {
-            count: std::thread::available_parallelism()
-                .map(|n| n.get().min(8))
-                .unwrap_or(2),
+            count: encoder_threads,
             ..Default::default()
         });
         let mut options = BTreeMap::new();
         if name.starts_with("libx26") {
-            options.insert("preset".into(), "veryfast".into());
+            options.insert(
+                "preset".into(),
+                if config.fast_software_encoding {
+                    "ultrafast"
+                } else {
+                    "veryfast"
+                }
+                .into(),
+            );
             options.insert("crf".into(), config.quality.to_string());
             if name == "libx264" {
                 options.insert("tune".into(), "stillimage,zerolatency".into());
@@ -50,7 +65,12 @@ impl FfmpegVideoEncoder {
             if name == "libx265" {
                 options.insert(
                     "x265-params".into(),
-                    "log-level=error:pools=4:frame-threads=2:rc-lookahead=0:bframes=0".into(),
+                    if config.fast_software_encoding {
+                        "log-level=error:pools=1:frame-threads=1:rc-lookahead=0:bframes=0"
+                    } else {
+                        "log-level=error:pools=4:frame-threads=2:rc-lookahead=0:bframes=0"
+                    }
+                    .into(),
                 );
             }
         } else if name == "libsvtav1" {
@@ -169,14 +189,6 @@ impl VideoEncoder for FfmpegVideoEncoder {
     type Packet = ff::Packet;
     fn encode(&mut self, video: &VideoFrame) -> Result<Vec<ff::Packet>> {
         video.validate()?;
-        let mut input = ff::frame::Video::new(ff::format::Pixel::BGRA, video.width, video.height);
-        let stride = input.stride(0);
-        for row in 0..video.height as usize {
-            input.data_mut(0)[row * stride..row * stride + video.width as usize * 4]
-                .copy_from_slice(
-                    &video.data[row * video.stride..row * video.stride + video.width as usize * 4],
-                );
-        }
         let (width, height) = (self.inner.width(), self.inner.height());
         let scale = (width as f64 / video.width as f64).min(height as f64 / video.height as f64);
         let sw = ((video.width as f64 * scale) as u32 & !1).max(2);
@@ -208,7 +220,7 @@ impl VideoEncoder for FfmpegVideoEncoder {
             self.source_size = (video.width, video.height);
         }
         let mut scaled = ff::frame::Video::new(self.inner.format(), sw, sh);
-        self.scaler.as_mut().unwrap().run(&input, &mut scaled)?;
+        scale_bgra(self.scaler.as_mut().unwrap(), video, &mut scaled)?;
         let mut output = if sw == width && sh == height {
             scaled
         } else {
@@ -248,6 +260,58 @@ impl VideoEncoder for FfmpegVideoEncoder {
         self.inner.send_eof()?;
         self.drain()
     }
+}
+
+/// Convert owned capture pixels directly when they include libswscale's
+/// required overread padding. External/test frames without it use a safe copy.
+fn scale_bgra(
+    scaler: &mut ff::software::scaling::Context,
+    video: &VideoFrame,
+    output: &mut ff::frame::Video,
+) -> Result<()> {
+    let image_bytes = video.stride.checked_mul(video.height as usize);
+    let padded = image_bytes
+        .and_then(|size| size.checked_add(VideoFrame::PADDING))
+        .is_some_and(|size| video.data.len() >= size);
+    if padded {
+        let stride = i32::try_from(video.stride).context("BGRA stride is too large")?;
+        let height = i32::try_from(video.height).context("BGRA height is too large")?;
+        let source = [
+            video.data.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        ];
+        let strides = [stride, 0, 0, 0];
+        // SAFETY: validate() checked the frame geometry; the complete BGRA
+        // plane and its initialized 16-byte padding remain alive throughout
+        // this synchronous call. output owns its allocated FFmpeg planes.
+        let rows = unsafe {
+            ff::ffi::sws_scale(
+                scaler.as_mut_ptr(),
+                source.as_ptr(),
+                strides.as_ptr(),
+                0,
+                height,
+                (*output.as_mut_ptr()).data.as_ptr(),
+                (*output.as_mut_ptr()).linesize.as_ptr(),
+            )
+        };
+        anyhow::ensure!(
+            rows == output.height() as i32,
+            "BGRA conversion failed: {rows}"
+        );
+    } else {
+        let mut input = ff::frame::Video::new(ff::format::Pixel::BGRA, video.width, video.height);
+        let stride = input.stride(0);
+        let row_bytes = video.width as usize * 4;
+        for row in 0..video.height as usize {
+            input.data_mut(0)[row * stride..row * stride + row_bytes]
+                .copy_from_slice(&video.data[row * video.stride..row * video.stride + row_bytes]);
+        }
+        scaler.run(&input, output)?;
+    }
+    Ok(())
 }
 
 /// Exercise the actual device, encoder and decoder; enumeration alone is insufficient.
@@ -325,4 +389,99 @@ pub fn probe_encoders() -> Vec<EncoderCapabilities> {
         }
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_software_mode_changes_the_x264_preset() {
+        super::super::initialize().unwrap();
+        let standard = RecordingConfig::default();
+        let fast = RecordingConfig {
+            fast_software_encoding: true,
+            ..standard.clone()
+        };
+        let standard_encoder = FfmpegVideoEncoder::new("libx264", 320, 180, &standard).unwrap();
+        let fast_encoder = FfmpegVideoEncoder::new("libx264", 320, 180, &fast).unwrap();
+        assert_eq!(standard_encoder.options["preset"], "veryfast");
+        assert_eq!(fast_encoder.options["preset"], "ultrafast");
+        drop((standard_encoder, fast_encoder));
+        probe_one("libx264", 320, 180, &fast).unwrap();
+        if ff::encoder::find_by_name("libx265").is_some() {
+            probe_one("libx265", 320, 180, &fast).unwrap();
+        }
+    }
+
+    #[test]
+    fn padded_capture_matches_copied_conversion_for_strides_and_formats() {
+        super::super::initialize().unwrap();
+        for (width, height, extra_stride, out_width, out_height, format) in [
+            (64, 36, 0, 64, 36, ff::format::Pixel::YUV420P),
+            (66, 38, 12, 34, 20, ff::format::Pixel::YUV420P),
+            (66, 38, 12, 34, 20, ff::format::Pixel::NV12),
+        ] {
+            let stride = width as usize * 4 + extra_stride;
+            let mut pixels = vec![0; stride * height as usize];
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let i = y * stride + x * 4;
+                    pixels[i..i + 4].copy_from_slice(&[
+                        (x * 11 + y * 3) as u8,
+                        (x * 7 + y * 13) as u8,
+                        (x * 5 + y * 17) as u8,
+                        255,
+                    ]);
+                }
+            }
+            let copied = VideoFrame {
+                width,
+                height,
+                stride,
+                pts_us: 0,
+                data: Arc::new(pixels.clone()),
+            };
+            let direct = VideoFrame {
+                data: VideoFrame::copy_pixels(&pixels),
+                ..copied.clone()
+            };
+            let make_scaler = || {
+                ff::software::scaling::Context::get(
+                    ff::format::Pixel::BGRA,
+                    width,
+                    height,
+                    format,
+                    out_width,
+                    out_height,
+                    ff::software::scaling::Flags::BICUBIC,
+                )
+                .unwrap()
+            };
+            let mut expected = ff::frame::Video::new(format, out_width, out_height);
+            let mut actual = ff::frame::Video::new(format, out_width, out_height);
+            copied.validate().unwrap();
+            direct.validate().unwrap();
+            scale_bgra(&mut make_scaler(), &copied, &mut expected).unwrap();
+            scale_bgra(&mut make_scaler(), &direct, &mut actual).unwrap();
+            for plane in 0..actual.planes() {
+                let (row_bytes, rows) = if plane == 0 {
+                    (out_width as usize, out_height as usize)
+                } else if format == ff::format::Pixel::NV12 {
+                    (out_width as usize, out_height as usize / 2)
+                } else {
+                    (out_width as usize / 2, out_height as usize / 2)
+                };
+                for row in 0..rows {
+                    let a = row * actual.stride(plane);
+                    let b = row * expected.stride(plane);
+                    assert_eq!(
+                        &actual.data(plane)[a..a + row_bytes],
+                        &expected.data(plane)[b..b + row_bytes],
+                        "format {format:?}, plane {plane}, row {row}"
+                    );
+                }
+            }
+        }
+    }
 }

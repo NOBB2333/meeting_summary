@@ -208,7 +208,10 @@ impl Recorder {
         .detach();
         // Reading/exporting saved meetings does not need screen capture access.
         // Enumerate targets only when choosing/starting video capture (or in the UI harness).
-        let targets = if !config.audio_only && cfg!(feature = "ui-smoke") {
+        let targets = if !config.audio_only
+            && cfg!(feature = "ui-smoke")
+            && !std::env::args().any(|a| a == "--ui-no-targets")
+        {
             opencap_platform::targets().unwrap_or_else(|e| {
                 message = format!("无法枚举录制目标：{e}");
                 Vec::new()

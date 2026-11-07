@@ -632,7 +632,7 @@ impl FixtureCanvas {
             height: self.height,
             stride: self.width as usize * 4,
             pts_us,
-            data: Arc::new(self.pixels.lock().clone()),
+            data: VideoFrame::copy_pixels(&self.pixels.lock()),
         }
     }
 }

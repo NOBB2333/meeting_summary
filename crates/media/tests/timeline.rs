@@ -187,6 +187,70 @@ fn vfr_static_tail_audio_and_recovery_preserve_duration() {
 }
 
 #[test]
+fn reference_encoding_preserves_variable_frame_durations() {
+    let dir = scratch();
+    let source = dir.join("reference.mp4");
+    let output = dir.join("encoded.mp4");
+    let config = RecordingConfig {
+        encoder: Some("libx264".into()),
+        adaptive: false,
+        system_audio: false,
+        ..Default::default()
+    };
+    let mut writer = MediaWriter::new(&source, 320, 180, &config).unwrap();
+    let pixels = Arc::new(vec![100; 320 * 180 * 4]);
+    for pts_us in [0, 500_000, 1_500_000] {
+        writer
+            .video(&VideoFrame {
+                width: 320,
+                height: 180,
+                stride: 320 * 4,
+                pts_us,
+                data: pixels.clone(),
+            })
+            .unwrap();
+    }
+    writer.finish(2_000_000).unwrap();
+    opencap_media::encode_reference(&source, &output, &config).unwrap();
+    let report = opencap_media::inspect_output(&output).unwrap();
+    let duration = report["duration_seconds"].as_f64().unwrap();
+    assert!((duration - 2.0).abs() < 0.06, "duration={duration}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn interrupted_video_only_recording_remains_recoverable_without_an_invented_tail() {
+    let dir = scratch();
+    let partial = dir.join("interrupted.partial.mp4");
+    let output = dir.join("recovered.mp4");
+    let config = RecordingConfig {
+        encoder: Some("libx264".into()),
+        system_audio: false,
+        ..Default::default()
+    };
+    let mut writer = MediaWriter::new(&partial, 320, 180, &config).unwrap();
+    let pixels = Arc::new(vec![100; 320 * 180 * 4]);
+    for pts_us in (0..=6).map(|step| step * 500_000) {
+        writer
+            .video(&VideoFrame {
+                width: 320,
+                height: 180,
+                stride: 320 * 4,
+                pts_us,
+                data: pixels.clone(),
+            })
+            .unwrap();
+    }
+    writer.flush_io().unwrap();
+    drop(writer); // Simulate interruption before the trailer and final packet.
+    recover_file(&partial, &output).unwrap();
+    let report = opencap_media::inspect_output(&output).unwrap();
+    let duration = report["duration_seconds"].as_f64().unwrap();
+    assert!((0.1..=3.1).contains(&duration), "duration={duration}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn exports_a_same_timeline_m4a_without_video() {
     let dir = scratch();
     let video = dir.join("recording.mp4");

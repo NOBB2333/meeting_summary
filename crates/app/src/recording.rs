@@ -358,6 +358,30 @@ impl Recorder {
                         ),
                     )
                     .child(label("省空间适合文档和会议；画面越动态，文件越大。"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                button("reduce-recording-load", "一键降低占用", false)
+                                    .disabled(self.active())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.active() {
+                                            this.config.reduce_recording_load();
+                                            if let Some(image) = this.preview_image.take() {
+                                                cx.drop_image(image, None);
+                                            }
+                                            this.save();
+                                            this.message = "已降低录制占用；完成后仍可从文件转录。".into();
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(label(format!("当前最高 {} FPS", self.config.max_fps))),
+                    )
+                    .child(label("适合老电脑：最高 10 FPS、加快软件 H.264/H.265 编码，并关闭画面预览和实时转录。画面流畅度或质量可能降低，文件可能变大；这些设置可分别重新调整。"))
             })
             .when(self.config.audio_only, |d| {
                 d.child(label("无需采集或编码画面，适合长时间会议录音。"))

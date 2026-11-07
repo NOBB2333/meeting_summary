@@ -1,4 +1,5 @@
 use opencap_core::{Codec, RecordingConfig, VideoFrame};
+use std::sync::{Arc, Weak};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Motion {
@@ -8,6 +9,8 @@ pub enum Motion {
 }
 pub struct FramePolicy {
     previous: Vec<u8>,
+    previous_frame: Weak<Vec<u8>>,
+    previous_geometry: (u32, u32, usize),
     last_pts: Option<i64>,
     last_motion: i64,
     last_high: i64,
@@ -17,6 +20,8 @@ impl Default for FramePolicy {
     fn default() -> Self {
         Self {
             previous: Vec::new(),
+            previous_frame: Weak::new(),
+            previous_geometry: (0, 0, 0),
             last_pts: None,
             last_motion: 0,
             last_high: 0,
@@ -26,28 +31,47 @@ impl Default for FramePolicy {
 }
 impl FramePolicy {
     pub fn accept(&mut self, frame: &VideoFrame, config: &RecordingConfig) -> bool {
-        let mut thumb = Vec::with_capacity(80 * 45);
-        for y in 0..45 {
-            for x in 0..80 {
-                let i = (y * frame.height as usize / 45) * frame.stride
-                    + (x * frame.width as usize / 80) * 4;
-                let d = &frame.data;
-                thumb.push(
-                    ((d[i] as u16 * 29 + d[i + 1] as u16 * 150 + d[i + 2] as u16 * 77) >> 8) as u8,
-                );
-            }
+        if !config.adaptive {
+            self.previous.clear();
+            self.previous_frame = Weak::new();
+            return self.due(frame.pts_us, config.max_fps);
         }
-        let changed = if self.previous.len() == thumb.len() {
-            thumb
-                .iter()
-                .zip(&self.previous)
-                .filter(|(a, b)| a.abs_diff(**b) > 8)
-                .count() as f64
-                / thumb.len() as f64
+        let geometry = (frame.width, frame.height, frame.stride);
+        let unchanged_buffer = self.previous_geometry == geometry
+            && self
+                .previous_frame
+                .upgrade()
+                .is_some_and(|previous| Arc::ptr_eq(&previous, &frame.data));
+        let changed = if unchanged_buffer {
+            0.0
         } else {
-            1.0
+            let mut thumb = Vec::with_capacity(80 * 45);
+            for y in 0..45 {
+                for x in 0..80 {
+                    let i = (y * frame.height as usize / 45) * frame.stride
+                        + (x * frame.width as usize / 80) * 4;
+                    let d = &frame.data;
+                    thumb.push(
+                        ((d[i] as u16 * 29 + d[i + 1] as u16 * 150 + d[i + 2] as u16 * 77) >> 8)
+                            as u8,
+                    );
+                }
+            }
+            let changed = if self.previous.len() == thumb.len() {
+                thumb
+                    .iter()
+                    .zip(&self.previous)
+                    .filter(|(a, b)| a.abs_diff(**b) > 8)
+                    .count() as f64
+                    / thumb.len() as f64
+            } else {
+                1.0
+            };
+            self.previous = thumb;
+            self.previous_frame = Arc::downgrade(&frame.data);
+            self.previous_geometry = geometry;
+            changed
         };
-        self.previous = thumb;
         if changed > 0.12 {
             self.motion = Motion::High;
             self.last_motion = frame.pts_us;
@@ -60,22 +84,21 @@ impl FramePolicy {
         } else if frame.pts_us - self.last_motion > 1_000_000 {
             self.motion = Motion::Static;
         }
-        let fps = if config.adaptive {
-            (match self.motion {
-                Motion::Static => 1,
-                Motion::Normal => 15,
-                Motion::High => config.max_fps,
-            })
-            .min(config.max_fps)
-        } else {
-            config.max_fps
-        };
+        let fps = (match self.motion {
+            Motion::Static => 1,
+            Motion::Normal => 15,
+            Motion::High => config.max_fps,
+        })
+        .min(config.max_fps);
+        self.due(frame.pts_us, fps)
+    }
+    fn due(&mut self, pts_us: i64, fps: u32) -> bool {
         let due = self
             .last_pts
-            .is_none_or(|p| frame.pts_us - p >= 1_000_000 / fps as i64);
+            .is_none_or(|p| pts_us - p >= 1_000_000 / fps as i64);
         // A change after a long static interval must be emitted immediately.
         if due {
-            self.last_pts = Some(frame.pts_us);
+            self.last_pts = Some(pts_us);
         }
         due
     }
@@ -153,6 +176,38 @@ mod tests {
         assert!(!p.accept(&frame(1_150_000, 0), &c));
         assert!(p.accept(&frame(1_200_000, 255), &c));
         assert_eq!(p.motion, Motion::High);
+    }
+    #[test]
+    fn reused_capture_frame_stays_static_and_new_pixels_wake_up() {
+        let mut p = FramePolicy::default();
+        let c = RecordingConfig::default();
+        let mut cached = frame(0, 0);
+        assert!(p.accept(&cached, &c));
+        let thumbnail = p.previous.as_ptr();
+        cached.pts_us = 1_100_000;
+        assert!(p.accept(&cached, &c));
+        assert_eq!(p.motion, Motion::Static);
+        assert_eq!(
+            p.previous.as_ptr(),
+            thumbnail,
+            "cached pixels were resampled"
+        );
+        cached.pts_us = 1_150_000;
+        assert!(!p.accept(&cached, &c));
+        assert!(p.accept(&frame(1_200_000, 255), &c));
+        assert_eq!(p.motion, Motion::High);
+    }
+    #[test]
+    fn fixed_fps_skips_motion_analysis() {
+        let mut p = FramePolicy::default();
+        let c = RecordingConfig {
+            adaptive: false,
+            ..Default::default()
+        };
+        assert!(p.accept(&frame(0, 0), &c));
+        assert!(!p.accept(&frame(10_000, 255), &c));
+        assert!(p.accept(&frame(40_000, 255), &c));
+        assert!(p.previous.is_empty());
     }
     #[test]
     fn explicit_encoder_is_never_silently_replaced() {

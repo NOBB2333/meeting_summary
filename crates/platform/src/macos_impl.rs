@@ -198,9 +198,9 @@ unsafe extern "C" fn capture_callback(
             height: height as u32,
             stride: stride as usize,
             pts_us,
-            data: Arc::new(
-                unsafe { std::slice::from_raw_parts(data.cast::<u8>(), count) }.to_vec(),
-            ),
+            data: VideoFrame::copy_pixels(unsafe {
+                std::slice::from_raw_parts(data.cast::<u8>(), count)
+            }),
         };
         if let Err(crossbeam_channel::TrySendError::Full(frame)) = tx.try_send(frame) {
             let _ = rx.try_recv();
@@ -870,14 +870,13 @@ impl FixtureCanvas {
                 oc_canvas_data(self.handle),
                 self.width as usize * self.height as usize * 4,
             )
-        }
-        .to_vec();
+        };
         VideoFrame {
             width: self.width,
             height: self.height,
             stride: self.width as usize * 4,
             pts_us,
-            data: Arc::new(data),
+            data: VideoFrame::copy_pixels(data),
         }
     }
 }

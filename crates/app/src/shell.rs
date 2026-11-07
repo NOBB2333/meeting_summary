@@ -40,7 +40,11 @@ impl Recorder {
         {
             ui::task_progress(
                 "asr-task-progress",
-                "正在转录逐字稿",
+                if self.preparing_model.is_some() {
+                    "正在下载识别模型"
+                } else {
+                    "正在转录逐字稿"
+                },
                 &self.transcription_status,
                 &self.transcription_clock,
                 if self.transcription_progress > 0. && self.transcription_progress < 1. {
@@ -288,12 +292,20 @@ impl Recorder {
                             ),
                     )
                     .child(label(if !compact && active {
-                        format!(
-                            "{:.1} FPS · {:.0} kbps · {:.1} MB",
-                            self.stats.fps,
-                            self.stats.bitrate_kbps,
-                            self.stats.bytes as f64 / 1_000_000.
-                        )
+                        if self.config.audio_only {
+                            format!(
+                                "录音 · {:.0} kbps · {:.1} MB",
+                                self.stats.bitrate_kbps,
+                                self.stats.bytes as f64 / 1_000_000.
+                            )
+                        } else {
+                            format!(
+                                "编码 {:.1} FPS · {:.0} kbps · {:.1} MB",
+                                self.stats.fps,
+                                self.stats.bitrate_kbps,
+                                self.stats.bytes as f64 / 1_000_000.
+                            )
+                        }
                     } else {
                         self.recording_status().to_owned()
                     })),

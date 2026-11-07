@@ -10,6 +10,10 @@ use std::{
 };
 use windows::{
     Win32::Graphics::{
+        Direct3D11::{
+            D3D11_BOX, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, ID3D11DeviceContext,
+            ID3D11Texture2D,
+        },
         Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
         Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6},
         Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO},
@@ -18,6 +22,7 @@ use windows::{
 };
 use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
+    d3d11::StagingTexture,
     frame::Frame,
     graphics_capture_api::InternalCaptureControl,
     monitor::Monitor,
@@ -174,6 +179,82 @@ struct Flags {
 struct Handler {
     flags: Flags,
     last: Option<Instant>,
+    staging: Option<StagingTexture>,
+}
+
+/// Ensure every successful Map is paired with Unmap, including error paths.
+struct MappedTexture<'a> {
+    context: &'a ID3D11DeviceContext,
+    texture: &'a ID3D11Texture2D,
+    mapped: D3D11_MAPPED_SUBRESOURCE,
+}
+impl Drop for MappedTexture<'_> {
+    fn drop(&mut self) {
+        unsafe { self.context.Unmap(self.texture, 0) };
+    }
+}
+impl Handler {
+    fn read_frame(
+        &mut self,
+        frame: &Frame<'_>,
+        crop: Option<Rect>,
+    ) -> Result<(usize, Arc<Vec<u8>>)> {
+        let (width, height) = crop.map_or((frame.width(), frame.height()), |r| (r.width, r.height));
+        let format = frame.desc().Format;
+        if self.staging.as_ref().is_none_or(|texture| {
+            let desc = texture.desc();
+            (desc.Width, desc.Height, desc.Format) != (width, height, format)
+        }) {
+            self.staging = Some(StagingTexture::new(frame.device(), width, height, format)?);
+        }
+        let texture = self.staging.as_ref().expect("staging texture").texture();
+        let context = frame.device_context();
+        unsafe {
+            if let Some(r) = crop {
+                let region = D3D11_BOX {
+                    left: r.x,
+                    top: r.y,
+                    front: 0,
+                    right: r.x + r.width,
+                    bottom: r.y + r.height,
+                    back: 1,
+                };
+                context.CopySubresourceRegion(
+                    texture,
+                    0,
+                    0,
+                    0,
+                    0,
+                    frame.as_raw_texture(),
+                    0,
+                    Some(&region),
+                );
+            } else {
+                context.CopyResource(texture, frame.as_raw_texture());
+            }
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+        let mapping = MappedTexture {
+            context,
+            texture,
+            mapped,
+        };
+        let stride = mapping.mapped.RowPitch as usize;
+        let len = stride
+            .checked_mul(height as usize)
+            .context("Capture frame is too large")?;
+        anyhow::ensure!(
+            !mapping.mapped.pData.is_null()
+                && stride >= width as usize * 4
+                && len <= isize::MAX as usize,
+            "Invalid mapped capture frame"
+        );
+        // SAFETY: D3D11 Map exposes RowPitch * height bytes until Unmap;
+        // mapping keeps the texture mapped until the owned copy is complete.
+        let pixels = unsafe { std::slice::from_raw_parts(mapping.mapped.pData.cast::<u8>(), len) };
+        Ok((stride, VideoFrame::copy_pixels(pixels)))
+    }
 }
 impl GraphicsCaptureApiHandler for Handler {
     type Flags = Flags;
@@ -182,6 +263,7 @@ impl GraphicsCaptureApiHandler for Handler {
         Ok(Self {
             flags: ctx.flags,
             last: None,
+            staging: None,
         })
     }
     fn on_frame_arrived(
@@ -203,7 +285,7 @@ impl GraphicsCaptureApiHandler for Handler {
         if width < 2 || height < 2 {
             return Ok(());
         }
-        let (width, height, mut buffer) = if let Some(r) = self.flags.crop {
+        let (width, height) = if let Some(r) = self.flags.crop {
             if r.x.checked_add(r.width).is_none_or(|x| x > width)
                 || r.y.checked_add(r.height).is_none_or(|y| y > height)
             {
@@ -213,18 +295,13 @@ impl GraphicsCaptureApiHandler for Handler {
                     .try_send("录制区域已超出显示器范围，录制已停止".into());
                 return Ok(());
             }
-            (
-                r.width,
-                r.height,
-                frame.buffer_crop(r.x, r.y, r.x + r.width, r.y + r.height)?,
-            )
+            (r.width, r.height)
         } else {
-            (width, height, frame.buffer()?)
+            (width, height)
         };
-        // Preserve the native row stride. De-padding uses the dependency's global
-        // Rayon pool and then requires another full-frame copy for ownership.
-        let stride = buffer.row_pitch() as usize;
-        let data = Arc::new(buffer.as_raw_buffer().to_vec());
+        // Reuse one CPU staging texture for the session, and preserve its row
+        // stride without waking the dependency's parallel de-padding pool.
+        let (stride, data) = self.read_frame(frame, self.flags.crop)?;
         let video = VideoFrame {
             width,
             height,

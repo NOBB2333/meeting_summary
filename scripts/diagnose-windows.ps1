@@ -54,6 +54,7 @@ if ($RecordingReport) {
         RealtimeTranscription = $saved.config.realtime_transcription
         ContextRevision = $saved.config.transcription_context_revision
         RecordingPreview = $saved.config.show_recording_preview
+        FastSoftwareEncoding = $saved.config.fast_software_encoding
         MaxFps = $saved.config.max_fps
         AudioOnly = $saved.config.audio_only
         PerformanceSamples = $saved.performance_samples

@@ -22,6 +22,12 @@ enum Command {
         model: ModelKind,
         #[arg(long)]
         realtime: bool,
+        /// Do not run a second, sentence-level model for streaming recognition.
+        #[arg(long)]
+        no_revision: bool,
+        /// Offline model used for optional sentence-level correction.
+        #[arg(long, value_enum, default_value = "offline")]
+        revision_model: ModelKind,
         #[arg(long,default_value=DEFAULT_HOTWORDS)]
         hotwords: String,
         /// Language hint: zh (Chinese with English terms), en, or auto (five languages).
@@ -83,6 +89,8 @@ fn main() -> Result<()> {
             output,
             model,
             realtime,
+            no_revision,
+            revision_model,
             hotwords,
             language,
         } => {
@@ -92,14 +100,15 @@ fn main() -> Result<()> {
                 "auto" => opencap_core::TranscriptionLanguage::Auto,
                 _ => opencap_core::TranscriptionLanguage::Chinese,
             };
-            let session = AsrSession::file_with_language(
+            let session = AsrSession::file_with_models(
                 model_root(),
                 model,
                 input,
                 output,
                 realtime,
                 hotwords,
-                true,
+                !no_revision,
+                revision_model,
                 language,
             )?;
             let mut complete = false;

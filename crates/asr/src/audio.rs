@@ -1,7 +1,65 @@
 use anyhow::{Context, Result};
 use ffmpeg_next as ff;
 use opencap_core::PcmAudio;
-use std::path::Path;
+use std::{collections::VecDeque, path::Path};
+
+/// Keep just enough normalized audio to restore speech before a VAD trigger.
+/// VAD emits a segment only after silence or its 15-second length limit.
+pub(crate) struct SpeechHistory {
+    samples: VecDeque<f32>,
+    first: u64,
+    next: u64,
+    emitted_end: u64,
+}
+impl SpeechHistory {
+    const SAMPLE_RATE: u64 = 16_000;
+    const PRE_ROLL: u64 = Self::SAMPLE_RATE / 4;
+    const CAPACITY: usize = 18 * Self::SAMPLE_RATE as usize;
+    pub fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            first: 0,
+            next: 0,
+            emitted_end: 0,
+        }
+    }
+    pub fn push(&mut self, samples: &[f32]) {
+        self.samples.extend(samples.iter().copied());
+        self.next += samples.len() as u64;
+        let excess = self.samples.len().saturating_sub(Self::CAPACITY);
+        self.samples.drain(..excess);
+        self.first += excess as u64;
+    }
+    /// Return a segment with earlier context, without overlapping previously emitted speech.
+    pub fn segment(&mut self, start: u64, detected: &[f32]) -> (u64, Vec<f32>) {
+        let end = start.saturating_add(detected.len() as u64);
+        let padded_start = start.saturating_sub(Self::PRE_ROLL).max(self.emitted_end);
+        let result = if padded_start >= self.first && end <= self.next && padded_start < end {
+            let from = (padded_start - self.first) as usize;
+            let to = (end - self.first) as usize;
+            (
+                padded_start,
+                self.samples.range(from..to).copied().collect(),
+            )
+        } else {
+            // If a detector ever retains more than the history limit, keep its
+            // original segment instead of losing speech or allocating without bound.
+            let skip = self
+                .emitted_end
+                .saturating_sub(start)
+                .min(detected.len() as u64) as usize;
+            (start + skip as u64, detected[skip..].to_vec())
+        };
+        self.emitted_end = self.emitted_end.max(end);
+        result
+    }
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.first = 0;
+        self.next = 0;
+        self.emitted_end = 0;
+    }
+}
 
 pub struct Normalizer {
     resampler: Option<ff::software::resampling::Context>,
@@ -196,6 +254,33 @@ pub fn decode_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn speech_history_restores_pre_roll_without_repeating_adjacent_sentences() {
+        let mut history = SpeechHistory::new();
+        let audio: Vec<f32> = (0..16_000).map(|v| v as f32).collect();
+        history.push(&audio);
+        let (start, first) = history.segment(4_000, &audio[4_000..8_000]);
+        assert_eq!(start, 0);
+        assert_eq!(first, audio[..8_000]);
+        let (start, second) = history.segment(9_000, &audio[9_000..12_000]);
+        assert_eq!(start, 8_000);
+        assert_eq!(second, audio[8_000..12_000]);
+        history.reset();
+        history.push(&audio);
+        let (start, next_recording) = history.segment(4_000, &audio[4_000..6_000]);
+        assert_eq!(start, 0);
+        assert_eq!(next_recording, audio[..6_000]);
+    }
+    #[test]
+    fn speech_history_is_bounded_and_falls_back_without_losing_detected_audio() {
+        let mut history = SpeechHistory::new();
+        history.push(&vec![0.25; SpeechHistory::CAPACITY + 16000]);
+        assert_eq!(history.samples.len(), SpeechHistory::CAPACITY);
+        let detected = vec![0.75; 100];
+        let (start, samples) = history.segment(1, &detected);
+        assert_eq!(start, 1);
+        assert_eq!(samples, detected);
+    }
     #[test]
     fn streaming_resampler_keeps_tail_across_arbitrary_packets() {
         ff::init().unwrap();

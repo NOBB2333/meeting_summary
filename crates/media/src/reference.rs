@@ -15,6 +15,13 @@ pub fn encode_reference(input: &Path, output: &Path, config: &RecordingConfig) -
         .context("Reference has no video stream")?;
     let index = stream.index();
     let tb = stream.time_base();
+    // Some older decoders leave a frame's duration unset, including the last
+    // frame. Preserve the stream's declared tail when it is available.
+    let source_duration = if stream.duration() > 0 {
+        ff::Rescale::rescale(&stream.duration(), tb, (1, 1_000_000))
+    } else {
+        0
+    };
     let nominal = stream.avg_frame_rate();
     let frame_duration = if nominal.numerator() > 0 && nominal.denominator() > 0 {
         1_000_000i64 * nominal.denominator() as i64 / nominal.numerator() as i64
@@ -69,7 +76,9 @@ pub fn encode_reference(input: &Path, output: &Path, config: &RecordingConfig) -
                 .unwrap_or(end);
             let origin = *first_pts.get_or_insert(timestamp);
             let pts = (timestamp - origin).max(0);
-            let duration = unsafe { (*decoded.as_ptr()).duration };
+            // ffmpeg-next maps this to pkt_duration on older FFmpeg and
+            // duration on newer releases.
+            let duration = decoded.packet().duration;
             end = pts
                 + if duration > 0 {
                     ff::Rescale::rescale(&duration, tb, (1, 1_000_000))
@@ -99,6 +108,7 @@ pub fn encode_reference(input: &Path, output: &Path, config: &RecordingConfig) -
     }
     decoder.send_eof()?;
     consume(&mut decoder)?;
+    end = end.max(source_duration);
     let frames = writer.frames;
     anyhow::ensure!(frames > 0, "No decoded reference frames");
     writer.finish(end)?;

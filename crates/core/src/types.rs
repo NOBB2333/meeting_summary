@@ -64,13 +64,28 @@ pub struct VideoFrame {
     pub data: Arc<Vec<u8>>,
 }
 impl VideoFrame {
+    /// Some libswscale paths can read up to 16 bytes past an image plane.
+    /// Padding lets the encoder use these owned pixels without another frame copy.
+    pub const PADDING: usize = 16;
+
+    pub fn copy_pixels(pixels: &[u8]) -> Arc<Vec<u8>> {
+        let mut data = Vec::with_capacity(pixels.len().saturating_add(Self::PADDING));
+        data.extend_from_slice(pixels);
+        data.resize(data.len() + Self::PADDING, 0);
+        Arc::new(data)
+    }
+
     pub fn validate(&self) -> Result<()> {
+        let row_bytes = (self.width as usize).checked_mul(4);
+        let image_bytes = self.stride.checked_mul(self.height as usize);
         anyhow::ensure!(
-            self.width > 0 && self.height > 0 && self.stride >= self.width as usize * 4,
+            self.width > 0
+                && self.height > 0
+                && row_bytes.is_some_and(|width| self.stride >= width),
             "Invalid BGRA frame geometry"
         );
         anyhow::ensure!(
-            self.data.len() >= self.stride * self.height as usize,
+            image_bytes.is_some_and(|size| self.data.len() >= size),
             "Truncated BGRA frame"
         );
         Ok(())

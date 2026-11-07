@@ -31,10 +31,25 @@ impl TaskClock {
         }
         let value = value.clamp(0., 1.);
         let now = Instant::now();
+        if let Some((previous, _)) = self.progress_latest {
+            if value < previous {
+                // A new phase may restart at zero; don't carry its old speed over.
+                self.progress_base = None;
+            } else if value == previous {
+                // Repeated progress events do not mean the task advanced.
+                return;
+            }
+        }
         if value > 0. && self.progress_base.is_none() {
             self.progress_base = Some((value, now));
         }
         self.progress_latest = Some((value, now));
+    }
+    pub fn stalled(&self) -> bool {
+        self.started.is_some()
+            && self
+                .progress_latest
+                .is_some_and(|(value, updated)| value < 1. && updated.elapsed().as_secs() > 15)
     }
     /// Exclude setup/download time; require measured advancement before showing an estimate.
     pub fn remaining(&self) -> Option<Duration> {
@@ -42,7 +57,7 @@ impl TaskClock {
         let (first, began) = self.progress_base?;
         let (last, updated) = self.progress_latest?;
         let seconds = updated.duration_since(began).as_secs_f64();
-        if last >= 1. || last - first < 0.03 || seconds < 3. || updated.elapsed().as_secs() > 15 {
+        if last >= 1. || last - first < 0.03 || seconds < 3. || self.stalled() {
             return None;
         }
         Some(Duration::from_secs_f64(
@@ -96,5 +111,22 @@ mod tests {
             elapsed: Duration::ZERO,
         };
         assert_eq!(clock.remaining().unwrap().as_secs(), 8);
+    }
+    #[test]
+    fn repeated_values_do_not_hide_a_stall_and_new_phases_reset_the_estimate() {
+        let now = Instant::now();
+        let mut clock = TaskClock {
+            started: Some(now - Duration::from_secs(30)),
+            progress_base: Some((0.1, now - Duration::from_secs(25))),
+            progress_latest: Some((0.6, now - Duration::from_secs(20))),
+            elapsed: Duration::ZERO,
+        };
+        clock.progress(0.6);
+        assert!(clock.stalled());
+        assert!(clock.remaining().is_none());
+        clock.progress(0.2);
+        assert!(!clock.stalled());
+        assert!(clock.remaining().is_none());
+        assert_eq!(clock.progress_base.unwrap().0, 0.2);
     }
 }

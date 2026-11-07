@@ -1,7 +1,5 @@
 use anyhow::Result;
 use opencap_core::*;
-#[cfg(windows)]
-use std::sync::Arc;
 use std::time::Instant;
 #[cfg(windows)]
 use windows::{
@@ -102,13 +100,10 @@ impl Canvas {
                 height: self.height,
                 stride: self.width as usize * 4,
                 pts_us,
-                data: Arc::new(
-                    std::slice::from_raw_parts(
-                        self.bits,
-                        self.width as usize * self.height as usize * 4,
-                    )
-                    .to_vec(),
-                ),
+                data: VideoFrame::copy_pixels(std::slice::from_raw_parts(
+                    self.bits,
+                    self.width as usize * self.height as usize * 4,
+                )),
             }
         }
     }

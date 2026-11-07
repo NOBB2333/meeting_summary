@@ -31,6 +31,57 @@ impl TranscriptionLanguage {
     }
 }
 
+/// Real-time recognition can prioritize low CPU or use a larger model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LiveAsrModel {
+    #[default]
+    Auto,
+    Compact,
+    Standard,
+    Enhanced,
+    Sentence,
+}
+impl LiveAsrModel {
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Compact,
+        Self::Standard,
+        Self::Enhanced,
+        Self::Sentence,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动",
+            Self::Compact => "轻量实时 · 14M",
+            Self::Standard => "标准实时 · 中文",
+            Self::Enhanced => "增强实时 · 中文",
+            Self::Sentence => "逐句 · 使用文件模型",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OfflineAsrModel {
+    #[default]
+    SenseVoice,
+    ParaformerSmall,
+    ParaformerLarge,
+}
+impl OfflineAsrModel {
+    pub const ALL: [Self; 3] = [
+        Self::SenseVoice,
+        Self::ParaformerSmall,
+        Self::ParaformerLarge,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SenseVoice => "SenseVoice · 多语言",
+            Self::ParaformerSmall => "Paraformer · 轻量中英",
+            Self::ParaformerLarge => "Paraformer · 标准中英",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Preset {
     #[default]
@@ -89,6 +140,8 @@ pub struct RecordingConfig {
     pub transcription_hotwords: String,
     pub transcription_language: TranscriptionLanguage,
     pub transcription_context_revision: bool,
+    pub live_asr_model: LiveAsrModel,
+    pub offline_asr_model: OfflineAsrModel,
     pub show_floating_controls: bool,
     pub show_capture_border: bool,
     pub border_mode: BorderMode,
@@ -96,6 +149,8 @@ pub struct RecordingConfig {
     pub exclude_app: bool,
     pub cursor: bool,
     pub adaptive: bool,
+    /// Trade software H.264/H.265 compression efficiency for lower CPU load.
+    pub fast_software_encoding: bool,
     pub max_fps: u32,
     pub quality: u32,
     pub max_bitrate_kbps: u32,
@@ -130,6 +185,8 @@ impl Default for RecordingConfig {
             transcription_hotwords: "录屏,语音转录,会议纪要,实时字幕".into(),
             transcription_language: TranscriptionLanguage::default(),
             transcription_context_revision: false,
+            live_asr_model: LiveAsrModel::Auto,
+            offline_asr_model: OfflineAsrModel::SenseVoice,
             show_floating_controls: false,
             show_capture_border: !cfg!(target_os = "linux"),
             border_mode: BorderMode::OnStart,
@@ -137,6 +194,7 @@ impl Default for RecordingConfig {
             exclude_app: !cfg!(target_os = "linux"),
             cursor: true,
             adaptive: true,
+            fast_software_encoding: false,
             max_fps: 30,
             quality: 30,
             max_bitrate_kbps: 1600,
@@ -150,6 +208,17 @@ impl Default for RecordingConfig {
     }
 }
 impl RecordingConfig {
+    /// Explicit shortcut for older machines. Keep unrelated quality and audio
+    /// choices intact; these changes are visible and can be adjusted again.
+    pub fn reduce_recording_load(&mut self) {
+        self.max_fps = self.max_fps.min(10);
+        self.adaptive = true;
+        self.fast_software_encoding = true;
+        self.show_recording_preview = false;
+        self.realtime_transcription = false;
+        self.preset = Preset::Custom;
+    }
+
     /// Keep old saved configurations with the border switch off working.
     pub fn effective_border_mode(&self) -> BorderMode {
         if self.show_capture_border {
@@ -255,8 +324,39 @@ pub fn config_path() -> PathBuf {
 mod border_tests {
     use super::*;
     #[test]
+    fn low_load_shortcut_preserves_quality_and_audio_and_never_raises_fps() {
+        let mut config = RecordingConfig {
+            max_fps: 30,
+            quality: 20,
+            codec: Codec::Hevc,
+            microphone: true,
+            ..Default::default()
+        };
+        config.reduce_recording_load();
+        assert_eq!(config.max_fps, 10);
+        assert!(config.adaptive);
+        assert!(config.fast_software_encoding);
+        assert!(!config.show_recording_preview);
+        assert!(!config.realtime_transcription);
+        assert_eq!(
+            (config.quality, config.codec, config.microphone),
+            (20, Codec::Hevc, true)
+        );
+        assert_eq!(config.preset, Preset::Custom);
+        let loaded: RecordingConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded.max_fps, 10);
+        assert!(!loaded.realtime_transcription);
+        config.max_fps = 5;
+        config.reduce_recording_load();
+        assert_eq!(config.max_fps, 5);
+    }
+    #[test]
     fn language_defaults_to_chinese_and_explicit_english_or_auto_survive_save() {
         let old: RecordingConfig = serde_json::from_str("{}").unwrap();
+        assert!(!old.fast_software_encoding);
+        assert_eq!(old.live_asr_model, LiveAsrModel::Auto);
+        assert_eq!(old.offline_asr_model, OfflineAsrModel::SenseVoice);
         assert_eq!(old.transcription_language, TranscriptionLanguage::Chinese);
         for language in TranscriptionLanguage::ALL {
             let config = RecordingConfig {
@@ -266,6 +366,21 @@ mod border_tests {
             let loaded: RecordingConfig =
                 serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
             assert_eq!(loaded.transcription_language, language);
+        }
+        for live in LiveAsrModel::ALL {
+            for offline in OfflineAsrModel::ALL {
+                let config = RecordingConfig {
+                    live_asr_model: live,
+                    offline_asr_model: offline,
+                    ..Default::default()
+                };
+                let loaded: RecordingConfig =
+                    serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+                assert_eq!(
+                    (loaded.live_asr_model, loaded.offline_asr_model),
+                    (live, offline)
+                );
+            }
         }
     }
     #[test]

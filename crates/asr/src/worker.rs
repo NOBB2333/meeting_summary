@@ -1,6 +1,6 @@
 use crate::{
     ModelKind, Segment, Transcript,
-    audio::{Normalizer, decode_file},
+    audio::{Normalizer, SpeechHistory, decode_file},
     prepare,
     revision::{MAX_REVISION_SAMPLES, Reviser},
 };
@@ -51,6 +51,7 @@ impl AsrSession {
             false,
             hotwords,
             revision,
+            ModelKind::Offline,
             TranscriptionLanguage::default(),
         )
     }
@@ -77,6 +78,7 @@ impl AsrSession {
             false,
             hotwords,
             plan.context_revision,
+            plan.revision_model,
             language,
         )
     }
@@ -137,6 +139,30 @@ impl AsrSession {
         revision: bool,
         language: TranscriptionLanguage,
     ) -> Result<Self> {
+        Self::file_with_models(
+            root,
+            kind,
+            source,
+            output,
+            realtime,
+            hotwords,
+            revision,
+            ModelKind::Offline,
+            language,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn file_with_models(
+        root: PathBuf,
+        kind: ModelKind,
+        source: PathBuf,
+        output: PathBuf,
+        realtime: bool,
+        hotwords: String,
+        revision: bool,
+        revision_model: ModelKind,
+        language: TranscriptionLanguage,
+    ) -> Result<Self> {
         Self::spawn(
             root,
             kind,
@@ -145,6 +171,7 @@ impl AsrSession {
             realtime,
             hotwords,
             revision,
+            revision_model,
             language,
         )
     }
@@ -157,8 +184,10 @@ impl AsrSession {
         realtime: bool,
         hotwords: String,
         context_revision: bool,
+        revision_model: ModelKind,
         language: TranscriptionLanguage,
     ) -> Result<Self> {
+        anyhow::ensure!(!revision_model.is_streaming(), "整句校正需要文件识别模型");
         let (input, rx) = bounded(1400); // about 30 seconds of mixed recording PCM
         let (tx, events) = unbounded();
         let output = Arc::new(Mutex::new(destination));
@@ -187,39 +216,41 @@ impl AsrSession {
                                 });
                             let _ = tx.send(AsrEvent::Status(message));
                         })?;
-                        if kind == ModelKind::Streaming && context_revision {
+                        if kind.is_streaming() && context_revision {
                             let _ = tx.send(AsrEvent::Status("正在准备上下文校正模型…".into()));
-                            prepare(ModelKind::Offline, &root, |bytes, total| {
+                            prepare(revision_model, &root, |bytes, total| {
                                 let _ = tx.send(AsrEvent::Status(format!(
                                     "下载校正模型 {:.0}%",
                                     bytes as f64 * 100.0 / total.unwrap_or(bytes.max(1)) as f64
                                 )));
                             })?;
                         }
-                        let revision = if kind == ModelKind::Streaming && context_revision {
-                            Some(ModelKind::Offline.path(&root))
+                        let revision = if kind.is_streaming() && context_revision {
+                            Some(revision_model.path(&root))
                         } else {
                             None
                         };
-                        let mut engine = Engine::new(
+                        let (mut engine, notices) = Engine::new(
                             kind,
                             &kind.path(&root),
                             &hotwords,
                             language,
-                            revision.as_deref(),
+                            revision.as_deref().map(|dir| (revision_model, dir)),
                             worker_cancelled.clone(),
                             &tx,
                         )?;
-                        let _ = tx.send(AsrEvent::Status(
-                            if source.is_some() {
-                                "文件识别已就绪 · 正在处理音频"
-                            } else if kind == ModelKind::Offline {
-                                "逐句模式已就绪 · 停顿后出字；流式模型支持边说边显示"
-                            } else {
-                                "流式识别已就绪 · 边说边显示，当前句可修正"
-                            }
-                            .into(),
-                        ));
+                        let status = if source.is_some() {
+                            "文件识别已就绪 · 正在处理音频"
+                        } else if !kind.is_streaming() {
+                            "逐句模式已就绪 · 停顿后出字；流式模型支持边说边显示"
+                        } else {
+                            "流式识别已就绪 · 边说边显示，当前句可修正"
+                        };
+                        let _ = tx.send(AsrEvent::Status(if notices.is_empty() {
+                            format!("{status} · {}", kind.label())
+                        } else {
+                            format!("{status} · {} · {}", kind.label(), notices.join("；"))
+                        }));
                         let mut transcript = Transcript {
                             source: source.clone(),
                             model: kind.directory().into(),
@@ -418,25 +449,64 @@ impl AsrSession {
         self.worker.is_finished()
     }
 }
-pub(crate) fn sense_voice(
+pub(crate) fn offline_recognizer(
+    kind: ModelKind,
     dir: &Path,
     language: TranscriptionLanguage,
 ) -> Result<OfflineRecognizer> {
     let mut config = OfflineRecognizerConfig::default();
-    config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
-        model: Some(dir.join("model.int8.onnx").to_string_lossy().into_owned()),
-        language: Some(language.code().into()),
-        use_itn: true,
-    };
+    let model = Some(dir.join("model.int8.onnx").to_string_lossy().into_owned());
+    match kind {
+        ModelKind::Offline => {
+            config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
+                model,
+                language: Some(language.code().into()),
+                use_itn: true,
+            }
+        }
+        ModelKind::ParaformerSmall | ModelKind::ParaformerLarge => {
+            config.model_config.paraformer = OfflineParaformerModelConfig { model };
+        }
+        _ => anyhow::bail!("{} 不是文件识别模型", kind.label()),
+    }
     config.model_config.tokens = Some(dir.join("tokens.txt").to_string_lossy().into_owned());
     config.model_config.provider = Some("cpu".into());
     config.model_config.num_threads = 1;
-    OfflineRecognizer::create(&config).context("无法加载上下文校正模型")
+    OfflineRecognizer::create(&config).with_context(|| format!("无法加载{}", kind.label()))
 }
 impl Drop for AsrSession {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Relaxed);
         self.input.take();
+    }
+}
+
+fn supported_hotwords<'a>(
+    input: &'a str,
+    vocabulary: &std::collections::HashSet<&str>,
+) -> (Vec<&'a str>, usize) {
+    let words = input
+        .split([',', '，', ';', '；', '\n', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .take(50);
+    let (accepted, rejected): (Vec<_>, Vec<_>) = words.partition(|word| {
+        word.chars()
+            .all(|c| vocabulary.contains(c.to_string().as_str()))
+    });
+    (accepted, rejected.len())
+}
+
+#[cfg(test)]
+mod hotword_tests {
+    use super::supported_hotwords;
+
+    #[test]
+    fn unknown_hotwords_do_not_disable_known_words_or_recognition() {
+        let vocabulary = ["会", "议", "转", "写"].into_iter().collect();
+        let (accepted, skipped) = supported_hotwords("会议,录屏；转写 OpenCap", &vocabulary);
+        assert_eq!(accepted, vec!["会议", "转写"]);
+        assert_eq!(skipped, 2);
     }
 }
 
@@ -456,6 +526,7 @@ enum Engine {
     Offline {
         recognizer: OfflineRecognizer,
         vad: VoiceActivityDetector,
+        history: SpeechHistory,
         origin: Option<u64>,
         id: u64,
         end: u64,
@@ -468,13 +539,14 @@ impl Engine {
         dir: &Path,
         hotwords: &str,
         language: TranscriptionLanguage,
-        revision_dir: Option<&Path>,
+        revision_model: Option<(ModelKind, &Path)>,
         cancelled: Arc<AtomicBool>,
         events: &Sender<AsrEvent>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<String>)> {
         let file = |name: &str| Some(dir.join(name).to_string_lossy().into_owned());
-        match kind {
-            ModelKind::Streaming => {
+        let mut notices = Vec::new();
+        let engine = match kind {
+            ModelKind::Streaming | ModelKind::StreamingStandard | ModelKind::StreamingEnhanced => {
                 let mut config = OnlineRecognizerConfig {
                     decoding_method: Some("modified_beam_search".into()),
                     max_active_paths: 4,
@@ -487,9 +559,9 @@ impl Engine {
                     ..Default::default()
                 };
                 config.model_config.transducer = OnlineTransducerModelConfig {
-                    encoder: file(ModelKind::Streaming.files()[0]),
-                    decoder: file(ModelKind::Streaming.files()[1]),
-                    joiner: file(ModelKind::Streaming.files()[2]),
+                    encoder: file(kind.files()[0]),
+                    decoder: file(kind.files()[1]),
+                    joiner: file(kind.files()[2]),
                 };
                 config.model_config.tokens = file("tokens.txt");
                 config.model_config.provider = Some("cpu".into());
@@ -499,18 +571,10 @@ impl Engine {
                     .lines()
                     .filter_map(|line| line.split_whitespace().next())
                     .collect();
-                let hotwords: Vec<_> = hotwords
-                    .split([',', '，', ';', '；', '\n', ' '])
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .take(50)
-                    .collect();
-                anyhow::ensure!(
-                    hotwords.iter().all(|word| word
-                        .chars()
-                        .all(|c| vocabulary.contains(c.to_string().as_str()))),
-                    "当前中文模型的术语只能包含词表中的中文字符，请修改术语或清空后重试"
-                );
+                let (hotwords, unsupported) = supported_hotwords(hotwords, &vocabulary);
+                if unsupported > 0 {
+                    notices.push(format!("{unsupported} 个热词不在当前模型词表中，已跳过"));
+                }
                 if !hotwords.is_empty() {
                     config.hotwords_buf = Some(hotwords.join("\n").into_bytes());
                     config.hotwords_score = 3.0;
@@ -518,7 +582,7 @@ impl Engine {
                 }
                 let recognizer = OnlineRecognizer::create(&config).context("无法加载流式模型")?;
                 let stream = recognizer.create_stream();
-                Ok(Self::Online {
+                Self::Online {
                     recognizer,
                     stream,
                     origin: None,
@@ -527,25 +591,22 @@ impl Engine {
                     previous: String::new(),
                     end: 0,
                     committed: false,
-                    correction: revision_dir
-                        .map(|dir| {
-                            Reviser::new(dir.to_path_buf(), language, cancelled, events.clone())
+                    correction: revision_model
+                        .map(|(kind, dir)| {
+                            Reviser::new(
+                                kind,
+                                dir.to_path_buf(),
+                                language,
+                                cancelled,
+                                events.clone(),
+                            )
                         })
                         .transpose()?,
-                    utterance_audio: revision_dir.map(|_| Vec::new()),
-                })
+                    utterance_audio: revision_model.map(|_| Vec::new()),
+                }
             }
-            ModelKind::Offline => {
-                let mut config = OfflineRecognizerConfig::default();
-                config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
-                    model: file("model.int8.onnx"),
-                    language: Some(language.code().into()),
-                    use_itn: true,
-                };
-                config.model_config.tokens = file("tokens.txt");
-                config.model_config.provider = Some("cpu".into());
-                config.model_config.num_threads = 1;
-                let recognizer = OfflineRecognizer::create(&config).context("无法加载离线模型")?;
+            ModelKind::Offline | ModelKind::ParaformerSmall | ModelKind::ParaformerLarge => {
+                let recognizer = offline_recognizer(kind, dir, language)?;
                 let config = VadModelConfig {
                     silero_vad: SileroVadModelConfig {
                         model: file("silero_vad.onnx"),
@@ -562,16 +623,18 @@ impl Engine {
                 };
                 let vad = VoiceActivityDetector::create(&config, 30.0)
                     .context("无法加载语音活动检测模型")?;
-                Ok(Self::Offline {
+                Self::Offline {
                     recognizer,
                     vad,
+                    history: SpeechHistory::new(),
                     origin: None,
                     id: 0,
                     end: 0,
                     committed: false,
-                })
+                }
             }
-        }
+        };
+        Ok((engine, notices))
     }
     fn feed(
         &mut self,
@@ -606,10 +669,15 @@ impl Engine {
                 }
             }
             Self::Offline {
-                vad, origin, end, ..
+                vad,
+                history,
+                origin,
+                end,
+                ..
             } => {
                 origin.get_or_insert(pts_ms.max(0) as u64);
                 *end = pts_ms.max(0) as u64 + samples.len() as u64 * 1000 / 16000;
+                history.push(samples);
                 vad.accept_waveform(samples);
             }
         }
@@ -699,18 +767,25 @@ impl Engine {
             Self::Offline {
                 recognizer,
                 vad,
+                history,
                 origin,
                 id,
                 end,
                 committed,
             } => {
                 while let Some(speech) = vad.front() {
+                    let (begin, samples) =
+                        history.segment(speech.start().max(0) as u64, speech.samples());
+                    if samples.is_empty() {
+                        vad.pop();
+                        continue;
+                    }
                     let stream = recognizer.create_stream();
-                    stream.accept_waveform(16000, speech.samples());
+                    stream.accept_waveform(16000, &samples);
                     recognizer.decode(&stream);
                     let result = stream.get_result().context("离线识别没有返回结果")?;
-                    let start = origin.unwrap_or(0) + speech.start().max(0) as u64 * 1000 / 16000;
-                    let stop = (start + speech.samples().len() as u64 * 1000 / 16000).min(*end);
+                    let start = origin.unwrap_or(0) + begin * 1000 / 16000;
+                    let stop = (start + samples.len() as u64 * 1000 / 16000).min(*end);
                     let text = result.text.trim().to_owned();
                     if !text.is_empty() {
                         let segment = Segment {
@@ -753,8 +828,14 @@ impl Engine {
                 *stream = recognizer.create_stream();
                 *origin = None;
             }
-            Self::Offline { vad, origin, .. } => {
+            Self::Offline {
+                vad,
+                history,
+                origin,
+                ..
+            } => {
                 vad.reset();
+                history.reset();
                 *origin = None;
             }
         }
@@ -810,6 +891,7 @@ mod live_integration_tests {
             crate::LiveModelPlan {
                 kind: ModelKind::Streaming,
                 context_revision: true,
+                revision_model: ModelKind::Offline,
             },
         )
         .unwrap();
@@ -928,7 +1010,7 @@ mod live_integration_tests {
                 .unwrap()
                 .as_nanos()
         ));
-        for kind in [ModelKind::Offline, ModelKind::Streaming] {
+        for kind in ModelKind::ALL {
             if !kind.ready(&root) {
                 continue;
             }
@@ -937,7 +1019,12 @@ mod live_integration_tests {
                 String::new(),
                 crate::LiveModelPlan {
                     kind,
-                    context_revision: kind == ModelKind::Streaming,
+                    context_revision: kind.is_streaming(),
+                    revision_model: if ModelKind::ParaformerSmall.ready(&root) {
+                        ModelKind::ParaformerSmall
+                    } else {
+                        ModelKind::Offline
+                    },
                 },
             )
             .unwrap();
@@ -984,6 +1071,8 @@ mod live_integration_tests {
                     AsrEvent::Finished(t) => {
                         assert!(t.complete, "{t:?}");
                         assert!(!t.text().is_empty());
+                        assert_eq!(t.model, kind.directory());
+                        assert!(t.segments.iter().all(|s| s.finalized && !s.correcting));
                         assert!(base.with_extension("transcript.docx").exists());
                         break;
                     }

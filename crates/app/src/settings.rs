@@ -271,6 +271,27 @@ impl Recorder {
                 ),
             )
             .child(label("H.264 兼容性最好；HEVC / AV1 需要播放器支持。"))
+            .child(ui::setting_row(
+                "软件编码速度",
+                "更快模式减少 H.264/H.265 软件编码负担，文件可能变大或画质降低；硬件编码不受影响。",
+                button(
+                    "fast-software-encoding",
+                    if self.config.fast_software_encoding {
+                        "更快"
+                    } else {
+                        "标准"
+                    },
+                    self.config.fast_software_encoding,
+                )
+                .disabled(self.active())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if !this.active() {
+                        this.config.fast_software_encoding = !this.config.fast_software_encoding;
+                        this.save();
+                    }
+                    cx.notify();
+                })),
+            ))
             .child(
                 div()
                     .flex()
@@ -332,9 +353,10 @@ impl Recorder {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if !this.active() {
                                     this.config.max_fps = match this.config.max_fps {
+                                        10 => 15,
                                         15 => 30,
                                         30 => 60,
-                                        _ => 15,
+                                        _ => 10,
                                     };
                                     this.config.preset = Preset::Custom;
                                     this.save();
@@ -382,6 +404,9 @@ impl Recorder {
                         })),
                     ),
             )
+            .child(label(
+                "降低最大 FPS 会减少实际采集次数，适合性能较低的电脑；自适应帧率主要减少编码次数。",
+            ))
     }
     fn storage_settings(&self, cx: &Context<Self>) -> Div {
         ui::card()

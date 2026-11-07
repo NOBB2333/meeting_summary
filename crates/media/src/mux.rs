@@ -293,24 +293,71 @@ pub fn recover_file(input: &Path, output: &Path) -> Result<()> {
     let mut source = ff::format::input(input)?;
     let mut dest = ff::format::output_as(output, "mp4")?;
     let mut time_bases = Vec::new();
+    let mut video_timings = Vec::new();
     for stream in source.streams() {
         let mut target = dest.add_stream(ff::encoder::find(stream.parameters().id()))?;
         target.set_parameters(stream.parameters());
         target.set_time_base(stream.time_base());
         time_bases.push(stream.time_base());
+        video_timings.push(if stream.parameters().medium() == ff::media::Type::Video {
+            Some((stream.start_time(), stream.duration()))
+        } else {
+            None
+        });
     }
     let mut options = ff::Dictionary::new();
     options.set("movflags", "+faststart");
     dest.write_header_with(options)?;
     let mut count = 0;
+    let mut last_video: Vec<Option<ff::Packet>> = (0..time_bases.len()).map(|_| None).collect();
+    let mut first_video_pts = vec![None; time_bases.len()];
+    let mut reordered_video = vec![false; time_bases.len()];
     for (_, mut packet) in source.packets() {
         let index = packet.stream();
         packet.rescale_ts(time_bases[index], dest.stream(index).unwrap().time_base());
         packet.set_position(-1);
-        packet.write_interleaved(&mut dest)?;
+        if video_timings[index].is_some() {
+            if let (Some(pts), Some(dts)) = (packet.pts(), packet.dts())
+                && pts != dts
+            {
+                reordered_video[index] = true;
+            }
+            if first_video_pts[index].is_none() {
+                first_video_pts[index] = packet.pts();
+            }
+            if let Some(previous) = last_video[index].replace(packet) {
+                previous.write_interleaved(&mut dest)?;
+            }
+        } else {
+            packet.write_interleaved(&mut dest)?;
+        }
         count += 1;
     }
     anyhow::ensure!(count > 0, "No recoverable packets");
+    for (index, packet) in last_video.into_iter().enumerate() {
+        if let Some(mut packet) = packet {
+            let (start, duration) = video_timings[index].expect("video timing");
+            let output_tb = dest.stream(index).unwrap().time_base();
+            let start = if start != ff::ffi::AV_NOPTS_VALUE {
+                Some(ff::Rescale::rescale(&start, time_bases[index], output_tb))
+            } else {
+                first_video_pts[index]
+            };
+            if duration > 0
+                && !reordered_video[index]
+                && let (Some(start), Some(pts)) = (start, packet.pts())
+            {
+                let duration = ff::Rescale::rescale(&duration, time_bases[index], output_tb);
+                let tail = start.saturating_add(duration).saturating_sub(pts);
+                // Older FFmpeg can demux the last packet with the nominal frame
+                // duration even when the stream declares a longer static tail.
+                if tail > packet.duration() {
+                    packet.set_duration(tail);
+                }
+            }
+            packet.write_interleaved(&mut dest)?;
+        }
+    }
     dest.write_trailer()?;
     drop(dest);
     // Verify an actual decoded frame, including recordings with no video stream.

@@ -226,7 +226,9 @@ pub fn task_progress(
                 )))
                 .child(label(clock.remaining().map_or_else(
                     || {
-                        if fraction.is_some() {
+                        if fraction.is_some() && clock.stalled() {
+                            "进度暂未更新，无法估计剩余时间".into()
+                        } else if fraction.is_some() {
                             "估计剩余：正在计算".into()
                         } else {
                             "当前阶段无法可靠估计剩余时间".into()

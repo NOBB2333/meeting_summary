@@ -346,8 +346,7 @@ pub fn start_capture(
                         .map_or_else(|| frame(&c, screen, &target, cursor, clock.now_us()), Ok);
                     match result {
                         Ok(frame) => {
-                            if tx.is_full() {
-                                let _ = rx.try_recv();
+                            if tx.is_full() && rx.try_recv().is_ok() {
                                 dropped.fetch_add(1, Ordering::Relaxed);
                             }
                             if tx.try_send(frame).is_err() {
