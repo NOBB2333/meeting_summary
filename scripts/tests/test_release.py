@@ -89,8 +89,8 @@ class ReleaseTests(unittest.TestCase):
         self.patched(patch.object(release, "current_commit", return_value="a" * 40))
         run = {"status": "completed", "event": "push", "path": ".github/workflows/release.yml",
                "head_branch": "v1.2", "head_sha": "a" * 40, "conclusion": "failure"}
-        names = ["Windows / build", "macOS / build (macos-14, arm64)",
-                 "macOS / build (macos-15-intel, x64)", "Linux / build"]
+        names = ["Windows / build", "macOS / build (macos-26, arm64)",
+                 "macOS / build (macos-26-intel, x64)", "Linux / build"]
         jobs = [{"id": index, "name": name, "status": "completed", "conclusion": "success"}
                 for index, name in enumerate(names)]
         jobs.append({"id": 5, "name": "Publish v1.2", "status": "completed", "conclusion": "failure"})
