@@ -12,7 +12,9 @@
 | 文件 / 校正 | Paraformer 轻量中英 | INT8 模型，约 82 MB；支持中文、英文及部分方言。 |
 | 文件 / 校正 | Paraformer 标准中英 | INT8 模型，约 227 MB；支持中文、英文及部分方言。 |
 
-体积是模型文件的近似十进制大小，不等于运行内存或各平台的最终下载量。三个实时模型以中文为主，不保证英文表现。文件识别由 Silero VAD 切句，字幕时间为整句范围；Paraformer 在本应用中不使用语言提示或实时热词，输出标点可能较少。SenseVoice 同样不使用实时热词。实时热词仅用在流式模型中，不属于当前模型词表的词会被跳过并提示，不会导致转录启动失败。
+体积是模型文件的近似十进制大小，不等于运行内存或各平台的最终下载量。三个实时模型以中文为主，不保证英文表现。文件识别由 Silero VAD 切句，字幕时间为整句范围；Paraformer 在本应用中不使用语言提示或实时热词。SenseVoice 同样不使用实时热词。实时热词仅用在流式模型中，不属于当前模型词表的词会被跳过并提示，不会导致转录启动失败。
+
+中英标点由单独的 CT-Transformer INT8 模型恢复，在「设置 → 识别模型」下载一次（模型文件约 75.5 MB），默认开启；实时流式稿最多每两秒处理一次，停顿定稿、文件识别和二遍复核结果各再处理一次。模型仅在本机运行，处理占用 ASR 线程而非录制线程。识别模型已有标点时保留它；标点模型未安装或输出不匹配原词时，只在句末补基本标点。新标点是基于文本的预测，问题、停顿和语气可能判断错误；可关闭自动标点。单次输入超过 200 字符时保留原文并只补句末。自动标点不修改现有历史稿，旧录音可另存重转。
 
 「断句校正」是可选的第二次识别：流式模型先显示文字，停顿后所选文件模型在后台复核该句。它会增加 CPU 和内存占用，结果也不保证一定更好；电脑卡顿时先关闭校正或关闭实时转录，在录制结束后转录文件。队列积压或连续讲话过长时，程序保留流式原文。不要把参数规模或文件大小当成准确率保证。
 
@@ -29,3 +31,4 @@ VAD 按段识别时，为每段补回最多约 250 毫秒起始音频，相邻�
 - [Paraformer 中文模型](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-paraformer/paraformer-models.html)
 - [标准实时权重](https://huggingface.co/k2-fsa/sherpa-onnx-streaming-zipformer-multi-zh-hans-2023-12-12)、[增强实时权重](https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30)
 - [Paraformer 轻量权重](https://huggingface.co/csukuangfj/sherpa-onnx-paraformer-zh-small-2024-03-09)、[Paraformer 标准权重](https://huggingface.co/csukuangfj/sherpa-onnx-paraformer-zh-2024-03-09)
+- [中英标点模型和官方示例](https://k2-fsa.github.io/sherpa/onnx/punctuation/pretrained_models.html)：固定模型 SHA-256 为 `65a3fb9f5ad7bfb96bf69e0dc4481df97f6ee60513c1d94ce981ba6effd524b1`，下载的镜像必须与官方归档提取出的模型完全一致。

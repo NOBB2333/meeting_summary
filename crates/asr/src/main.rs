@@ -14,6 +14,7 @@ enum Command {
         #[arg(value_enum)]
         model: ModelKind,
     },
+    PreparePunctuation,
     Transcribe {
         input: PathBuf,
         #[arg(long)]
@@ -25,6 +26,9 @@ enum Command {
         /// Do not run a second, sentence-level model for streaming recognition.
         #[arg(long)]
         no_revision: bool,
+        /// Do not add automatic punctuation to recognition results.
+        #[arg(long)]
+        no_punctuation: bool,
         /// Offline model used for optional sentence-level correction.
         #[arg(long, value_enum, default_value = "offline")]
         revision_model: ModelKind,
@@ -84,12 +88,22 @@ fn main() -> Result<()> {
                 .display()
             );
         }
+        Command::PreparePunctuation => {
+            println!(
+                "{}",
+                prepare_punctuation(&model_root(), |bytes, total| {
+                    eprintln!("download {bytes}/{}", total.unwrap_or(0));
+                })?
+                .display()
+            );
+        }
         Command::Transcribe {
             input,
             output,
             model,
             realtime,
             no_revision,
+            no_punctuation,
             revision_model,
             hotwords,
             language,
@@ -100,7 +114,7 @@ fn main() -> Result<()> {
                 "auto" => opencap_core::TranscriptionLanguage::Auto,
                 _ => opencap_core::TranscriptionLanguage::Chinese,
             };
-            let session = AsrSession::file_with_models(
+            let session = AsrSession::file_with_options(
                 model_root(),
                 model,
                 input,
@@ -110,6 +124,7 @@ fn main() -> Result<()> {
                 !no_revision,
                 revision_model,
                 language,
+                !no_punctuation,
             )?;
             let mut complete = false;
             while let Ok(event) = session.events.recv() {

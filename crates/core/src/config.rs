@@ -140,6 +140,8 @@ pub struct RecordingConfig {
     pub transcription_hotwords: String,
     pub transcription_language: TranscriptionLanguage,
     pub transcription_context_revision: bool,
+    /// Restore punctuation locally when a sentence or live hypothesis changes.
+    pub transcription_punctuation: bool,
     pub live_asr_model: LiveAsrModel,
     pub offline_asr_model: OfflineAsrModel,
     pub show_floating_controls: bool,
@@ -189,6 +191,7 @@ impl Default for RecordingConfig {
             transcription_hotwords: "录屏,语音转录,会议纪要,实时字幕".into(),
             transcription_language: TranscriptionLanguage::default(),
             transcription_context_revision: false,
+            transcription_punctuation: true,
             live_asr_model: LiveAsrModel::Auto,
             offline_asr_model: OfflineAsrModel::SenseVoice,
             show_floating_controls: false,
@@ -330,6 +333,20 @@ pub fn config_path() -> PathBuf {
 #[cfg(test)]
 mod border_tests {
     use super::*;
+    #[test]
+    fn old_settings_enable_punctuation_and_explicit_disable_survives_reload() {
+        let mut old = serde_json::to_value(RecordingConfig::default()).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("transcription_punctuation");
+        let config: RecordingConfig = serde_json::from_value(old).unwrap();
+        assert!(config.transcription_punctuation);
+        let mut disabled = config;
+        disabled.transcription_punctuation = false;
+        let restored: RecordingConfig =
+            serde_json::from_slice(&serde_json::to_vec(&disabled).unwrap()).unwrap();
+        assert!(!restored.transcription_punctuation);
+    }
     #[test]
     fn low_load_shortcut_preserves_quality_and_audio_and_never_raises_fps() {
         let mut config = RecordingConfig {

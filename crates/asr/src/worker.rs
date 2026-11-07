@@ -2,6 +2,7 @@ use crate::{
     ModelKind, ReviewState, Segment, SentenceReview, Transcript,
     audio::{Normalizer, SpeechHistory, decode_file},
     prepare,
+    punctuation::{PartialPunctuation, Punctuator},
     revision::{MAX_REVISION_SAMPLES, Reviser},
 };
 use anyhow::{Context, Result};
@@ -55,6 +56,7 @@ impl AsrSession {
             revision,
             ModelKind::Offline,
             TranscriptionLanguage::default(),
+            true,
         )
     }
     /// The caller selects only installed models; sentence mode uses the same VAD
@@ -72,6 +74,15 @@ impl AsrSession {
         plan: crate::LiveModelPlan,
         language: TranscriptionLanguage,
     ) -> Result<Self> {
+        Self::live_with_plan_options(root, hotwords, plan, language, true)
+    }
+    pub fn live_with_plan_options(
+        root: PathBuf,
+        hotwords: String,
+        plan: crate::LiveModelPlan,
+        language: TranscriptionLanguage,
+        punctuation: bool,
+    ) -> Result<Self> {
         Self::spawn(
             root,
             plan.kind,
@@ -82,6 +93,7 @@ impl AsrSession {
             plan.context_revision,
             plan.revision_model,
             language,
+            punctuation,
         )
     }
     pub fn file(
@@ -165,6 +177,32 @@ impl AsrSession {
         revision_model: ModelKind,
         language: TranscriptionLanguage,
     ) -> Result<Self> {
+        Self::file_with_options(
+            root,
+            kind,
+            source,
+            output,
+            realtime,
+            hotwords,
+            revision,
+            revision_model,
+            language,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn file_with_options(
+        root: PathBuf,
+        kind: ModelKind,
+        source: PathBuf,
+        output: PathBuf,
+        realtime: bool,
+        hotwords: String,
+        revision: bool,
+        revision_model: ModelKind,
+        language: TranscriptionLanguage,
+        punctuation: bool,
+    ) -> Result<Self> {
         Self::spawn(
             root,
             kind,
@@ -175,6 +213,7 @@ impl AsrSession {
             revision,
             revision_model,
             language,
+            punctuation,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -188,6 +227,7 @@ impl AsrSession {
         context_revision: bool,
         revision_model: ModelKind,
         language: TranscriptionLanguage,
+        punctuation_enabled: bool,
     ) -> Result<Self> {
         anyhow::ensure!(!revision_model.is_streaming(), "整句校正需要文件识别模型");
         let (input, rx) = bounded(1400); // about 30 seconds of mixed recording PCM
@@ -232,7 +272,9 @@ impl AsrSession {
                         } else {
                             None
                         };
-                        let (mut engine, notices) = Engine::new(
+                        let punctuation =
+                            Arc::new(Punctuator::new(&root, punctuation_enabled, language));
+                        let (mut engine, mut notices) = Engine::new(
                             kind,
                             &kind.path(&root),
                             &hotwords,
@@ -240,7 +282,13 @@ impl AsrSession {
                             revision.as_deref().map(|dir| (revision_model, dir)),
                             worker_cancelled.clone(),
                             &tx,
+                            punctuation.clone(),
                         )?;
+                        if punctuation_enabled && !punctuation.has_model() {
+                            notices.push(
+                                "标点模型未安装，仅补句末标点；可在设置下载中英标点模型".into(),
+                            );
+                        }
                         let status = if source.is_some() {
                             "文件识别已就绪 · 正在处理音频"
                         } else if !kind.is_streaming() {
@@ -530,6 +578,8 @@ enum Engine {
         committed: bool,
         correction: Option<Reviser>,
         utterance_audio: Option<Vec<f32>>,
+        punctuation: Arc<Punctuator>,
+        partial_punctuation: PartialPunctuation,
     },
     Offline {
         recognizer: OfflineRecognizer,
@@ -539,9 +589,11 @@ enum Engine {
         id: u64,
         end: u64,
         committed: bool,
+        punctuation: Arc<Punctuator>,
     },
 }
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         kind: ModelKind,
         dir: &Path,
@@ -550,6 +602,7 @@ impl Engine {
         revision_model: Option<(ModelKind, &Path)>,
         cancelled: Arc<AtomicBool>,
         events: &Sender<AsrEvent>,
+        punctuation: Arc<Punctuator>,
     ) -> Result<(Self, Vec<String>)> {
         let file = |name: &str| Some(dir.join(name).to_string_lossy().into_owned());
         let mut notices = Vec::new();
@@ -607,10 +660,13 @@ impl Engine {
                                 language,
                                 cancelled,
                                 events.clone(),
+                                punctuation.clone(),
                             )
                         })
                         .transpose()?,
                     utterance_audio: revision_model.map(|_| Vec::new()),
+                    punctuation,
+                    partial_punctuation: PartialPunctuation::default(),
                 }
             }
             ModelKind::Offline | ModelKind::ParaformerSmall | ModelKind::ParaformerLarge => {
@@ -639,6 +695,7 @@ impl Engine {
                     id: 0,
                     end: 0,
                     committed: false,
+                    punctuation,
                 }
             }
         };
@@ -709,6 +766,8 @@ impl Engine {
                 committed,
                 correction,
                 utterance_audio,
+                punctuation,
+                partial_punctuation,
             } => {
                 while recognizer.is_ready(stream) {
                     recognizer.decode(stream);
@@ -735,12 +794,17 @@ impl Engine {
                         .and_then(|ts| ts.last())
                         .map(|v| base + ((*v).max(0.0) * 1000.0) as u64 + 100)
                         .unwrap_or(*end);
+                    let rendered = if final_now {
+                        punctuation.finish(&text)
+                    } else {
+                        partial_punctuation.render(&text, punctuation)
+                    };
                     let mut segment = Segment {
                         id: *id,
                         revision: *revision,
                         start_ms: start.min(*end),
                         end_ms: last.min(*end).max(start.min(*end)),
-                        text: text.clone(),
+                        text: rendered.clone(),
                         finalized: final_now,
                         correcting: false,
                         review: None,
@@ -749,7 +813,7 @@ impl Engine {
                         let audio = utterance_audio.take();
                         let mut review = SentenceReview {
                             state: ReviewState::Pending,
-                            original_text: text.clone(),
+                            original_text: rendered,
                             model: correction.model().into(),
                             revised_text: None,
                             reason: None,
@@ -798,6 +862,7 @@ impl Engine {
                     *id += 1;
                     *revision = 0;
                     previous.clear();
+                    partial_punctuation.clear();
                     *utterance_audio = correction.as_ref().map(|_| Vec::new());
                 }
             }
@@ -809,6 +874,7 @@ impl Engine {
                 id,
                 end,
                 committed,
+                punctuation,
             } => {
                 while let Some(speech) = vad.front() {
                     let (begin, samples) =
@@ -823,7 +889,7 @@ impl Engine {
                     let result = stream.get_result().context("离线识别没有返回结果")?;
                     let start = origin.unwrap_or(0) + begin * 1000 / 16000;
                     let stop = (start + samples.len() as u64 * 1000 / 16000).min(*end);
-                    let text = result.text.trim().to_owned();
+                    let text = punctuation.finish(result.text.trim());
                     if !text.is_empty() {
                         let segment = Segment {
                             id: *id,
@@ -964,6 +1030,8 @@ mod live_integration_tests {
         let mut first_partial = None;
         let mut revisions = 0;
         let mut past_twenty = false;
+        let expect_punctuation = crate::punctuation_ready(&crate::model_root());
+        let mut partial_has_punctuation = false;
         let mut pending_correction = false;
         let mut visible = Transcript::default();
         // Keep input open throughout speech; finalization happens only afterwards.
@@ -978,6 +1046,8 @@ mod live_integration_tests {
                         first_partial.get_or_insert(began.elapsed());
                         revisions += 1;
                         past_twenty |= s.end_ms > 20_000;
+                        partial_has_punctuation |=
+                            s.text.chars().any(|c| "，。！？,.!?".contains(c));
                     }
                     pending_correction |= s.correcting;
                     visible.apply(s);
@@ -995,6 +1065,12 @@ mod live_integration_tests {
             revisions > 10 && past_twenty,
             "revisions={revisions}, past20={past_twenty}"
         );
+        if expect_punctuation {
+            assert!(
+                partial_has_punctuation,
+                "live text never received punctuation before the sentence ended"
+            );
+        }
         let native = visible.segments[0].text.clone();
         assert!(
             native.contains("预算") && native.contains("万元"),
@@ -1111,6 +1187,16 @@ mod live_integration_tests {
                         assert!(!t.text().is_empty());
                         assert_eq!(t.model, kind.directory());
                         assert!(t.segments.iter().all(|s| s.finalized && !s.correcting));
+                        assert!(
+                            t.segments.iter().all(|s| {
+                                s.text
+                                    .chars()
+                                    .last()
+                                    .is_some_and(|c| "。，！？；：,.!?;:".contains(c))
+                            }),
+                            "{kind:?} omitted sentence punctuation: {:?}",
+                            t.segments
+                        );
                         if kind.is_streaming() {
                             let reviews: Vec<_> = t
                                 .segments

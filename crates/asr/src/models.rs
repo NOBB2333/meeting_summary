@@ -10,10 +10,10 @@ use std::{
 };
 pub const DEFAULT_HOTWORDS: &str = "录屏,语音转录,会议纪要,实时字幕";
 
-struct RemoteFile {
-    name: &'static str,
-    size: u64,
-    sha256: &'static str,
+pub(crate) struct RemoteFile {
+    pub name: &'static str,
+    pub size: u64,
+    pub sha256: &'static str,
 }
 struct RemoteModel {
     repo: &'static str,
@@ -115,7 +115,7 @@ fn remote_model(kind: ModelKind) -> Option<RemoteModel> {
     })
 }
 
-fn copy_verified(
+pub(crate) fn copy_verified(
     reader: &mut impl Read,
     writer: &mut impl Write,
     item: &RemoteFile,
@@ -259,6 +259,7 @@ pub struct ModelAvailability {
     pub streaming_enhanced: bool,
     pub paraformer_small: bool,
     pub paraformer_large: bool,
+    pub punctuation: bool,
 }
 impl ModelAvailability {
     pub fn inspect(root: &Path) -> Self {
@@ -269,6 +270,7 @@ impl ModelAvailability {
             streaming_enhanced: ModelKind::StreamingEnhanced.ready(root),
             paraformer_small: ModelKind::ParaformerSmall.ready(root),
             paraformer_large: ModelKind::ParaformerLarge.ready(root),
+            punctuation: crate::punctuation_ready(root),
         }
     }
     pub fn ready(self, kind: ModelKind) -> bool {
@@ -567,6 +569,7 @@ mod tests {
             streaming_enhanced: false,
             paraformer_small: false,
             paraformer_large: false,
+            punctuation: false,
         };
         assert_eq!(
             available.live_plan_for(LiveAsrModel::Enhanced, OfflineAsrModel::SenseVoice, true),

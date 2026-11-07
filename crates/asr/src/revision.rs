@@ -1,4 +1,5 @@
 //! Optional sentence correction must never hold up the streaming decoder.
+use crate::punctuation::Punctuator;
 use crate::{AsrEvent, ReviewState, Segment, Transcript};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
 use std::{
@@ -26,6 +27,7 @@ pub(crate) struct Reviser {
     pending: BTreeMap<u64, Segment>,
     cancelled: Arc<AtomicBool>,
     model: String,
+    punctuation: Option<Arc<Punctuator>>,
 }
 
 impl Reviser {
@@ -35,6 +37,7 @@ impl Reviser {
         language: opencap_core::TranscriptionLanguage,
         cancelled: Arc<AtomicBool>,
         events: Sender<AsrEvent>,
+        punctuation: Arc<Punctuator>,
     ) -> anyhow::Result<Self> {
         let mut reviser = Self::spawn(cancelled, move || {
             let model = super::worker::offline_recognizer(kind, &dir, language);
@@ -54,6 +57,7 @@ impl Reviser {
             }
         })?;
         reviser.model = kind.label().into();
+        reviser.punctuation = Some(punctuation);
         Ok(reviser)
     }
 
@@ -111,6 +115,7 @@ impl Reviser {
             pending: BTreeMap::new(),
             cancelled,
             model: "文件模型".into(),
+            punctuation: None,
         })
     }
 
@@ -167,11 +172,22 @@ impl Reviser {
 
     fn apply(
         &mut self,
-        segment: Segment,
+        mut segment: Segment,
         transcript: &mut Transcript,
         events: &Sender<AsrEvent>,
     ) -> bool {
         self.pending.remove(&segment.id);
+        if let Some(punctuation) = &self.punctuation {
+            let original = segment.text.clone();
+            segment.text = punctuation.finish(&segment.text);
+            if let Some(review) = segment.review.as_mut() {
+                if review.revised_text.as_deref() == Some(original.as_str()) {
+                    review.revised_text = Some(segment.text.clone());
+                } else if review.original_text == original {
+                    review.original_text = segment.text.clone();
+                }
+            }
+        }
         if transcript.apply(segment.clone()) {
             let _ = events.send(AsrEvent::Segment(segment));
             true
@@ -271,6 +287,31 @@ mod tests {
     }
 
     #[test]
+    fn second_pass_keeps_punctuation_and_review_versions_in_sync() {
+        let mut reviser = Reviser::spawn(Arc::new(AtomicBool::new(false)), || {
+            |_: &[f32]| Some("复核结果".into())
+        })
+        .unwrap();
+        reviser.punctuation = Some(Arc::new(Punctuator::new(
+            std::path::Path::new("/not-installed"),
+            true,
+            opencap_core::TranscriptionLanguage::Chinese,
+        )));
+        let mut transcript = Transcript::default();
+        let segment = review_segment();
+        assert!(reviser.submit(&segment, vec![0.; 16000]));
+        transcript.apply(segment);
+        let (events, _) = unbounded();
+        reviser.finish(&mut transcript, &events);
+        let segment = &transcript.segments[0];
+        assert_eq!(segment.text, "复核结果。");
+        assert_eq!(
+            segment.review.as_ref().unwrap().revised_text.as_deref(),
+            Some("复核结果。")
+        );
+    }
+
+    #[test]
     fn slow_correction_does_not_block_next_sentence_and_backlog_preserves_native_text() {
         let (started, ready) = bounded(1);
         let (release, wait) = bounded(1);
@@ -348,6 +389,7 @@ mod tests {
             pending: [(0, segment.clone())].into(),
             cancelled: Arc::new(AtomicBool::new(false)),
             model: "测试模型".into(),
+            punctuation: None,
         };
         let (events, _) = unbounded();
         reviser.finish(&mut transcript, &events);

@@ -5,6 +5,7 @@ use opencap_asr::{AsrEvent, AsrSession, ModelKind, Transcript, model_root};
 pub(super) enum PrepareEvent {
     Progress(String, Option<f64>),
     Done(ModelKind, anyhow::Result<PathBuf>),
+    PunctuationDone(anyhow::Result<PathBuf>),
 }
 pub(super) fn final_recording_path(path: &std::path::Path) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -97,11 +98,12 @@ impl Recorder {
                 "所选实时模型未安装；请在设置 → 识别模型下载。录制文件会正常保存".into();
             return None;
         };
-        match AsrSession::live_with_plan_language(
+        match AsrSession::live_with_plan_options(
             model_root(),
             self.config.transcription_hotwords.clone(),
             plan,
             self.config.transcription_language,
+            self.config.transcription_punctuation,
         ) {
             Ok(asr) => {
                 let sender = asr.audio_sender();
@@ -141,6 +143,32 @@ impl Recorder {
                 let _ = tx.send(PrepareEvent::Progress(text, fraction));
             });
             let _ = tx.send(PrepareEvent::Done(kind, result));
+        });
+    }
+    pub(super) fn prepare_punctuation_model(&mut self) {
+        if self.transcription_busy() || self.active() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.transcription_clock.start();
+        self.transcription_progress = 0.;
+        self.preparing_model = Some(rx);
+        self.transcription_status = "正在下载中英标点模型…".into();
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            let result = opencap_asr::prepare_punctuation(&model_root(), |bytes, total| {
+                if last.elapsed() >= std::time::Duration::from_millis(300) || total == Some(bytes) {
+                    let fraction = total
+                        .filter(|&n| n > 0 && bytes < n)
+                        .map(|n| bytes as f64 / n as f64);
+                    let message = fraction
+                        .map(|p| format!("下载中英标点模型 {:.0}%", p * 100.))
+                        .unwrap_or_else(|| "正在校验中英标点模型…".into());
+                    let _ = tx.send(PrepareEvent::Progress(message, fraction));
+                    last = std::time::Instant::now();
+                }
+            });
+            let _ = tx.send(PrepareEvent::PunctuationDone(result));
         });
     }
     pub(super) fn choose_transcription_file(&mut self, realtime: bool, cx: &mut Context<Self>) {
@@ -225,7 +253,7 @@ impl Recorder {
         } else {
             offline_model
         };
-        match AsrSession::file_with_models(
+        match AsrSession::file_with_options(
             model_root(),
             kind,
             source,
@@ -235,6 +263,7 @@ impl Recorder {
             self.config.transcription_context_revision,
             offline_model,
             self.config.transcription_language,
+            self.config.transcription_punctuation,
         ) {
             Ok(asr) => {
                 self.transcription_clock.start();
@@ -285,6 +314,16 @@ impl Recorder {
                     self.transcription_progress = if result.is_ok() { 1. } else { 0. };
                     self.transcription_status = match result {
                         Ok(_) => format!("{}已就绪", kind.label()),
+                        Err(e) => format!("下载失败，可重试：{e:#}"),
+                    };
+                }
+                PrepareEvent::PunctuationDone(result) => {
+                    self.asr_models = opencap_asr::ModelAvailability::inspect(&model_root());
+                    self.preparing_model = None;
+                    self.transcription_clock.finish();
+                    self.transcription_progress = if result.is_ok() { 1. } else { 0. };
+                    self.transcription_status = match result {
+                        Ok(_) => "中英标点模型已就绪".into(),
                         Err(e) => format!("下载失败，可重试：{e:#}"),
                     };
                 }
@@ -1134,9 +1173,17 @@ impl Recorder {
             .child(button("download-selected-offline", if self.asr_models.ready(offline_model) { format!("{} · 已安装", offline_model.label()) } else { format!("下载{}", offline_model.label()) }, false)
                 .disabled(busy || self.asr_models.ready(offline_model))
                 .on_click(cx.listener(move |this,_,_,cx| { this.prepare_asr_model(offline_model); cx.notify(); })))
+            .child(div().flex().flex_wrap().gap_2()
+                .child(button("punctuation-toggle", if self.config.transcription_punctuation { "自动标点：开启" } else { "自动标点：关闭" }, self.config.transcription_punctuation)
+                    .disabled(busy)
+                    .on_click(cx.listener(|this,_,_,cx| { this.config.transcription_punctuation = !this.config.transcription_punctuation; this.save(); cx.notify(); })))
+                .child(button("download-punctuation", if self.asr_models.punctuation { "中英标点模型 · 已安装" } else { "下载中英标点模型 · 约 65–76 MB" }, false)
+                    .disabled(busy || self.asr_models.punctuation)
+                    .on_click(cx.listener(|this,_,_,cx| { this.prepare_punctuation_model(); cx.notify(); }))))
+            .child(label("自动标点在本机运行：流式文字定期补标点，停顿和二遍结果再次处理；未安装模型时只补句末标点。模型可能判断错误，可关闭。"))
             .when(self.preparing_model.is_some() || self.transcription_status.starts_with("下载失败") || self.transcription_status.ends_with("已就绪"), |d| d.child(label(self.transcription_status.clone())))
             .child(label(plan.map(|p| p.description()).unwrap_or("所选实时模型尚不可用，请下载或切换模型")))
-            .child(label("断句校正使用所选文件模型，运行时占用更多资源；未安装时实时识别继续，长句或积压时保留流式原文。文件模型不使用实时热词，字幕时间为整句范围；Paraformer 不使用语言提示，标点可能较少。"))
+            .child(label("断句校正使用所选文件模型，运行时占用更多资源；未安装时实时识别继续，长句或积压时保留流式原文。文件模型不使用实时热词，字幕时间为整句范围；Paraformer 不使用语言提示。"))
             .child(label("实时热词只使用当前模型词表支持的词；不支持的词会跳过，不再阻止识别。切换模型在下次任务生效。"))
             .child(button("speech-vocabulary-settings", "配置全局词汇与语言", false).ghost().on_click(cx.listener(|this, _, _, cx| this.open_ai_settings(crate::settings::SettingsPage::Vocabulary, cx))))
             .child(button("stream-file-demo", "按原速试播所选模型", false).ghost().disabled(busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(true,cx))))

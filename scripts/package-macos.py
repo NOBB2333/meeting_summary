@@ -102,6 +102,7 @@ def build_bundle(root, binary, staging, identity):
     (resources / "docs").mkdir()
     for name in ("transcription-selection.md", "asr-models.md", "performance-review.md",
                  "technical-current.md", "asr-improvement-plan.md", "low-power-capture-plan.md",
+                 "realtime-speaker-plan.md",
                  "architecture.md", "build-and-linux.md",
                  "ui-workspace-layout.md", "ui-redesign.md"):
         shutil.copy2(root / "docs" / name, resources / "docs" / name)
