@@ -11,11 +11,11 @@ use std::{
 use windows::{
     Win32::Graphics::{
         Direct3D11::{
-            D3D11_BOX, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, ID3D11DeviceContext,
+            D3D11_BOX, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, ID3D11Device, ID3D11DeviceContext,
             ID3D11Texture2D,
         },
         Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
-        Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6},
+        Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1, IDXGIOutput6},
         Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO},
     },
     core::Interface,
@@ -31,7 +31,8 @@ use windows_capture::{
 };
 
 type CaptureError = Box<dyn std::error::Error + Send + Sync>;
-enum NativeItem {
+#[derive(Clone, Copy)]
+pub(super) enum NativeItem {
     Display(Monitor),
     Window(Window),
 }
@@ -167,12 +168,27 @@ fn ensure_sdr(monitor: Monitor) -> Result<()> {
     }
     anyhow::bail!("Cannot determine capture display color space")
 }
+pub(super) fn record_adapter(metrics: &CaptureMetrics, device: &ID3D11Device) {
+    let details = (|| -> windows::core::Result<_> {
+        let dxgi: IDXGIDevice = device.cast()?;
+        let adapter = unsafe { dxgi.GetAdapter()? };
+        let desc = unsafe { adapter.GetDesc()? };
+        Ok(desc)
+    })();
+    if let Ok(desc) = details {
+        let luid = (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
+            | u64::from(desc.AdapterLuid.LowPart);
+        metrics.set_adapter(desc.VendorId, luid, unsafe { device.GetFeatureLevel().0 }
+            as u32);
+    }
+}
 struct Flags {
     clock: RecordingClock,
     tx: Sender<VideoFrame>,
     evict: Receiver<VideoFrame>,
     errors: Sender<String>,
     dropped: Arc<AtomicU64>,
+    metrics: Arc<CaptureMetrics>,
     crop: Option<Rect>,
     interval: Duration,
 }
@@ -199,6 +215,7 @@ impl Handler {
         frame: &Frame<'_>,
         crop: Option<Rect>,
     ) -> Result<(usize, Arc<Vec<u8>>)> {
+        let started = Instant::now();
         let (width, height) = crop.map_or((frame.width(), frame.height()), |r| (r.width, r.height));
         let format = frame.desc().Format;
         if self.staging.as_ref().is_none_or(|texture| {
@@ -209,6 +226,7 @@ impl Handler {
         }
         let texture = self.staging.as_ref().expect("staging texture").texture();
         let context = frame.device_context();
+        let submitting = Instant::now();
         unsafe {
             if let Some(r) = crop {
                 let region = D3D11_BOX {
@@ -233,8 +251,17 @@ impl Handler {
                 context.CopyResource(texture, frame.as_raw_texture());
             }
         }
+        self.flags
+            .metrics
+            .copy_submit_max_us
+            .fetch_max(submitting.elapsed().as_micros() as u64, Ordering::Relaxed);
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let mapping_started = Instant::now();
         unsafe { context.Map(texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+        self.flags.metrics.map_call_max_us.fetch_max(
+            mapping_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
         let mapping = MappedTexture {
             context,
             texture,
@@ -253,13 +280,16 @@ impl Handler {
         // SAFETY: D3D11 Map exposes RowPitch * height bytes until Unmap;
         // mapping keeps the texture mapped until the owned copy is complete.
         let pixels = unsafe { std::slice::from_raw_parts(mapping.mapped.pData.cast::<u8>(), len) };
-        Ok((stride, VideoFrame::copy_pixels(pixels)))
+        let copied = VideoFrame::copy_pixels(pixels);
+        self.flags.metrics.record_readback(len, started.elapsed());
+        Ok((stride, copied))
     }
 }
 impl GraphicsCaptureApiHandler for Handler {
     type Flags = Flags;
     type Error = CaptureError;
     fn new(ctx: Context<Flags>) -> std::result::Result<Self, Self::Error> {
+        record_adapter(&ctx.flags.metrics, &ctx.device);
         Ok(Self {
             flags: ctx.flags,
             last: None,
@@ -271,9 +301,15 @@ impl GraphicsCaptureApiHandler for Handler {
         frame: &mut Frame,
         _control: InternalCaptureControl,
     ) -> std::result::Result<(), Self::Error> {
-        if self.flags.clock.is_paused()
-            || self.last.is_some_and(|t| t.elapsed() < self.flags.interval)
-        {
+        self.flags.metrics.callbacks.fetch_add(1, Ordering::Relaxed);
+        if self.flags.clock.is_paused() {
+            return Ok(());
+        }
+        if self.last.is_some_and(|t| t.elapsed() < self.flags.interval) {
+            self.flags
+                .metrics
+                .rate_skips
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         self.last = Some(Instant::now());
@@ -326,21 +362,35 @@ impl GraphicsCaptureApiHandler for Handler {
     }
 }
 pub struct WindowsCapture {
-    control: Option<CaptureControl<Handler, CaptureError>>,
+    control: Option<CaptureMode>,
     warnings: Vec<String>,
+    path: &'static str,
+}
+enum CaptureMode {
+    Legacy(CaptureControl<Handler, CaptureError>),
+    Async(super::async_capture::AsyncCapture),
 }
 impl WindowsCapture {
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
     pub fn is_finished(&self) -> bool {
-        self.control.as_ref().is_none_or(|c| c.is_finished())
+        self.control.as_ref().is_none_or(|c| match c {
+            CaptureMode::Legacy(c) => c.is_finished(),
+            CaptureMode::Async(c) => c.is_finished(),
+        })
+    }
+    pub fn capture_path(&self) -> &'static str {
+        self.path
     }
 }
 impl CaptureBackend for WindowsCapture {
     fn stop(&mut self) -> Result<()> {
         if let Some(c) = self.control.take() {
-            c.stop().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            match c {
+                CaptureMode::Legacy(c) => c.stop().map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                CaptureMode::Async(mut c) => c.stop()?,
+            }
         }
         Ok(())
     }
@@ -357,6 +407,7 @@ pub fn start_capture(
     evict: Receiver<VideoFrame>,
     errors: Sender<String>,
     dropped: Arc<AtomicU64>,
+    metrics: Arc<CaptureMetrics>,
 ) -> Result<WindowsCapture> {
     // Windows owns its yellow capture border. Ask the documented borderless API,
     // then use our platform-neutral border policy for the application's overlay.
@@ -399,12 +450,38 @@ pub fn start_capture(
             (NativeItem::Window(w), None)
         }
     };
+    if config.experimental_async_wgc {
+        let args = super::async_capture::AsyncArgs {
+            item,
+            crop,
+            cursor: config.cursor,
+            border,
+            interval: Duration::from_micros(1_000_000 / config.max_fps as u64),
+            clock: clock.clone(),
+            tx: tx.clone(),
+            evict: evict.clone(),
+            errors: errors.clone(),
+            dropped: dropped.clone(),
+            metrics: metrics.clone(),
+        };
+        match super::async_capture::AsyncCapture::start(args) {
+            Ok(control) => {
+                return Ok(WindowsCapture {
+                    control: Some(CaptureMode::Async(control)),
+                    warnings,
+                    path: "WGC D3D11 -> nonblocking staging -> CPU BGRA -> FFmpeg",
+                });
+            }
+            Err(error) => warnings.push(format!("异步画面采集不可用，已切回兼容模式：{error:#}")),
+        }
+    }
     let flags = Flags {
         clock,
         tx,
         evict,
         errors,
         dropped,
+        metrics,
         crop,
         interval: Duration::from_micros(1_000_000 / config.max_fps as u64),
     };
@@ -432,8 +509,9 @@ pub fn start_capture(
     let control =
         Handler::start_free_threaded(settings).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(WindowsCapture {
-        control: Some(control),
+        control: Some(CaptureMode::Legacy(control)),
         warnings,
+        path: super::CAPTURE_PATH,
     })
 }
 

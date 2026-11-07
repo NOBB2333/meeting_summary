@@ -285,6 +285,9 @@ pub struct LinuxCapture {
     warnings: Vec<String>,
 }
 impl LinuxCapture {
+    pub fn capture_path(&self) -> &'static str {
+        super::CAPTURE_PATH
+    }
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -313,6 +316,7 @@ pub fn start_capture(
     rx: Receiver<VideoFrame>,
     errors: Sender<String>,
     dropped: Arc<AtomicU64>,
+    metrics: Arc<CaptureMetrics>,
 ) -> Result<LinuxCapture> {
     anyhow::ensure!(
         std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland"),
@@ -327,7 +331,13 @@ pub fn start_capture(
         .xfixes_query_version(5, 0)
         .ok()
         .and_then(|r| r.reply().ok());
+    let first_started = Instant::now();
+    metrics.callbacks.fetch_add(1, Ordering::Relaxed);
     let first = frame(&c, screen, &config.target, config.cursor, clock.now_us())?;
+    metrics.record_readback(
+        first.stride * first.height as usize,
+        first_started.elapsed(),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let finished = Arc::new(AtomicBool::new(false));
     let (worker_stop, worker_finished) = (stop.clone(), finished.clone());
@@ -341,9 +351,20 @@ pub fn start_capture(
             while !worker_stop.load(Ordering::Acquire) {
                 let began = Instant::now();
                 if !clock.snapshot().1 {
-                    let result = next
-                        .take()
-                        .map_or_else(|| frame(&c, screen, &target, cursor, clock.now_us()), Ok);
+                    let result = if let Some(first) = next.take() {
+                        Ok(first)
+                    } else {
+                        let started = Instant::now();
+                        metrics.callbacks.fetch_add(1, Ordering::Relaxed);
+                        let result = frame(&c, screen, &target, cursor, clock.now_us());
+                        if let Ok(frame) = &result {
+                            metrics.record_readback(
+                                frame.stride * frame.height as usize,
+                                started.elapsed(),
+                            );
+                        }
+                        result
+                    };
                     match result {
                         Ok(frame) => {
                             if tx.is_full() && rx.try_recv().is_ok() {

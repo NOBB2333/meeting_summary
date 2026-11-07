@@ -36,6 +36,29 @@ fn transcription_output(
     opencap_core::create_meeting_base(root, &label).map(|base| opencap_core::meeting_base(&base))
 }
 impl Recorder {
+    pub(super) fn select_sentence_review(
+        &mut self,
+        selection: &super::transcript_view::ReviewSelection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active() || self.transcription_busy() {
+            self.transcription_status = "请在录制和识别结束后切换句子版本".into();
+        } else if self.transcript.correction.is_some() {
+            self.transcription_status = "请先恢复 AI 校正前的逐字稿，再切换句子版本".into();
+        } else if self
+            .transcript
+            .select_sentence_review(selection.id, selection.original)
+        {
+            self.transcript_dirty = true;
+            if self.transcript_output.is_some() {
+                self.retry_transcript_sync();
+            } else {
+                self.transcription_status = "句子版本已切换".into();
+            }
+        }
+        cx.notify();
+    }
+
     pub(super) fn transcription_busy(&self) -> bool {
         self.asr.as_ref().is_some_and(|a| !a.finished())
             || self.preparing_model.is_some()
@@ -58,6 +81,7 @@ impl Recorder {
         self.transcription_clock = task::TaskClock::default();
         self.speaker_clock = task::TaskClock::default();
         self.transcription_progress = 0.;
+        self.asr_processed_ms = None;
         self.reset_minutes();
         if !self.config.realtime_transcription {
             self.transcription_status = "本次未开启实时转录；录制保存后可在会议文件中补转".into();
@@ -282,6 +306,7 @@ impl Recorder {
                     self.transcription_progress = p;
                     self.transcription_clock.progress(p);
                 }
+                AsrEvent::Processed(ms) => self.asr_processed_ms = Some(ms),
                 AsrEvent::Gap(start, end) => {
                     self.transcription_status = format!(
                         "实时识别积压，{}–{} 将从保存文件补转",
@@ -294,6 +319,19 @@ impl Recorder {
                     if !t.cancelled && !t.gaps.is_empty() {
                         self.pending_backfill = t.source.clone().filter(|p| p.exists());
                     }
+                    let deferred = t
+                        .segments
+                        .iter()
+                        .filter(|segment| {
+                            segment.review.as_ref().is_some_and(|review| {
+                                matches!(
+                                    review.state,
+                                    opencap_asr::ReviewState::Deferred
+                                        | opencap_asr::ReviewState::Failed
+                                )
+                            })
+                        })
+                        .count();
                     self.transcription_status = if t.cancelled {
                         "已取消，已确认文本与原媒体保留"
                     } else if t.complete {
@@ -302,6 +340,10 @@ impl Recorder {
                         "转录尚未完整完成，原文件保留，可重新导入"
                     }
                     .into();
+                    if !t.cancelled && deferred > 0 {
+                        self.transcription_status =
+                            format!("转录已保存；{deferred} 段未完成复核，可使用当前模型另存重转");
+                    }
                     if !t.output_warnings.is_empty() {
                         self.transcription_status = format!(
                             "识别已完成；{} 个文件未同步，可关闭外部编辑器后重试",
@@ -615,6 +657,17 @@ impl Recorder {
                             this.save();
                             cx.notify();
                         })),
+                    )
+                    .child(
+                        button("recording-high-quality", "启用实时高质量", false)
+                            .disabled(self.active() || self.transcription_busy())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.config.realtime_transcription = true;
+                                this.config.transcription_context_revision = true;
+                                this.save();
+                                this.transcription_status = "已开启实时转录与断句复核；请确认所选流式模型和文件模型均已安装".into();
+                                cx.notify();
+                            })),
                     ),
             )
             .when(!self.active(), |d| {
@@ -629,7 +682,28 @@ impl Recorder {
                         .unwrap_or("所选语音模型未安装，请前往设置下载"),
                 ))
             })
+            .when(
+                self.config.realtime_transcription
+                    && self.config.transcription_context_revision
+                    && !self.asr_models.live_plan_for(
+                        self.config.live_asr_model,
+                        self.config.offline_asr_model,
+                        true,
+                    ).is_some_and(|plan| plan.context_revision),
+                |d| d.child(label("当前双模型复核未就绪：请安装或选择流式模型及所选文件模型。")),
+            )
             .child(label(self.transcription_status.clone()))
+            .when(self.asr_live && self.active(), |d| {
+                d.when_some(self.asr_processed_ms, |d, processed| {
+                    let recorded_ms = (self.stats.duration_seconds.max(0.) * 1000.) as u64;
+                    let delay = recorded_ms.saturating_sub(processed);
+                    d.child(label(if delay < 2000 {
+                        format!("已处理至 {} · 基本同步", opencap_asr::timestamp(processed, '.'))
+                    } else {
+                        format!("已处理至 {} · 落后录音约 {:.1} 秒", opencap_asr::timestamp(processed, '.'), delay as f64 / 1000.)
+                    }))
+                })
+            })
             .child(
                 div()
                     .h(px(

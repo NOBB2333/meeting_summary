@@ -1,5 +1,5 @@
 //! Optional sentence correction must never hold up the streaming decoder.
-use crate::{AsrEvent, Segment, Transcript};
+use crate::{AsrEvent, ReviewState, Segment, Transcript};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
 use std::{
     collections::BTreeMap,
@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(crate) const MAX_REVISION_SAMPLES: usize = 30 * 16000;
@@ -17,6 +17,7 @@ pub(crate) const MAX_REVISION_SAMPLES: usize = 30 * 16000;
 struct Job {
     segment: Segment,
     audio: Vec<f32>,
+    queued_at: Instant,
 }
 
 pub(crate) struct Reviser {
@@ -24,6 +25,7 @@ pub(crate) struct Reviser {
     results: Receiver<Segment>,
     pending: BTreeMap<u64, Segment>,
     cancelled: Arc<AtomicBool>,
+    model: String,
 }
 
 impl Reviser {
@@ -34,7 +36,7 @@ impl Reviser {
         cancelled: Arc<AtomicBool>,
         events: Sender<AsrEvent>,
     ) -> anyhow::Result<Self> {
-        Self::spawn(cancelled, move || {
+        let mut reviser = Self::spawn(cancelled, move || {
             let model = super::worker::offline_recognizer(kind, &dir, language);
             if let Err(e) = &model {
                 let _ = events.send(AsrEvent::Status(format!(
@@ -50,7 +52,9 @@ impl Reviser {
                     .get_result()
                     .map(|result| result.text.trim().to_owned())
             }
-        })
+        })?;
+        reviser.model = kind.label().into();
+        Ok(reviser)
     }
 
     fn spawn<F, D>(cancelled: Arc<AtomicBool>, create: F) -> anyhow::Result<Self>
@@ -68,9 +72,34 @@ impl Reviser {
             .spawn(move || {
                 let mut decode = create();
                 for mut job in rx {
-                    if !stopped.load(Ordering::Relaxed)
-                        && let Some(text) = decode(&job.audio).filter(|s| !s.is_empty())
-                    {
+                    let started = Instant::now();
+                    let result = if stopped.load(Ordering::Relaxed) {
+                        None
+                    } else {
+                        decode(&job.audio).filter(|s| !s.is_empty())
+                    };
+                    if let Some(review) = job.segment.review.as_mut() {
+                        review.queue_ms =
+                            Some(started.duration_since(job.queued_at).as_millis() as u64);
+                        review.processing_ms = Some(started.elapsed().as_millis() as u64);
+                        review.state = if result.is_some() {
+                            ReviewState::Reviewed
+                        } else {
+                            ReviewState::Failed
+                        };
+                        review.revised_text.clone_from(&result);
+                        if result.is_none() {
+                            review.reason = Some(
+                                if stopped.load(Ordering::Relaxed) {
+                                    "cancelled"
+                                } else {
+                                    "empty_or_unavailable"
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                    if let Some(text) = result {
                         job.segment.text = text;
                     }
                     let _ = tx.send(finalize(job.segment));
@@ -81,7 +110,12 @@ impl Reviser {
             results,
             pending: BTreeMap::new(),
             cancelled,
+            model: "文件模型".into(),
         })
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     pub fn submit(&mut self, segment: &Segment, audio: Vec<f32>) -> bool {
@@ -92,6 +126,7 @@ impl Reviser {
             .try_send(Job {
                 segment: segment.clone(),
                 audio,
+                queued_at: Instant::now(),
             })
             .is_err()
         {
@@ -147,7 +182,18 @@ impl Reviser {
 
     fn fallback(&mut self, transcript: &mut Transcript, events: &Sender<AsrEvent>) -> bool {
         let mut changed = false;
-        for (_, segment) in std::mem::take(&mut self.pending) {
+        for (_, mut segment) in std::mem::take(&mut self.pending) {
+            if let Some(review) = segment.review.as_mut() {
+                review.state = ReviewState::Deferred;
+                review.reason = Some(
+                    if self.cancelled.load(Ordering::Relaxed) {
+                        "cancelled"
+                    } else {
+                        "worker_disconnected"
+                    }
+                    .into(),
+                );
+            }
             changed |= self.apply(finalize(segment), transcript, events);
         }
         changed
@@ -164,6 +210,66 @@ fn finalize(mut segment: Segment) -> Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SentenceReview;
+
+    fn review_segment() -> Segment {
+        Segment {
+            id: 0,
+            revision: 1,
+            start_ms: 0,
+            end_ms: 1000,
+            text: "原始识别".into(),
+            finalized: false,
+            correcting: true,
+            review: Some(SentenceReview {
+                state: ReviewState::Pending,
+                original_text: "原始识别".into(),
+                model: "测试模型".into(),
+                revised_text: None,
+                reason: None,
+                audio_ms: Some(1000),
+                queue_ms: None,
+                processing_ms: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn revision_records_original_result_and_real_processing_times() {
+        let mut reviser = Reviser::spawn(Arc::new(AtomicBool::new(false)), || {
+            |_: &[f32]| Some("复核结果".into())
+        })
+        .unwrap();
+        let mut transcript = Transcript::default();
+        let segment = review_segment();
+        assert!(reviser.submit(&segment, vec![0.; 16000]));
+        transcript.apply(segment);
+        let (events, _) = unbounded();
+        reviser.finish(&mut transcript, &events);
+        let sentence = &transcript.segments[0];
+        let review = sentence.review.as_ref().unwrap();
+        assert_eq!(sentence.text, "复核结果");
+        assert_eq!(review.original_text, "原始识别");
+        assert_eq!(review.revised_text.as_deref(), Some("复核结果"));
+        assert_eq!(review.state, ReviewState::Reviewed);
+        assert!(review.queue_ms.is_some() && review.processing_ms.is_some());
+    }
+
+    #[test]
+    fn empty_revision_is_visible_as_failed_and_keeps_original_text() {
+        let mut reviser =
+            Reviser::spawn(Arc::new(AtomicBool::new(false)), || |_: &[f32]| None).unwrap();
+        let mut transcript = Transcript::default();
+        let segment = review_segment();
+        assert!(reviser.submit(&segment, vec![0.; 16000]));
+        transcript.apply(segment);
+        let (events, _) = unbounded();
+        reviser.finish(&mut transcript, &events);
+        let sentence = &transcript.segments[0];
+        assert_eq!(sentence.text, "原始识别");
+        assert_eq!(sentence.review.as_ref().unwrap().state, ReviewState::Failed);
+    }
+
     #[test]
     fn slow_correction_does_not_block_next_sentence_and_backlog_preserves_native_text() {
         let (started, ready) = bounded(1);
@@ -186,6 +292,7 @@ mod tests {
             text: "公司的陆平".into(),
             finalized: false,
             correcting: true,
+            review: None,
         };
         let first = sentence(0);
         assert!(reviser.submit(&first, vec![0.0; 16000]));
@@ -231,6 +338,7 @@ mod tests {
             text: "这个词不能少最后一个字".into(),
             finalized: false,
             correcting: true,
+            review: None,
         };
         let mut transcript = Transcript::default();
         transcript.apply(segment.clone());
@@ -239,6 +347,7 @@ mod tests {
             results,
             pending: [(0, segment.clone())].into(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            model: "测试模型".into(),
         };
         let (events, _) = unbounded();
         reviser.finish(&mut transcript, &events);
@@ -267,6 +376,7 @@ mod tests {
             text: "已经显示的完整原文".into(),
             finalized: false,
             correcting: true,
+            review: None,
         };
         assert!(reviser.submit(&segment, vec![0.0; 16000]));
         ready.recv_timeout(Duration::from_secs(5)).unwrap();

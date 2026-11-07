@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+mod readback_queue;
 #[cfg(windows)]
 mod windows_impl;
 #[cfg(windows)]

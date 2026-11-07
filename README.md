@@ -42,6 +42,12 @@ Windows / macOS / Linux 本地开源录屏、转录与纪要工具。Rust + GPUI
 
 识别模型缓存在应用配置目录的 `models`，可通过 `OPENCAP_MODEL_DIR` 指定目录；下载后识别在本机离线进行。实时模型可选轻量、标准、增强三个中文 Zipformer 或文件模型逐句模式；文件转录和可选断句校正可选 SenseVoice 多语言、Paraformer 轻量中英、Paraformer 标准中英。默认仍是自动选择轻量实时模型、文件使用 SenseVoice；较大模型通常需要更多内存和 CPU，效果需用自己的录音比较。会议列表可用“用当前模型另存重转”保留原稿，并标明主识别模型。模型大小、语言和限制见 [识别模型说明](docs/asr-models.md)。
 
+录制页可选择“启用实时高质量”，使用已安装的流式模型和所选文件模型进行逐句复核；识别落后、复核失败或积压时保留流式原文并显示状态。录制完成后可在逐字稿中对照和选择流式原文或二遍结果；待补转可通过会议列表另存重转。该模式会增加本机计算，“一键降低占用”会关闭实时转录，若需要同时使用须重新开启实时高质量。当前没有云端语音识别。
+
+Windows 可在“设置 → 录制偏好 → 画面与编码”手动开启默认关闭的“Windows 异步采集（实验）”，尝试减少回读等待；是否改善鼠标卡顿须在目标电脑对照测试。初始化失败会回退原采集，运行中遇到严重错误会保存已完成内容。它仍需复制画面到 CPU，10 FPS 也不保证流畅；实际路径和阶段计数保存在录制报告中。
+
+录制、转写和打包的现有实现与验证边界见 [当前技术方案](docs/technical-current.md)；纯软件 GPU 采集、旧电脑兼容路径及录制中高质量识别的实施顺序见 [低功耗录屏建设方案](docs/low-power-capture-plan.md)；豆包输入法公开资料和识别改造细节见 [语音识别与改造方案](docs/asr-improvement-plan.md)。
+
 独立 CLI（也可在 Windows 开发脚本准备 FFmpeg DLL 后使用）：
 
 ```bash
@@ -86,7 +92,7 @@ FFmpeg 的 DLL 已经放在 `opencap.exe` 旁边，不需要另外安装 FFmpeg�
 
 推荐：Windows 11 x64。此前版本已通过 Windows CI 构建、软件编码与私有运行库检查；本次模型选择、Kit / ASR / AI 交互和实际录制性能仍需在 Windows 实机回归。
 
-**macOS**：直接打开 `release/OpenCap.app`，FFmpeg 动态库已放在应用包内，无需安装虚拟声卡。源码后端支持 macOS 13+，应用包的最低版本同时取决于捆绑库；本机 Homebrew 库要求 macOS 26，当前本机包因此要求 macOS 26+。首次使用在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」允许 OpenCap；录制麦克风还需要独立的麦克风权限。macOS 的默认输出位置是 `~/Movies/OpenCap`。
+**macOS**：打开打包脚本打印的 `OpenCap.app` 路径（通常是 `release/OpenCap.app`；旧版运行时会生成在 `release/builds/`，先退出旧版再打开新包）。FFmpeg 动态库已放在应用包内，无需安装虚拟声卡。源码后端支持 macOS 13+，应用包的最低版本同时取决于捆绑库；本机 Homebrew 库要求 macOS 26，当前本机包因此要求 macOS 26+。首次使用在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」允许 OpenCap；录制麦克风还需要独立的麦克风权限。macOS 的默认输出位置是 `~/Movies/OpenCap`。
 
 **设置已允许但仍无法获取目标**：开发包使用临时签名，重新构建后系统可能仍保留旧签名的授权。先退出应用，在录屏权限列表移除旧 OpenCap，再添加**当前的** `OpenCap.app` 并重新打开。只关掉再打开权限开关可能无法修复旧签名。应用会显示 ScreenCaptureKit 的实际错误，并提供「打开权限设置」「刷新录制目标」。使用固定 Apple Development / Developer ID 签名可避免每次构建改变授权身份，见下面的 macOS 构建说明。
 
@@ -325,9 +331,9 @@ scripts/package.sh
 open release/OpenCap.app
 ```
 
-`package.sh` 默认先编译 release，再递归捆绑 FFmpeg 和其依赖 `.dylib`、重写加载路径并检查签名。`--profile debug` 可构建并打包调试版，`--no-build` 仅打包已有二进制。应用仍在运行时会拒绝覆盖包，须从应用中退出后再打包，避免运行进程与授权签名不一致。
+`package.sh` 默认先编译 release，再递归捆绑 FFmpeg 和其依赖 `.dylib`、重写加载路径并检查签名；也可显式使用 `scripts/package.sh --release`。`--profile debug` 可构建并打包调试版，`--no-build` 仅打包已有二进制（可能落后于源码）。如果 `release/OpenCap.app` 正在运行，脚本会保留它，在 `release/builds/` 的独立目录生成新包，并打印完整路径；否则更新默认路径并保留旧包备份。也可使用 `--output /新目录/OpenCap.app` 指定尚不存在的输出路径。
 
-macOS 的 `scripts/dev.sh` 默认构建 Debug 原生应用包并打开 `release/OpenCap.app`；`scripts/dev.sh run --release` 使用优化版本。两者都可录屏，Debug 更适合调试代码，Release 用于录制和性能测试。给应用包的授权不一定适用于裸 `target/debug/opencap`，因此开发启动也统一走应用包。重复字体和 `block` 依赖未来兼容性警告不代表脚本启动失败。
+macOS 的 `scripts/dev.sh` 默认构建 Debug 原生应用包并打开 `release/OpenCap.app`；`scripts/dev.sh run --release` 使用优化版本。由于该命令需要打开固定路径，如果原包正在运行，它会要求先退出，而不会误打开旧版本。两者都可录屏，Debug 更适合调试代码，Release 用于录制和性能测试。给应用包的授权不一定适用于裸 `target/debug/opencap`，因此开发启动也统一走应用包。重复字体和 `block` 依赖未来兼容性警告不代表脚本启动失败。
 
 默认临时签名供本机评审；二进制或包内容改变后，Debug / Release 都可能需要重新授权。有有效签名证书时使用 `scripts/package.sh --identity "Apple Development: ..."` 或环境变量 `OPENCAP_SIGNING_IDENTITY`，持续使用同一个有效证书身份以保持更新时的代码身份。本机打包不会发布或上传，也没有执行 notarization；公开分发还需准备对应源码和第三方许可证（见 `THIRD_PARTY.md`）。
 
@@ -336,6 +342,8 @@ macOS 的 `scripts/dev.sh` 默认构建 Debug 原生应用包并打开 `release/
 Linux 首先支持 Intel / x86_64 的统信 UOS：X11 显示器、窗口和区域录制，PulseAudio 或 PipeWire-Pulse 的系统声与麦克风，以及仅录音、暂停恢复和文稿功能。Wayland 暂仅支持音频和文稿。X11 不支持排除本应用，暂不提供窗口缩略预览、录制边框或托盘；关闭主窗会退出，快捷键与悬浮控制仍可用；Linux 暂未实现锁屏自动停止，请先停止录制再锁屏。窗口最小化或关闭时结束采集并保存，窗口内容被遮挡时建议改录完整屏幕。
 
 普通提交、分支推送和 PR 不触发云端构建；提交前在本地运行 `scripts/dev.sh test`、`scripts/dev.sh lint -- -D warnings`（Windows 使用 `dev.ps1`）。需要发布时，同步 `Cargo.toml`、`Cargo.lock`、macOS `Info.plist` 的版本，补充 `docs/releases/<标签>.md`，运行 `python3 scripts/release.py check-version --tag v1.2` 检查；为已审查的提交创建版本标签，再用一次 `git push --atomic origin main v1.2` 同时推送提交与标签。后续发布使用新的版本号，不移动旧标签。
+
+如只需要当前分支的三端测试包，可在 Actions → **Build test packages** 手动运行，或执行 `gh workflow run build.yml --ref main`；它复用三端构建和测试并上传 Actions artifacts，不创建或发布 Release。分支测试包不是版本标签发布包，保留 14 天。
 
 只有 `v1.2`、`v1.2.1` 这样的版本标签触发一个 `Release` 工作流，任务名显示版本号；Windows、Mac 双架构和 Linux 在同一轮中构建。全部成功后校验安装包版本、架构和 Linux 运行记录，上传五个带版本号的包、`build-validation.json` 和 `SHA256SUMS`，核对远端校验值后才公开 Release。失败时不会公开不完整的发布，也不需要额外推送来取包。Linux 的手动诊断入口仅复用已有失败构建产物，不触发整套发布构建。
 
@@ -370,6 +378,8 @@ GPL-3.0-or-later。GPUI 使用 Apache-2.0；FFmpeg 构建包含 GPL 组件。发
 ### Windows 周期性卡顿诊断
 
 旧电脑可在录制页点 **一键降低占用**：采集上限不超过 10 FPS，开启自适应，关闭画面预览和实时转录，并启用更快的软件 H.264/H.265 编码。录制画面可能不够流畅，软件编码文件可能变大或画质下降；完成录制后仍可从文件转录。上述设置会保存，可以分别重新打开预览和实时转录，并在「设置 → 录制偏好」调整帧率和软件编码速度。原有配置不会自动改写。
+
+10 FPS 能减少一部分采集后处理和编码工作，但不能保证鼠标或桌面不卡；低帧率的视频本身也会更不流畅。应在目标 Windows 电脑上控制分辨率、画面、编码器等变量，分别测试 30、15 和 10 FPS 以及预览、转录的影响；见 [性能排查和实机对照方案](docs/performance-review.md)。
 
 录制前可分别关闭“实时转录”和“画面预览”对照；只关“断句校正”仍会保留实时文字。新配置默认不启用二次校正，已有设置保留。选择流式模型并开启断句校正时，录制和文件试播先显示流式文字，停顿后在独立队列校正，避免校正挡住后续识别。文件转录模型和流式模型共用模型目录但格式不同：已有文件模型可通过 VAD 逐句实时识别，停顿或最长约 15 秒断句后出字；流式模型不依赖可选校正模型才能启动。
 

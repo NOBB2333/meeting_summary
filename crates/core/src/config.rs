@@ -151,6 +151,10 @@ pub struct RecordingConfig {
     pub adaptive: bool,
     /// Trade software H.264/H.265 compression efficiency for lower CPU load.
     pub fast_software_encoding: bool,
+    /// In automatic codec mode, prefer widely supported H.264 for lower load.
+    pub prefer_h264: bool,
+    /// Opt-in until the nonblocking WGC backend is tested on the target driver.
+    pub experimental_async_wgc: bool,
     pub max_fps: u32,
     pub quality: u32,
     pub max_bitrate_kbps: u32,
@@ -195,6 +199,8 @@ impl Default for RecordingConfig {
             cursor: true,
             adaptive: true,
             fast_software_encoding: false,
+            prefer_h264: false,
+            experimental_async_wgc: false,
             max_fps: 30,
             quality: 30,
             max_bitrate_kbps: 1600,
@@ -214,6 +220,7 @@ impl RecordingConfig {
         self.max_fps = self.max_fps.min(10);
         self.adaptive = true;
         self.fast_software_encoding = true;
+        self.prefer_h264 = true;
         self.show_recording_preview = false;
         self.realtime_transcription = false;
         self.preset = Preset::Custom;
@@ -336,6 +343,7 @@ mod border_tests {
         assert_eq!(config.max_fps, 10);
         assert!(config.adaptive);
         assert!(config.fast_software_encoding);
+        assert!(config.prefer_h264);
         assert!(!config.show_recording_preview);
         assert!(!config.realtime_transcription);
         assert_eq!(
@@ -355,6 +363,8 @@ mod border_tests {
     fn language_defaults_to_chinese_and_explicit_english_or_auto_survive_save() {
         let old: RecordingConfig = serde_json::from_str("{}").unwrap();
         assert!(!old.fast_software_encoding);
+        assert!(!old.prefer_h264);
+        assert!(!old.experimental_async_wgc);
         assert_eq!(old.live_asr_model, LiveAsrModel::Auto);
         assert_eq!(old.offline_asr_model, OfflineAsrModel::SenseVoice);
         assert_eq!(old.transcription_language, TranscriptionLanguage::Chinese);

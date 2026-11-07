@@ -381,7 +381,7 @@ impl Recorder {
                             )
                             .child(label(format!("当前最高 {} FPS", self.config.max_fps))),
                     )
-                    .child(label("适合老电脑：最高 10 FPS、加快软件 H.264/H.265 编码，并关闭画面预览和实时转录。画面流畅度或质量可能降低，文件可能变大；这些设置可分别重新调整。"))
+                    .child(label("适合老电脑：最高 10 FPS、自动编码优先 H.264、加快软件编码，并关闭画面预览和实时转录。画面流畅度或质量可能降低，文件可能变大；这些设置可分别重新调整。"))
             })
             .when(self.config.audio_only, |d| {
                 d.child(label("无需采集或编码画面，适合长时间会议录音。"))

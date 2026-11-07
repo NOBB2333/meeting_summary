@@ -272,6 +272,51 @@ impl Recorder {
             )
             .child(label("H.264 兼容性最好；HEVC / AV1 需要播放器支持。"))
             .child(ui::setting_row(
+                "自动编码优先 H.264",
+                "自动选择时先尝试 H.264；明确选择 HEVC、AV1 或指定编码器时保持原选择。",
+                button(
+                    "prefer-h264",
+                    if self.config.prefer_h264 {
+                        "开启"
+                    } else {
+                        "关闭"
+                    },
+                    self.config.prefer_h264,
+                )
+                .disabled(self.active())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if !this.active() {
+                        this.config.prefer_h264 = !this.config.prefer_h264;
+                        this.save();
+                    }
+                    cx.notify();
+                })),
+            ))
+            .when(cfg!(windows), |d| {
+                d.child(ui::setting_row(
+                    "Windows 异步采集（实验）",
+                    "尝试减少读取显卡画面时的等待；旧驱动兼容性需实测，关闭后使用原采集方式。",
+                    button(
+                        "experimental-async-wgc",
+                        if self.config.experimental_async_wgc {
+                            "开启"
+                        } else {
+                            "关闭"
+                        },
+                        self.config.experimental_async_wgc,
+                    )
+                    .disabled(self.active())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.active() {
+                            this.config.experimental_async_wgc =
+                                !this.config.experimental_async_wgc;
+                            this.save();
+                        }
+                        cx.notify();
+                    })),
+                ))
+            })
+            .child(ui::setting_row(
                 "软件编码速度",
                 "更快模式减少 H.264/H.265 软件编码负担，文件可能变大或画质降低；硬件编码不受影响。",
                 button(

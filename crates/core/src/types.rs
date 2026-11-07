@@ -1,6 +1,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Rect {
@@ -89,6 +96,95 @@ impl VideoFrame {
             "Truncated BGRA frame"
         );
         Ok(())
+    }
+}
+
+/// Cheap, bounded counters. Platform callbacks never perform file IO to log a frame.
+#[derive(Default)]
+pub struct CaptureMetrics {
+    pub callbacks: AtomicU64,
+    pub rate_skips: AtomicU64,
+    pub readbacks: AtomicU64,
+    pub readback_bytes: AtomicU64,
+    pub readback_max_us: AtomicU64,
+    pub copy_submit_max_us: AtomicU64,
+    pub map_call_max_us: AtomicU64,
+    pub map_not_ready: AtomicU64,
+    pub staging_full: AtomicU64,
+    adapter_known: AtomicBool,
+    adapter_luid: AtomicU64,
+    adapter_vendor: AtomicU64,
+    feature_level: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CaptureMetricsSnapshot {
+    pub callbacks: u64,
+    pub rate_skips: u64,
+    pub readbacks: u64,
+    pub readback_bytes: u64,
+    pub readback_max_us: u64,
+    pub copy_submit_max_us: u64,
+    pub map_call_max_us: u64,
+    pub map_not_ready: u64,
+    pub staging_full: u64,
+    pub adapter_luid: Option<String>,
+    pub adapter_vendor_id: Option<u64>,
+    pub d3d_feature_level: Option<u64>,
+}
+
+impl CaptureMetrics {
+    pub fn set_adapter(&self, vendor: u32, luid: u64, feature_level: u32) {
+        self.adapter_vendor
+            .store(u64::from(vendor), Ordering::Relaxed);
+        self.adapter_luid.store(luid, Ordering::Relaxed);
+        self.feature_level
+            .store(u64::from(feature_level), Ordering::Relaxed);
+        self.adapter_known.store(true, Ordering::Release);
+    }
+    pub fn record_readback(&self, bytes: usize, elapsed: Duration) {
+        self.readbacks.fetch_add(1, Ordering::Relaxed);
+        self.readback_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.readback_max_us
+            .fetch_max(elapsed.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Start recording statistics after encoder probing, without clearing the
+    /// device identity discovered during capture startup.
+    pub fn reset_counters(&self) {
+        for counter in [
+            &self.callbacks,
+            &self.rate_skips,
+            &self.readbacks,
+            &self.readback_bytes,
+            &self.readback_max_us,
+            &self.copy_submit_max_us,
+            &self.map_call_max_us,
+            &self.map_not_ready,
+            &self.staging_full,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot(&self) -> CaptureMetricsSnapshot {
+        let get = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        let known = self.adapter_known.load(Ordering::Acquire);
+        CaptureMetricsSnapshot {
+            callbacks: get(&self.callbacks),
+            rate_skips: get(&self.rate_skips),
+            readbacks: get(&self.readbacks),
+            readback_bytes: get(&self.readback_bytes),
+            readback_max_us: get(&self.readback_max_us),
+            copy_submit_max_us: get(&self.copy_submit_max_us),
+            map_call_max_us: get(&self.map_call_max_us),
+            map_not_ready: get(&self.map_not_ready),
+            staging_full: get(&self.staging_full),
+            adapter_luid: known.then(|| format!("{:016x}", get(&self.adapter_luid))),
+            adapter_vendor_id: known.then(|| get(&self.adapter_vendor)),
+            d3d_feature_level: known.then(|| get(&self.feature_level)),
+        }
     }
 }
 #[derive(Clone)]

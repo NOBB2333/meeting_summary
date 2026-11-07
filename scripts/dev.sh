@@ -58,7 +58,7 @@ if [[ "$task" == run && "$(uname -s)" == Darwin ]]; then
   done
   echo "OpenCap: building $run_profile and launching release/OpenCap.app (macOS permissions belong to the app bundle)."
   cargo build -p opencap --locked "${build_arguments[@]}"
-  python3 "$root/scripts/package-macos.py" --profile "$run_profile" --no-build
+  python3 "$root/scripts/package-macos.py" --profile "$run_profile" --no-build --output "$root/release/OpenCap.app"
   exec open "$root/release/OpenCap.app" --args "${app_arguments[@]}"
 fi
 

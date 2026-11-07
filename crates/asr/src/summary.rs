@@ -794,6 +794,7 @@ pub(crate) mod tests {
                     text: "欧盆盖本周不能上线。".repeat(1300),
                     finalized: true,
                     correcting: false,
+                    review: None,
                 })
                 .collect(),
             ..Default::default()
@@ -913,6 +914,7 @@ pub(crate) mod tests {
                 text: "不能上线，预算未定。".into(),
                 finalized: true,
                 correcting: false,
+                review: None,
             }],
             ..Default::default()
         };
@@ -1027,6 +1029,7 @@ pub(crate) mod tests {
                     text: "会议讨论内容".repeat(150),
                     finalized: true,
                     correcting: false,
+                    review: None,
                 })
                 .collect(),
             speaker_turns: vec![crate::SpeakerTurn {
@@ -1166,6 +1169,7 @@ pub(crate) mod tests {
                 text: "预算未定。".into(),
                 finalized: true,
                 correcting: false,
+                review: None,
             }],
             speaker_turns: vec![
                 crate::SpeakerTurn {
@@ -1262,6 +1266,7 @@ pub(crate) mod tests {
                     text: "本周不能上线，预算两万元，负责人未确定。".into(),
                     finalized: true,
                     correcting: false,
+                    review: None,
                 }],
                 ..Default::default()
             };

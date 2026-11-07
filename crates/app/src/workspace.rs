@@ -944,6 +944,7 @@ mod export_tests {
                 text: "客户反馈与下周安排。".into(),
                 finalized: true,
                 correcting: false,
+                review: None,
             }],
             ..Default::default()
         };

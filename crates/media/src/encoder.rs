@@ -10,6 +10,9 @@ pub struct FfmpegVideoEncoder {
     pub options: BTreeMap<String, String>,
     scaler: Option<ff::software::scaling::Context>,
     source_size: (u32, u32),
+    scaled_frame: Option<ff::frame::Video>,
+    canvas_frame: Option<ff::frame::Video>,
+    canvas_layout: Option<(u32, u32)>,
     next_keyframe: i64,
     gop_us: i64,
 }
@@ -141,6 +144,9 @@ impl FfmpegVideoEncoder {
             options,
             scaler: None,
             source_size: (0, 0),
+            scaled_frame: None,
+            canvas_frame: None,
+            canvas_layout: None,
             next_keyframe: 0,
             gop_us: config.gop_seconds as i64 * 1_000_000,
         })
@@ -219,16 +225,20 @@ impl VideoEncoder for FfmpegVideoEncoder {
             self.scaler = Some(scaler);
             self.source_size = (video.width, video.height);
         }
-        let mut scaled = ff::frame::Video::new(self.inner.format(), sw, sh);
-        scale_bgra(self.scaler.as_mut().unwrap(), video, &mut scaled)?;
-        let mut output = if sw == width && sh == height {
+        let (scaled, _) = writable_video_frame(&mut self.scaled_frame, self.inner.format(), sw, sh);
+        scale_bgra(self.scaler.as_mut().unwrap(), video, scaled)?;
+        let output = if sw == width && sh == height {
             scaled
         } else {
-            let mut canvas = ff::frame::Video::new(self.inner.format(), width, height);
-            for plane in 0..canvas.planes() {
-                canvas
-                    .data_mut(plane)
-                    .fill(if plane == 0 { 16 } else { 128 });
+            let (canvas, allocated) =
+                writable_video_frame(&mut self.canvas_frame, self.inner.format(), width, height);
+            if allocated || self.canvas_layout != Some((sw, sh)) {
+                for plane in 0..canvas.planes() {
+                    canvas
+                        .data_mut(plane)
+                        .fill(if plane == 0 { 16 } else { 128 });
+                }
+                self.canvas_layout = Some((sw, sh));
             }
             let x = ((width - sw) / 2) as usize & !1;
             let y = ((height - sh) / 2) as usize & !1;
@@ -249,17 +259,39 @@ impl VideoEncoder for FfmpegVideoEncoder {
             canvas
         };
         output.set_pts(Some(video.pts_us * 90 / 1000));
+        // A reused frame must not inherit the preceding forced keyframe.
+        output.set_kind(ff::picture::Type::None);
         if video.pts_us >= self.next_keyframe {
             output.set_kind(ff::picture::Type::I);
             self.next_keyframe = video.pts_us + self.gop_us;
         }
-        self.inner.send_frame(&output)?;
+        self.inner.send_frame(output)?;
         self.drain()
     }
     fn flush(&mut self) -> Result<Vec<ff::Packet>> {
         self.inner.send_eof()?;
         self.drain()
     }
+}
+
+/// Reuse only buffers no longer held by an asynchronous encoder. Allocating a
+/// fresh frame is cheaper than making a shared frame writable by copying its
+/// previous pixels, which will be overwritten anyway.
+fn writable_video_frame(
+    slot: &mut Option<ff::frame::Video>,
+    format: ff::format::Pixel,
+    width: u32,
+    height: u32,
+) -> (&mut ff::frame::Video, bool) {
+    let reusable = slot.as_mut().is_some_and(|frame| {
+        frame.format() == format && frame.width() == width && frame.height() == height
+            // SAFETY: the owned frame is alive for the duration of this query.
+            && unsafe { ff::ffi::av_frame_is_writable(frame.as_mut_ptr()) != 0 }
+    });
+    if !reusable {
+        *slot = Some(ff::frame::Video::new(format, width, height));
+    }
+    (slot.as_mut().expect("frame allocated"), !reusable)
 }
 
 /// Convert owned capture pixels directly when they include libswscale's
@@ -394,6 +426,32 @@ pub fn probe_encoders() -> Vec<EncoderCapabilities> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reusable_frames_never_overwrite_a_buffer_still_held_by_encoder() {
+        super::super::initialize().unwrap();
+        let mut slot = None;
+        let (frame, allocated) =
+            writable_video_frame(&mut slot, ff::format::Pixel::YUV420P, 64, 36);
+        assert!(allocated);
+        frame.data_mut(0).fill(42);
+        let mut held = ff::frame::Video::empty();
+        // Model the reference an asynchronous encoder retains after send_frame.
+        assert_eq!(
+            unsafe { ff::ffi::av_frame_ref(held.as_mut_ptr(), frame.as_ptr()) },
+            0
+        );
+        let (frame, allocated) =
+            writable_video_frame(&mut slot, ff::format::Pixel::YUV420P, 64, 36);
+        assert!(allocated);
+        frame.data_mut(0).fill(99);
+        assert_eq!(held.data(0)[0], 42);
+        let pointer = frame.data(0).as_ptr();
+        let (frame, allocated) =
+            writable_video_frame(&mut slot, ff::format::Pixel::YUV420P, 64, 36);
+        assert!(!allocated);
+        assert_eq!(frame.data(0).as_ptr(), pointer);
+    }
 
     #[test]
     fn fast_software_mode_changes_the_x264_preset() {

@@ -2,6 +2,35 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Provenance of a sentence-level second ASR pass. The streaming text remains
+/// available even if a later model changes the displayed sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewState {
+    Pending,
+    Reviewed,
+    Restored,
+    Deferred,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentenceReview {
+    pub state: ReviewState,
+    pub original_text: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revised_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
     pub id: u64,
@@ -13,6 +42,8 @@ pub struct Segment {
     /// Endpoint reached; the independent sentence decoder may still replace it.
     #[serde(default)]
     pub correcting: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<SentenceReview>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Transcript {
@@ -48,6 +79,45 @@ pub struct SpeakerTurn {
     pub speaker: u32,
 }
 impl Transcript {
+    /// Explicitly choose a completed sentence's streaming or second-pass
+    /// result. Never let this replace an in-flight or AI-corrected document.
+    pub fn select_sentence_review(&mut self, id: u64, original: bool) -> bool {
+        if self.correction.is_some() {
+            return false;
+        }
+        let Some(segment) = self.segments.iter_mut().find(|segment| segment.id == id) else {
+            return false;
+        };
+        if !segment.finalized {
+            return false;
+        }
+        let Some(review) = segment.review.as_mut() else {
+            return false;
+        };
+        if !matches!(review.state, ReviewState::Reviewed | ReviewState::Restored) {
+            return false;
+        }
+        let chosen = if original {
+            Some(&review.original_text)
+        } else {
+            review.revised_text.as_ref()
+        };
+        let Some(chosen) = chosen else {
+            return false;
+        };
+        if *chosen == segment.text {
+            return false;
+        }
+        segment.text.clone_from(chosen);
+        segment.revision = segment.revision.saturating_add(1);
+        review.state = if original {
+            ReviewState::Restored
+        } else {
+            ReviewState::Reviewed
+        };
+        true
+    }
+
     pub fn speaker_name(&self, id: u32) -> String {
         self.speaker_names
             .get(&id)
@@ -409,6 +479,7 @@ mod tests {
             text: text.into(),
             finalized,
             correcting: false,
+            review: None,
         }
     }
     #[test]
@@ -421,6 +492,33 @@ mod tests {
         assert_eq!(t.text(), "公司下周开会");
         assert!(!t.apply(s(2, "公", false)));
         assert!(!t.apply(s(4, "错误迟到结果", false)));
+    }
+    #[test]
+    fn sentence_review_versions_roundtrip_and_late_updates_cannot_override_selection() {
+        let mut segment = s(4, "公司下周录屏", true);
+        segment.review = Some(SentenceReview {
+            state: ReviewState::Reviewed,
+            original_text: "公司下周陆平".into(),
+            revised_text: Some("公司下周录屏".into()),
+            model: "SenseVoice".into(),
+            reason: None,
+            audio_ms: Some(1400),
+            queue_ms: Some(20),
+            processing_ms: Some(100),
+        });
+        let mut transcript = Transcript::default();
+        assert!(transcript.apply(segment));
+        assert!(transcript.select_sentence_review(1, true));
+        assert_eq!(transcript.text(), "公司下周陆平");
+        assert!(!transcript.apply(s(100, "迟到结果", true)));
+        let saved = serde_json::to_string(&transcript).unwrap();
+        let mut reopened: Transcript = serde_json::from_str(&saved).unwrap();
+        assert!(reopened.select_sentence_review(1, false));
+        assert_eq!(reopened.text(), "公司下周录屏");
+        assert_eq!(
+            reopened.segments[0].review.as_ref().unwrap().state,
+            ReviewState::Reviewed
+        );
     }
     #[test]
     fn unconfirmed_text_cannot_enter_minutes() {

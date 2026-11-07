@@ -5,7 +5,64 @@ use crate::{
 use anyhow::{Context, Result};
 use ffmpeg_next as ff;
 use opencap_core::*;
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::Path,
+    sync::OnceLock,
+};
+
+/// Cache only successful software probes. A hardware encoder's actual device
+/// and driver identity are not yet known here, so caching it would be unsafe.
+#[derive(Clone, PartialEq, Eq)]
+struct SoftwareProbeKey {
+    name: String,
+    width: u32,
+    height: u32,
+    fps: u32,
+    quality: u32,
+    max_bitrate_kbps: u32,
+    gop_seconds: u32,
+    fast: bool,
+    available_threads: usize,
+    options: BTreeMap<String, String>,
+}
+impl SoftwareProbeKey {
+    fn new(name: &str, width: u32, height: u32, config: &RecordingConfig) -> Self {
+        Self {
+            name: name.into(),
+            width,
+            height,
+            fps: config.max_fps,
+            quality: config.quality,
+            max_bitrate_kbps: config.max_bitrate_kbps,
+            gop_seconds: config.gop_seconds,
+            fast: config.fast_software_encoding,
+            available_threads: std::thread::available_parallelism().map_or(2, usize::from),
+            options: config.encoder_options.clone(),
+        }
+    }
+}
+#[derive(Default)]
+struct SoftwareProbeCache(VecDeque<SoftwareProbeKey>);
+impl SoftwareProbeCache {
+    fn contains(&self, key: &SoftwareProbeKey) -> bool {
+        self.0.contains(key)
+    }
+    fn insert(&mut self, key: SoftwareProbeKey) {
+        self.remove(&key);
+        if self.0.len() == 32 {
+            self.0.pop_front();
+        }
+        self.0.push_back(key);
+    }
+    fn remove(&mut self, key: &SoftwareProbeKey) {
+        self.0.retain(|entry| entry != key);
+    }
+}
+fn software_probe_cache() -> &'static parking_lot::Mutex<SoftwareProbeCache> {
+    static CACHE: OnceLock<parking_lot::Mutex<SoftwareProbeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(SoftwareProbeCache::default()))
+}
 
 pub struct MediaWriter {
     output: ff::format::context::Output,
@@ -34,14 +91,32 @@ impl MediaWriter {
             opencap_platform::capture_vendor(&config.target),
         );
         for name in candidates {
-            match probe_one(name, width, height, config)
-                .and_then(|_| FfmpegVideoEncoder::new(name, width, height, config))
-            {
+            let key = name
+                .starts_with("lib")
+                .then(|| SoftwareProbeKey::new(name, width, height, config));
+            let cached = key
+                .as_ref()
+                .is_some_and(|key| software_probe_cache().lock().contains(key));
+            let result = if cached {
+                Ok(())
+            } else {
+                probe_one(name, width, height, config)
+            }
+            .and_then(|_| FfmpegVideoEncoder::new(name, width, height, config));
+            match result {
                 Ok(encoder) => {
+                    if let Some(key) = key {
+                        software_probe_cache().lock().insert(key);
+                    }
                     chosen = Some(encoder);
                     break;
                 }
-                Err(e) => failures.push(format!("{name}: {e:#}")),
+                Err(e) => {
+                    if let Some(key) = key {
+                        software_probe_cache().lock().remove(&key);
+                    }
+                    failures.push(format!("{name}: {e:#}"));
+                }
             }
         }
         let video =
@@ -245,6 +320,13 @@ impl MediaWriter {
     }
     pub fn audio_cursor_us(&self) -> Option<i64> {
         self.audio.as_ref().map(|_| self.mixer.cursor * 1000 / 48)
+    }
+    /// Media time at which the next complete AAC packet can be written.
+    /// Keep the same 150 ms capture/mixing allowance as the recording loop.
+    pub fn next_audio_due_us(&self) -> Option<i64> {
+        self.audio.as_ref().map(|audio| {
+            ((self.mixer.cursor + i64::from(audio.frame_size())) * 1_000 + 47) / 48 + 150_000
+        })
     }
     pub fn flush_io(&mut self) -> Result<()> {
         unsafe {
@@ -481,4 +563,29 @@ pub fn export_audio(input: &Path, output: &Path) -> Result<()> {
     std::fs::hard_link(&temporary, output)?;
     std::fs::remove_file(temporary)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod probe_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cached_probe_requires_matching_encoder_geometry_and_options_and_is_bounded() {
+        let config = RecordingConfig::default();
+        let original = SoftwareProbeKey::new("libx264", 1280, 720, &config);
+        let mut cache = SoftwareProbeCache::default();
+        cache.insert(original.clone());
+        assert!(cache.contains(&original));
+        assert!(!cache.contains(&SoftwareProbeKey::new("libx264", 1920, 1080, &config)));
+        let modified = RecordingConfig {
+            fast_software_encoding: true,
+            ..config.clone()
+        };
+        assert!(!cache.contains(&SoftwareProbeKey::new("libx264", 1280, 720, &modified)));
+        for width in 1..=32 {
+            cache.insert(SoftwareProbeKey::new("libx264", width, 720, &config));
+        }
+        assert_eq!(cache.0.len(), 32);
+        assert!(!cache.contains(&original));
+    }
 }

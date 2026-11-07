@@ -564,19 +564,17 @@ fn audio_only_session_pauses_and_finalizes_without_screen_or_audio_devices() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(session.stats().state, RecordingState::Paused);
-    std::thread::sleep(Duration::from_millis(300));
+    // Cross a metrics interval while paused so the report can reveal a busy
+    // polling loop even when no screen or audio devices are attached.
+    std::thread::sleep(Duration::from_millis(1300));
     session.command(RecordingCommand::Resume);
     let deadline = Instant::now() + Duration::from_secs(2);
     while session.stats().state == RecordingState::Paused && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(session.stats().state, RecordingState::Recording);
-    // Exercise the periodic desktop check as well as initial device-free startup.
-    std::thread::sleep(Duration::from_millis(if cfg!(target_os = "linux") {
-        1200
-    } else {
-        100
-    }));
+    // Exercise a recording metrics interval and the periodic desktop check.
+    std::thread::sleep(Duration::from_millis(1300));
     session.command(RecordingCommand::Stop);
     session.join();
     let stats = session.stats();
@@ -604,7 +602,29 @@ fn audio_only_session_pauses_and_finalizes_without_screen_or_audio_devices() {
     );
     assert_ne!(output.parent().unwrap(), dir.as_path());
     assert_eq!(output.parent().unwrap().parent(), Some(dir.as_path()));
-    assert!(output.with_extension("recording.json").exists());
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.with_extension("recording.json")).unwrap())
+            .unwrap();
+    let paused_sample = report["performance_samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|sample| sample["paused"] == true)
+        .expect("paused interval should be recorded");
+    assert!(
+        paused_sample["loop_iterations"].as_u64().unwrap() < 100,
+        "paused recording should not poll every 5 ms: {paused_sample}"
+    );
+    let active_sample = report["performance_samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|sample| sample["paused"] == false)
+        .expect("active interval should be recorded");
+    assert!(
+        active_sample["loop_iterations"].as_u64().unwrap() < 100,
+        "audio-only recording should wake for AAC deadlines: {active_sample}"
+    );
     assert_eq!(stats.audio_output.as_ref(), Some(&output));
     assert!(!output.with_extension("mp4").exists());
     assert!(!output.with_extension("partial.m4a").exists());

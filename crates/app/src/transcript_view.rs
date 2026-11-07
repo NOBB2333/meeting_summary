@@ -5,7 +5,12 @@ use gpui::component::{
     scroll::Scrollbar,
     text::{SelectionFormat, TextView},
 };
-use opencap_asr::{Segment, Transcript};
+use opencap_asr::{ReviewState, Segment, SentenceReview, Transcript};
+
+pub(super) struct ReviewSelection {
+    pub id: u64,
+    pub original: bool,
+}
 
 #[derive(Clone, PartialEq)]
 struct Row {
@@ -17,6 +22,7 @@ struct Row {
     text: SharedString,
     finalized: bool,
     correcting: bool,
+    review: Option<SentenceReview>,
 }
 impl Row {
     fn matches(&self, segment: &Segment) -> bool {
@@ -26,6 +32,7 @@ impl Row {
             && self.end_ms == segment.end_ms
             && self.finalized == segment.finalized
             && self.correcting == segment.correcting
+            && self.review == segment.review
             && self.text.as_ref() == segment.text
     }
     fn new(segment: &Segment, transcript: &Transcript) -> Self {
@@ -43,18 +50,22 @@ impl Row {
                     format!("{speaker}  ·  ")
                 },
                 opencap_asr::timestamp(segment.start_ms, '.'),
-                if segment.finalized {
-                    "已确认"
-                } else if segment.correcting {
-                    "整句校正中 · 下一句继续识别"
-                } else {
-                    "识别中 · 后续语音可修正"
-                }
+                match segment.review.as_ref().map(|review| review.state) {
+                    Some(ReviewState::Pending) => "整句校正中 · 下一句继续识别",
+                    Some(ReviewState::Reviewed) => "已复核",
+                    Some(ReviewState::Restored) => "已选流式原文",
+                    Some(ReviewState::Deferred) => "待补转 · 已保留流式原文",
+                    Some(ReviewState::Failed) => "复核未完成 · 已保留流式原文",
+                    None if segment.finalized => "已确认",
+                    None if segment.correcting => "整句校正中 · 下一句继续识别",
+                    None => "识别中 · 后续语音可修正",
+                },
             )
             .into(),
             text: segment.text.clone().into(),
             finalized: segment.finalized,
             correcting: segment.correcting,
+            review: segment.review.clone(),
         }
     }
 }
@@ -73,6 +84,7 @@ pub(super) struct TranscriptView {
     #[cfg(feature = "ui-smoke")]
     pub measured_rows: Rc<std::cell::RefCell<std::collections::BTreeSet<usize>>>,
 }
+impl EventEmitter<ReviewSelection> for TranscriptView {}
 impl TranscriptView {
     pub fn new() -> Self {
         Self {
@@ -260,6 +272,7 @@ impl Render for TranscriptView {
         let following = self.state.is_following_tail();
         let query = self.query.clone();
         let copy_rows = rows.clone();
+        let selection_view = cx.entity().downgrade();
         #[cfg(feature = "ui-smoke")]
         let measured = self.measured_rows.clone();
         div()
@@ -364,6 +377,19 @@ impl Render for TranscriptView {
                             #[cfg(feature = "ui-smoke")]
                             measured.borrow_mut().insert(index);
                             let row = &rows[index];
+                            let review_selection = row.review.as_ref().and_then(|review| {
+                                let revised = review.revised_text.as_ref()?;
+                                if !row.finalized || revised == &review.original_text {
+                                    return None;
+                                }
+                                match review.state {
+                                    ReviewState::Reviewed => Some((true, "选择流式原文")),
+                                    ReviewState::Restored => Some((false, "选择复核结果")),
+                                    _ => None,
+                                }
+                            });
+                            let selection_view = selection_view.clone();
+                            let row_id = row.id;
                             div()
                                 .w_full()
                                 .pr_3()
@@ -377,7 +403,25 @@ impl Render for TranscriptView {
                                         .items_center()
                                         .justify_between()
                                         .gap_2()
-                                        .child(label(row.metadata.clone())),
+                                        .child(label(row.metadata.clone()))
+                                        .when_some(review_selection, |d, (original, title)| {
+                                            d.child(
+                                                button(
+                                                    ("review-selection", row_id as usize),
+                                                    title,
+                                                    false,
+                                                )
+                                                .ghost()
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = selection_view.update(cx, |_, cx| {
+                                                        cx.emit(ReviewSelection {
+                                                            id: row_id,
+                                                            original,
+                                                        });
+                                                    });
+                                                }),
+                                            )
+                                        }),
                                 )
                                 .child(
                                     div()
@@ -393,6 +437,22 @@ impl Render for TranscriptView {
                                             .scrollable(false),
                                         ),
                                 )
+                                .when_some(row.review.as_ref(), |d, review| {
+                                    let other = if review.state == ReviewState::Restored {
+                                        review
+                                            .revised_text
+                                            .as_deref()
+                                            .map(|text| ("复核结果", text))
+                                    } else if review.state == ReviewState::Reviewed {
+                                        Some(("流式原文", review.original_text.as_str()))
+                                    } else {
+                                        None
+                                    };
+                                    d.when_some(
+                                        other.filter(|(_, text)| *text != row.text.as_ref()),
+                                        |d, (kind, text)| d.child(label(format!("{kind}：{text}"))),
+                                    )
+                                })
                                 .into_any()
                         })
                         .size_full(),
@@ -462,6 +522,7 @@ mod tests {
                     text: format!("第 {id} 段会议内容"),
                     finalized: true,
                     correcting: false,
+                    review: None,
                 })
                 .collect(),
             ..Default::default()
@@ -492,6 +553,7 @@ mod tests {
             text: "正在说的新内容".into(),
             finalized: false,
             correcting: false,
+            review: None,
         });
         view.update_rows(&transcript, false);
         assert_eq!(view.state.item_count(), 5001);

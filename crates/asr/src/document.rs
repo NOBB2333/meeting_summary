@@ -322,6 +322,7 @@ mod tests {
                 text: original.into(),
                 finalized: true,
                 correcting: false,
+                review: None,
             }],
             speaker_turns: vec![crate::SpeakerTurn {
                 start_ms: 1200,

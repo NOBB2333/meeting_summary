@@ -1,3 +1,4 @@
+mod async_capture;
 mod audio;
 mod capture;
 mod controls;

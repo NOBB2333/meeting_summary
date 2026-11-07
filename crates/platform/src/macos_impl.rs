@@ -146,9 +146,16 @@ pub fn window_region(view: isize) -> Result<CaptureTarget> {
 }
 pub const CAPTURE_PATH: &str = "ScreenCaptureKit -> CPU BGRA -> FFmpeg/VideoToolbox";
 
+type VideoCaptureChannel = (
+    Sender<VideoFrame>,
+    Receiver<VideoFrame>,
+    Arc<AtomicU64>,
+    Arc<CaptureMetrics>,
+);
+
 struct CaptureContext {
     clock: RecordingClock,
-    video: Option<(Sender<VideoFrame>, Receiver<VideoFrame>, Arc<AtomicU64>)>,
+    video: Option<VideoCaptureChannel>,
     audio: Option<Sender<AudioChunk>>,
     error: Sender<String>,
     failed: Arc<AtomicBool>,
@@ -183,9 +190,10 @@ unsafe extern "C" fn capture_callback(
     }
     let pts_us = (state.clock.now_us() - latency.clamp(0, 2_000_000)).max(0);
     if kind == 0 {
-        let Some((tx, rx, dropped)) = &state.video else {
+        let Some((tx, rx, dropped, metrics)) = &state.video else {
             return;
         };
+        metrics.callbacks.fetch_add(1, Ordering::Relaxed);
         if width < 2
             || height < 2
             || stride < width * 4
@@ -193,6 +201,7 @@ unsafe extern "C" fn capture_callback(
         {
             return;
         }
+        let started = Instant::now();
         let frame = VideoFrame {
             width: width as u32,
             height: height as u32,
@@ -202,6 +211,7 @@ unsafe extern "C" fn capture_callback(
                 std::slice::from_raw_parts(data.cast::<u8>(), count)
             }),
         };
+        metrics.record_readback(count, started.elapsed());
         if let Err(crossbeam_channel::TrySendError::Full(frame)) = tx.try_send(frame) {
             let _ = rx.try_recv();
             dropped.fetch_add(1, Ordering::Relaxed);
@@ -278,6 +288,9 @@ pub struct MacCapture {
     warnings: Vec<String>,
 }
 impl MacCapture {
+    pub fn capture_path(&self) -> &'static str {
+        CAPTURE_PATH
+    }
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -298,6 +311,7 @@ pub fn start_capture(
     rx: Receiver<VideoFrame>,
     errors: Sender<String>,
     dropped: Arc<AtomicU64>,
+    metrics: Arc<CaptureMetrics>,
 ) -> Result<MacCapture> {
     let mut options =
         json!({"fps": config.max_fps, "cursor": config.cursor, "exclude_app": config.exclude_app});
@@ -314,7 +328,7 @@ pub fn start_capture(
         options,
         CaptureContext {
             clock,
-            video: Some((tx, rx, dropped)),
+            video: Some((tx, rx, dropped, metrics)),
             audio: None,
             error: errors,
             failed: failed.clone(),

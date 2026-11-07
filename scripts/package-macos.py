@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Bundle native dylibs recursively; never require the recipient's Homebrew."""
 import argparse
+from datetime import datetime
 import os
 import plistlib
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -35,30 +37,53 @@ def minimum_macos(path):
     return max(versions)
 
 
-def package(profile, identity, build=True):
-    root = Path(__file__).resolve().parent.parent
-    destination = root / "release" / "OpenCap.app"
-    executable_prefix = str(destination / "Contents/MacOS/opencap")
-    for line in run("ps", "-axo", "pid=,command=").splitlines():
+def running_pids(destination, process_table=None):
+    """Only match the app binary itself, not a command merely mentioning it."""
+    executable = str(destination / "Contents/MacOS/opencap")
+    if process_table is None:
+        process_table = run("ps", "-axo", "pid=,command=")
+    found = []
+    for line in process_table.splitlines():
         fields = line.strip().split(None, 1)
         if len(fields) != 2:
             continue
-        process_command = fields[1]
-        if (process_command == executable_prefix or
-                process_command.startswith(executable_prefix + " ") or
-                process_command.startswith(executable_prefix + ".bin ")):
-            raise SystemExit("OpenCap is still running. Quit it from the app before packaging; replacing a running app leaves its process and macOS permission signature out of sync.")
-    if build:
-        command = [str(root / "scripts/dev.sh"), "build", "-p", "opencap"]
-        if profile == "release":
-            command.append("--release")
-        subprocess.run(command, cwd=root, check=True)
-    binary = root / "target" / profile / "opencap"
-    if not binary.is_file():
-        raise SystemExit(f"Build first: scripts/dev.sh build {'--release' if profile == 'release' else ''}")
-    staging = root / "release" / ".OpenCap.app.build"
-    if staging.exists():
-        shutil.rmtree(staging)
+        command = fields[1]
+        if any(command == prefix or command.startswith(prefix + " ")
+               for prefix in (executable, executable + ".bin")):
+            found.append(fields[0])
+    return found
+
+
+def reserve_build_path(root, label="build"):
+    builds = root / "release" / "builds"
+    builds.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path(tempfile.mkdtemp(prefix=f"{label}-{stamp}-", dir=builds)) / "OpenCap.app"
+
+
+def select_destination(root, output=None):
+    default = root / "release" / "OpenCap.app"
+    destination = Path(os.path.abspath(os.path.expanduser(output))) if output else default
+    if destination.suffix.lower() != ".app":
+        raise SystemExit("The output path must end in .app")
+    if destination.is_symlink():
+        raise SystemExit(f"Refusing to replace a symlink: {destination}")
+    if destination.exists() and destination != default:
+        raise SystemExit(f"Output already exists; choose a new path: {destination}")
+    pids = running_pids(destination)
+    if pids and output:
+        raise SystemExit(
+            f"OpenCap is running from {destination} (PID {', '.join(pids)}). "
+            "Quit it before replacing this exact app, or run scripts/package.sh "
+            "without --output to create a separate build."
+        )
+    if pids:
+        destination = reserve_build_path(root)
+        print(f"OpenCap is running (PID {', '.join(pids)}); building a separate app at {destination}", flush=True)
+    return destination
+
+
+def build_bundle(root, binary, staging, identity):
     macos = staging / "Contents" / "MacOS"
     frameworks = staging / "Contents" / "Frameworks"
     resources = staging / "Contents" / "Resources"
@@ -75,7 +100,11 @@ def package(profile, identity, build=True):
         shutil.copy2(root / name, resources / name)
     shutil.copytree(root / "LICENSES", resources / "LICENSES")
     (resources / "docs").mkdir()
-    shutil.copy2(root / "docs/transcription-selection.md", resources / "docs/transcription-selection.md")
+    for name in ("transcription-selection.md", "asr-models.md", "performance-review.md",
+                 "technical-current.md", "asr-improvement-plan.md", "low-power-capture-plan.md",
+                 "architecture.md", "build-and-linux.md",
+                 "ui-workspace-layout.md", "ui-redesign.md"):
+        shutil.copy2(root / "docs" / name, resources / "docs" / name)
     copied = {}
     search = rpaths(binary)
 
@@ -133,18 +162,63 @@ def package(profile, identity, build=True):
         run("codesign", "--force", "--sign", identity, str(library))
     run("codesign", "--force", "--sign", identity, str(staging))
     run("codesign", "--verify", "--deep", "--strict", str(staging))
-    if destination.exists():
-        shutil.rmtree(destination)
-    staging.rename(destination)
+    return len(copied), minimum_text
+
+
+def package(profile, identity, build=True, output=None):
+    root = Path(__file__).resolve().parent.parent
+    destination = select_destination(root, output)
+    if build:
+        command = [str(root / "scripts/dev.sh"), "build", "-p", "opencap"]
+        if profile == "release":
+            command.append("--release")
+        subprocess.run(command, cwd=root, check=True)
+    binary = root / "target" / profile / "opencap"
+    if not binary.is_file():
+        raise SystemExit(f"Build first: scripts/dev.sh build {'--release' if profile == 'release' else ''}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".OpenCap-staging-", dir=destination.parent) as temp:
+        staging = Path(temp) / "OpenCap.app"
+        count, minimum_text = build_bundle(root, binary, staging, identity)
+        # A user may have opened the canonical app while the build was running.
+        if running_pids(destination):
+            if output:
+                raise SystemExit(f"OpenCap started while building; existing app is untouched: {destination}")
+            destination = reserve_build_path(root)
+            print(f"OpenCap started while building; using separate app at {destination}", flush=True)
+        default = root / "release" / "OpenCap.app"
+        if destination.is_symlink() or (destination.exists() and destination != default):
+            raise SystemExit(f"Output appeared while building; existing path is untouched: {destination}")
+        previous = None
+        if destination.exists():
+            previous = reserve_build_path(root, "previous")
+            destination.rename(previous)
+        try:
+            staging.rename(destination)
+        except OSError:
+            if previous is not None:
+                previous.rename(destination)
+            raise
+        if previous is not None:
+            print(f"Previous app retained at {previous}")
     signing = "local ad-hoc; reauthorize after rebuilding" if identity == "-" else "certificate signature"
-    print(f"{destination} ({len(copied)} bundled dylibs; macOS {minimum_text}+; {profile}; {signing})")
+    print(f"{destination} ({count} bundled dylibs; macOS {minimum_text}+; {profile}; {signing})")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    profiles = parser.add_mutually_exclusive_group()
+    profiles.add_argument("--profile", choices=("debug", "release"))
+    profiles.add_argument("--release", action="store_const", const="release", dest="profile",
+                          help="Alias for --profile release")
+    parser.set_defaults(profile="release")
+    parser.add_argument("--no-build", action="store_true", help="Package an existing binary without compiling; it may be older than the source")
+    parser.add_argument("--output", help="Write to this new .app path; an existing non-default path is never overwritten")
+    parser.add_argument("--identity", default=os.environ.get("OPENCAP_SIGNING_IDENTITY", "-"),
+                        help="codesign identity; use Apple Development/Developer ID for stable permissions")
+    return parser
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", choices=("debug", "release"), default="release")
-    parser.add_argument("--no-build", action="store_true", help="Package an existing binary without compiling; it may be older than the source")
-    parser.add_argument("--identity", default=os.environ.get("OPENCAP_SIGNING_IDENTITY", "-"),
-                        help="codesign identity; use Apple Development/Developer ID for stable permissions")
-    args = parser.parse_args()
-    package(args.profile, args.identity, not args.no_build)
+    args = build_parser().parse_args()
+    package(args.profile, args.identity, not args.no_build, args.output)

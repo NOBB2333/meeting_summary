@@ -67,6 +67,7 @@ struct Recorder {
     transcription_tab: bool,
     asr: Option<opencap_asr::AsrSession>,
     asr_live: bool,
+    asr_processed_ms: Option<u64>,
     asr_models: opencap_asr::ModelAvailability,
     transcript: opencap_asr::Transcript,
     transcript_output: Option<PathBuf>,
@@ -293,6 +294,7 @@ impl Recorder {
             transcription_tab: !cfg!(feature = "ui-smoke"),
             asr: None,
             asr_live: false,
+            asr_processed_ms: None,
             asr_models: opencap_asr::ModelAvailability::inspect(&opencap_asr::model_root()),
             transcript: opencap_asr::Transcript::default(),
             transcript_output: None,
@@ -309,7 +311,14 @@ impl Recorder {
                 view
             },
             voice_busy: false,
-            transcript_view: cx.new(|_| transcript_view::TranscriptView::new()),
+            transcript_view: {
+                let view = cx.new(|_| transcript_view::TranscriptView::new());
+                cx.subscribe(&view, |this, _, event, cx| {
+                    this.select_sentence_review(event, cx)
+                })
+                .detach();
+                view
+            },
             transcript_dirty: true,
             transcript_new_document: true,
             task_display_second: 0,

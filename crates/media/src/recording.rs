@@ -1,6 +1,6 @@
 use crate::MediaWriter;
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, bounded, unbounded};
 use opencap_core::*;
 use opencap_policy::FramePolicy;
 use parking_lot::Mutex;
@@ -121,6 +121,33 @@ fn unique_output(dir: &Path, audio_only: bool) -> Result<(PathBuf, PathBuf)> {
         .open(&partial)?;
     Ok((output, partial))
 }
+
+/// Wait without consuming: the recording loop drains commands before media.
+/// Senders are kept alive by `run`, so disconnected optional backends do not
+/// continuously wake `Select` (notably audio-only sessions without video).
+fn wait_for_work(
+    commands: &Receiver<RecordingCommand>,
+    video: &Receiver<VideoFrame>,
+    audio: &Receiver<AudioChunk>,
+    errors: &Receiver<String>,
+    warnings: &Receiver<String>,
+    listen_video: bool,
+    timeout: Duration,
+) {
+    let mut select = Select::new();
+    select.recv(commands);
+    if listen_video {
+        select.recv(video);
+    }
+    select.recv(audio);
+    select.recv(errors);
+    select.recv(warnings);
+    let _ = select.ready_timeout(timeout);
+}
+
+fn until_media_deadline(now_us: i64, due_us: Option<i64>) -> Option<Duration> {
+    due_us.map(|due| Duration::from_micros(due.saturating_sub(now_us).max(0) as u64))
+}
 /// Microphone conditioning runs on the capture side so the level meter and the
 /// recorded track always see the same signal.
 struct MicChain {
@@ -170,7 +197,14 @@ fn run(
     let (audio_tx, audio_rx) = bounded(256);
     let (errors_tx, errors_rx) = bounded(8);
     let (warn_tx, warn_rx) = bounded(16);
+    let _channel_keepalive = (
+        video_tx.clone(),
+        audio_tx.clone(),
+        errors_tx.clone(),
+        warn_tx.clone(),
+    );
     let dropped = Arc::new(AtomicU64::new(0));
+    let capture_metrics = Arc::new(CaptureMetrics::default());
     let mut capture = if config.audio_only {
         None
     } else {
@@ -181,8 +215,13 @@ fn run(
             video_rx.clone(),
             errors_tx,
             dropped.clone(),
+            capture_metrics.clone(),
         )?)
     };
+    let capture_path = capture.as_ref().map_or(
+        "native system audio / microphone only; no video capture",
+        |capture| capture.capture_path(),
+    );
     let first = if let Some(capture) = &capture {
         stats
             .lock()
@@ -227,6 +266,7 @@ fn run(
         let _ = policy.accept(latest, &config);
     }
     dropped.store(0, Ordering::Relaxed);
+    capture_metrics.reset_counters();
     {
         let mut s = stats.lock();
         s.state = RecordingState::Recording;
@@ -238,8 +278,8 @@ fn run(
         s.audio_routing = routing.clone();
     }
     let began = Instant::now();
-    let mut last_loop = Instant::now();
     let mut loop_max_ms = 0.0f64;
+    let mut loop_iterations = 0u64;
     let mut encode_max_ms = 0.0f64;
     let mut preview_max_ms = 0.0f64;
     let mut audio_write_max_ms = 0.0f64;
@@ -257,10 +297,18 @@ fn run(
     let mut silent_audio_since = [Instant::now(); 2];
     let mut silent_audio_warned = [false; 2];
     loop {
-        loop_max_ms = loop_max_ms.max(last_loop.elapsed().as_secs_f64() * 1000.);
-        last_loop = Instant::now();
+        let loop_started = Instant::now();
+        loop_iterations += 1;
         let mut stop = false;
-        for cmd in commands.try_iter() {
+        loop {
+            let cmd = match commands.try_recv() {
+                Ok(cmd) => cmd,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    stop = true;
+                    break;
+                }
+            };
             match cmd {
                 RecordingCommand::Pause => {
                     clock.pause();
@@ -389,6 +437,7 @@ fn run(
             writer.audio_until((now - 150_000).max(0), false)?;
             audio_write_max_ms = audio_write_max_ms.max(measured.elapsed().as_secs_f64() * 1000.);
         }
+        loop_max_ms = loop_max_ms.max(loop_started.elapsed().as_secs_f64() * 1000.);
         if tick.elapsed() >= Duration::from_secs(1) {
             writer.flush_io()?;
             // PulseAudio-only Linux sessions do not require an X11/Wayland
@@ -426,11 +475,14 @@ fn run(
                 "cpu_percent": cpu, "peak_memory_bytes": memory, "fps": s.fps,
                 "capture_fps": capture_fps, "captured_frames": captured,
                 "dropped_frames": s.dropped_frames, "video_queue": video_rx.len(), "audio_queue": audio_rx.len(),
+                "capture_metrics": capture_metrics.snapshot(),
                 "asr_pending_packets": writer.asr_pending_packets(), "loop_max_ms": loop_max_ms,
+                "loop_iterations": loop_iterations,
                 "encode_max_ms": encode_max_ms, "preview_max_ms": preview_max_ms,
                 "audio_write_max_ms": audio_write_max_ms, "paused": clock.is_paused()
             }));
             loop_max_ms = 0.;
+            loop_iterations = 0;
             encode_max_ms = 0.;
             preview_max_ms = 0.;
             audio_write_max_ms = 0.;
@@ -473,7 +525,28 @@ fn run(
             last_bytes = bytes;
             tick = Instant::now();
         }
-        thread::sleep(Duration::from_millis(5));
+        let paused = clock.is_paused();
+        let now_us = (clock.now_us() - video_epoch).max(0);
+        let mut timeout = Duration::from_secs(1).saturating_sub(tick.elapsed());
+        if !paused {
+            if latest.is_some()
+                && let Some(next) = until_media_deadline(now_us, policy.next_due_us(&config))
+            {
+                timeout = timeout.min(next);
+            }
+            if let Some(next) = until_media_deadline(now_us, writer.next_audio_due_us()) {
+                timeout = timeout.min(next);
+            }
+        }
+        wait_for_work(
+            &commands,
+            &video_rx,
+            &audio_rx,
+            &errors_rx,
+            &warn_rx,
+            !paused && !config.audio_only,
+            timeout,
+        );
     }
     stats.lock().state = RecordingState::Stopping;
     clock.pause();
@@ -485,6 +558,18 @@ fn run(
             .lock()
             .warnings
             .push(format!("采集结束时发生错误：{error}"));
+    }
+    // An asynchronous backend may publish its final completed capture while
+    // stopping. Keep it only when its media timestamp can follow the last frame.
+    let mut tail = None;
+    for mut frame in video_rx.try_iter() {
+        frame.pts_us = (frame.pts_us - video_epoch).clamp(0, stop_us.saturating_sub(1));
+        if frame.pts_us * 90 / 1000 > writer.last_video_us * 90 / 1000 {
+            tail = Some(frame);
+        }
+    }
+    if let Some(frame) = tail {
+        writer.video(&frame)?;
     }
     if let Err(error) = audio.stop() {
         stats
@@ -549,7 +634,7 @@ fn run(
     };
     let report = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "config": config, "stats": snapshot, "encoder_options": encoder_options, "encoder_details": encoder_details, "output_media":crate::inspect_output(&output)?,
         "pixel_format": if config.audio_only { None } else { Some("8-bit 4:2:0 BT.709 SDR") }, "time_base": if config.audio_only { "1/48000" } else { "1/90000" }, "rate_control": if config.audio_only { "AAC bitrate" } else if snapshot.encoder.ends_with("_qsv") { "ICQ (no hard VBV cap)" } else { "quality with encoder-specific rate control" },
-        "audio_changes": audio_changes, "performance_samples": performance_samples, "performance_sample_note": "last 1800 one-second samples; timings are recording-worker maxima, not UI/cursor latency; ASR queue is 1024-sample 48kHz packets", "gpu_usage": "unavailable", "capture_path": if config.audio_only { "native system audio / microphone only; no video capture" } else { opencap_platform::CAPTURE_PATH }, "av_offset_definition": "audio stream end minus video stream end; does not measure perceptual synchronization" });
+        "audio_changes": audio_changes, "capture_metrics": capture_metrics.snapshot(), "performance_samples": performance_samples, "performance_sample_note": "last 1800 one-second samples; capture counters and maxima are cumulative; copy_submit is CPU submission time, not GPU completion; loop_max_ms excludes waits; timings do not measure UI/cursor latency", "gpu_usage": "unavailable", "capture_path": capture_path, "av_offset_definition": "audio stream end minus video stream end; does not measure perceptual synchronization" });
     std::fs::write(
         output.with_extension("recording.json"),
         serde_json::to_vec_pretty(&report)?,
@@ -563,4 +648,71 @@ fn container_av_offset(path: &Path) -> Result<f64> {
         Ok((s.start_time() + s.duration()) as f64 * f64::from(s.time_base()) * 1000.0)
     };
     Ok(end(ffmpeg_next::media::Type::Audio)? - end(ffmpeg_next::media::Type::Video)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_wait_wakes_for_control_without_consuming_it() {
+        let (commands_tx, commands) = unbounded();
+        let (_video_tx, video) = bounded(2);
+        let (_audio_tx, audio) = bounded(2);
+        let (_errors_tx, errors) = bounded(2);
+        let (_warnings_tx, warnings) = bounded(2);
+        commands_tx.send(RecordingCommand::Stop).unwrap();
+        let start = Instant::now();
+        wait_for_work(
+            &commands,
+            &video,
+            &audio,
+            &errors,
+            &warnings,
+            true,
+            Duration::from_secs(1),
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(matches!(commands.try_recv(), Ok(RecordingCommand::Stop)));
+    }
+
+    #[test]
+    fn paused_work_wait_ignores_a_queued_video_frame() {
+        let (_commands_tx, commands) = unbounded();
+        let (video_tx, video) = bounded(2);
+        let (_audio_tx, audio) = bounded(2);
+        let (_errors_tx, errors) = bounded(2);
+        let (_warnings_tx, warnings) = bounded(2);
+        video_tx
+            .send(VideoFrame {
+                width: 2,
+                height: 2,
+                stride: 8,
+                pts_us: 0,
+                data: Arc::new(vec![0; 16]),
+            })
+            .unwrap();
+        let start = Instant::now();
+        wait_for_work(
+            &commands,
+            &video,
+            &audio,
+            &errors,
+            &warnings,
+            false,
+            Duration::from_millis(30),
+        );
+        assert!(start.elapsed() >= Duration::from_millis(15));
+        assert_eq!(video.len(), 1);
+    }
+
+    #[test]
+    fn deadline_saturates_after_media_time_has_passed() {
+        assert_eq!(
+            until_media_deadline(100, Some(150)),
+            Some(Duration::from_micros(50))
+        );
+        assert_eq!(until_media_deadline(200, Some(150)), Some(Duration::ZERO));
+        assert_eq!(until_media_deadline(100, None), None);
+    }
 }

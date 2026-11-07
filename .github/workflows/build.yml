@@ -1,0 +1,17 @@
+name: Build test packages
+run-name: Test packages - ${{ github.ref_name }}
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  windows:
+    name: Windows
+    uses: ./.github/workflows/windows.yml
+  macos:
+    name: macOS
+    uses: ./.github/workflows/macos.yml
+  linux:
+    name: Linux
+    uses: ./.github/workflows/linux.yml

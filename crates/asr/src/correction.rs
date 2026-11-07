@@ -212,6 +212,7 @@ mod tests {
             end_ms: id * 1000 + 900,
             finalized: true,
             correcting: false,
+            review: None,
         }
     }
     #[test]

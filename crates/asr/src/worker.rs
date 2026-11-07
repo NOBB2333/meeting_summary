@@ -1,5 +1,5 @@
 use crate::{
-    ModelKind, Segment, Transcript,
+    ModelKind, ReviewState, Segment, SentenceReview, Transcript,
     audio::{Normalizer, SpeechHistory, decode_file},
     prepare,
     revision::{MAX_REVISION_SAMPLES, Reviser},
@@ -23,6 +23,8 @@ pub enum AsrEvent {
     Status(String),
     Segment(Segment),
     Progress(f64),
+    /// End of audio actually consumed by the live recognizer, including silence.
+    Processed(u64),
     Gap(u64, u64),
     Finished(Box<Transcript>),
     Error(String),
@@ -262,6 +264,7 @@ impl AsrSession {
                         let mut last_progress = Instant::now();
                         let mut last_checkpoint = Instant::now();
                         let mut checkpoint_dirty = false;
+                        let live_input = source.is_none();
                         let read_result = {
                             let mut consume = |audio: Option<PcmAudio>,
                                                duration: Option<f64>|
@@ -317,6 +320,11 @@ impl AsrSession {
                                     &tx,
                                 )?;
                                 expected_us = Some(end_us);
+                                if live_input && last_progress.elapsed() >= Duration::from_secs(1) {
+                                    let _ =
+                                        tx.send(AsrEvent::Processed(end_us.max(0) as u64 / 1000));
+                                    last_progress = Instant::now();
+                                }
                                 if let Some(duration) = duration
                                     && last_progress.elapsed() >= Duration::from_millis(300)
                                 {
@@ -735,18 +743,47 @@ impl Engine {
                         text: text.clone(),
                         finalized: final_now,
                         correcting: false,
+                        review: None,
                     };
-                    if final_now
-                        && let Some(correction) = correction
-                        && let Some(audio) = utterance_audio.take().filter(|a| !a.is_empty())
-                    {
-                        segment.correcting = true;
-                        segment.finalized = false;
-                        if !correction.submit(&segment, audio) {
-                            // Queue full: confirm native text immediately. Audio
-                            // ingestion and the next sentence never wait on revision.
-                            segment.correcting = false;
-                            segment.finalized = true;
+                    if final_now && let Some(correction) = correction {
+                        let audio = utterance_audio.take();
+                        let mut review = SentenceReview {
+                            state: ReviewState::Pending,
+                            original_text: text.clone(),
+                            model: correction.model().into(),
+                            revised_text: None,
+                            reason: None,
+                            audio_ms: audio.as_ref().map(|a| a.len() as u64 * 1000 / 16000),
+                            queue_ms: None,
+                            processing_ms: None,
+                        };
+                        match audio {
+                            Some(audio) if !audio.is_empty() => {
+                                segment.correcting = true;
+                                segment.finalized = false;
+                                segment.review = Some(review);
+                                if !correction.submit(&segment, audio) {
+                                    // Retain the original text and record why this
+                                    // sentence could not enter the bounded queue.
+                                    segment.correcting = false;
+                                    segment.finalized = true;
+                                    let review = segment.review.as_mut().expect("review exists");
+                                    review.state = ReviewState::Deferred;
+                                    review.reason = Some("queue_full".into());
+                                }
+                            }
+                            other => {
+                                review.state = ReviewState::Deferred;
+                                review.reason = Some(
+                                    if other.is_none() {
+                                        "utterance_too_long"
+                                    } else {
+                                        "empty_audio"
+                                    }
+                                    .into(),
+                                );
+                                segment.review = Some(review);
+                            }
                         }
                     }
                     t.apply(segment.clone());
@@ -796,6 +833,7 @@ impl Engine {
                             text,
                             finalized: true,
                             correcting: false,
+                            review: None,
                         };
                         t.apply(segment.clone());
                         let _ = tx.send(AsrEvent::Segment(segment));
@@ -1073,6 +1111,32 @@ mod live_integration_tests {
                         assert!(!t.text().is_empty());
                         assert_eq!(t.model, kind.directory());
                         assert!(t.segments.iter().all(|s| s.finalized && !s.correcting));
+                        if kind.is_streaming() {
+                            let reviews: Vec<_> = t
+                                .segments
+                                .iter()
+                                .filter_map(|segment| segment.review.as_ref())
+                                .collect();
+                            assert!(!reviews.is_empty(), "{kind:?} has no review provenance");
+                            assert!(reviews.iter().all(|review| {
+                                !review.original_text.is_empty()
+                                    && !review.model.is_empty()
+                                    && review.state != crate::ReviewState::Pending
+                            }));
+                            assert!(
+                                reviews.iter().any(|review| {
+                                    review.state == crate::ReviewState::Reviewed
+                                        && review
+                                            .revised_text
+                                            .as_ref()
+                                            .is_some_and(|text| !text.is_empty())
+                                        && review.audio_ms.is_some()
+                                        && review.queue_ms.is_some()
+                                        && review.processing_ms.is_some()
+                                }),
+                                "{kind:?} did not complete a measured second pass: {reviews:?}"
+                            );
+                        }
                         assert!(base.with_extension("transcript.docx").exists());
                         break;
                     }

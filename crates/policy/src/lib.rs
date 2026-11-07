@@ -84,13 +84,26 @@ impl FramePolicy {
         } else if frame.pts_us - self.last_motion > 1_000_000 {
             self.motion = Motion::Static;
         }
-        let fps = (match self.motion {
+        let fps = self.target_fps(config);
+        self.due(frame.pts_us, fps)
+    }
+    fn target_fps(&self, config: &RecordingConfig) -> u32 {
+        (match self.motion {
             Motion::Static => 1,
             Motion::Normal => 15,
             Motion::High => config.max_fps,
         })
-        .min(config.max_fps);
-        self.due(frame.pts_us, fps)
+        .min(config.max_fps)
+    }
+    /// The cached image still needs periodic output, including a static tail.
+    /// New capture frames can wake the worker earlier and change the policy.
+    pub fn next_due_us(&self, config: &RecordingConfig) -> Option<i64> {
+        let fps = if config.adaptive {
+            self.target_fps(config)
+        } else {
+            config.max_fps
+        };
+        self.last_pts.map(|pts| pts + 1_000_000 / fps as i64)
     }
     fn due(&mut self, pts_us: i64, fps: u32) -> bool {
         let due = self
@@ -115,6 +128,18 @@ pub fn candidates(config: &RecordingConfig) -> Vec<&str> {
     };
     #[cfg(not(target_os = "macos"))]
     match config.codec {
+        Codec::Auto if config.prefer_h264 => vec![
+            "h264_qsv",
+            "h264_nvenc",
+            "h264_amf",
+            "libx264",
+            "hevc_qsv",
+            "hevc_nvenc",
+            "hevc_amf",
+            "av1_qsv",
+            "av1_nvenc",
+            "av1_amf",
+        ],
         Codec::Auto => vec![
             "av1_qsv",
             "av1_nvenc",
@@ -139,17 +164,32 @@ pub fn prefer_adapter(mut candidates: Vec<&str>, vendor: Option<u32>) -> Vec<&st
         Some(0x1002) => "_amf",
         _ => return candidates,
     };
-    candidates.sort_by_key(|name| {
-        let codec = if name.starts_with("av1") {
+    let family = |name: &str| {
+        if name.starts_with("av1") || name == "libsvtav1" {
             0
-        } else if name.starts_with("hevc") {
+        } else if name.starts_with("hevc") || name == "libx265" {
             1
-        } else if name.starts_with("h264") {
+        } else if name.starts_with("h264") || name == "libx264" {
             2
         } else {
             3
-        };
-        (codec, u8::from(!name.ends_with(preferred)))
+        }
+    };
+    let mut order = Vec::new();
+    for name in &candidates {
+        let codec = family(name);
+        if !order.contains(&codec) {
+            order.push(codec);
+        }
+    }
+    candidates.sort_by_key(|name| {
+        (
+            order
+                .iter()
+                .position(|codec| *codec == family(name))
+                .unwrap_or(order.len()),
+            u8::from(!name.ends_with(preferred)),
+        )
     });
     candidates
 }
@@ -208,6 +248,7 @@ mod tests {
         assert!(!p.accept(&frame(10_000, 255), &c));
         assert!(p.accept(&frame(40_000, 255), &c));
         assert!(p.previous.is_empty());
+        assert_eq!(p.next_due_us(&c), Some(73_333));
     }
     #[test]
     fn explicit_encoder_is_never_silently_replaced() {
@@ -225,5 +266,29 @@ mod tests {
         assert_eq!(ordered[0], "av1_nvenc");
         assert_eq!(ordered[3], "hevc_nvenc");
         assert_eq!(ordered.last(), Some(&"libx264"));
+    }
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn low_load_prioritizes_h264_but_preserves_explicit_choices() {
+        let mut c = RecordingConfig {
+            prefer_h264: true,
+            ..Default::default()
+        };
+        let ordered = prefer_adapter(candidates(&c), Some(0x10de));
+        assert_eq!(ordered[0], "h264_nvenc");
+        assert!(
+            ordered.iter().position(|name| *name == "libx264").unwrap()
+                < ordered
+                    .iter()
+                    .position(|name| name.starts_with("hevc"))
+                    .unwrap()
+        );
+        c.codec = Codec::Hevc;
+        assert_eq!(
+            prefer_adapter(candidates(&c), Some(0x10de))[0],
+            "hevc_nvenc"
+        );
+        c.encoder = Some("libsvtav1".into());
+        assert_eq!(candidates(&c), vec!["libsvtav1"]);
     }
 }
