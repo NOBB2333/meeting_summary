@@ -9,7 +9,7 @@ on:
         description: "Existing version tag to publish without rebuilding"
         type: string
         required: true
-        default: v1.2
+        default: v2.0
       artifact_run:
         description: "Completed Release run ID with all platform builds successful"
         type: string

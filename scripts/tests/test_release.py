@@ -80,8 +80,11 @@ class ReleaseTests(unittest.TestCase):
             release.check_version("v1.2", self.root)
 
     def test_missing_packages_fail_before_prepare(self):
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            release.prepare("v1.2", self.root, self.root / "output")
+        self.version_fixture()
+        check_version = release.check_version
+        with patch.object(release, "check_version", side_effect=lambda tag: check_version(tag, self.root)):
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                release.prepare("v1.2", self.root, self.root / "output")
         self.assertFalse((self.root / "output").exists())
 
     def source_fixture(self):

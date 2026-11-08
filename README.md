@@ -343,7 +343,7 @@ macOS 的 `scripts/dev.sh` 默认构建 Debug 原生应用包并打开 `release/
 
 Linux 首先支持 Intel / x86_64 的统信 UOS：X11 显示器、窗口和区域录制，PulseAudio 或 PipeWire-Pulse 的系统声与麦克风，以及仅录音、暂停恢复和文稿功能。Wayland 暂仅支持音频和文稿。X11 不支持排除本应用，暂不提供窗口缩略预览、录制边框或托盘；关闭主窗会退出，快捷键与悬浮控制仍可用；Linux 暂未实现锁屏自动停止，请先停止录制再锁屏。窗口最小化或关闭时结束采集并保存，窗口内容被遮挡时建议改录完整屏幕。
 
-普通提交、分支推送和 PR 不触发云端构建；提交前在本地运行 `scripts/dev.sh test`、`scripts/dev.sh lint -- -D warnings`（Windows 使用 `dev.ps1`）。需要发布时，同步 `Cargo.toml`、`Cargo.lock`、macOS `Info.plist` 的版本，补充 `docs/releases/<标签>.md`，运行 `python3 scripts/release.py check-version --tag v1.2` 检查；为已审查的提交创建版本标签，再用一次 `git push --atomic origin main v1.2` 同时推送提交与标签。后续发布使用新的版本号，不移动旧标签。
+普通提交、分支推送和 PR 不触发云端构建；提交前在本地运行 `scripts/dev.sh test`、`scripts/dev.sh lint -- -D warnings`（Windows 使用 `dev.ps1`）。需要发布时，同步 `Cargo.toml`、`Cargo.lock`、macOS `Info.plist` 的版本，补充 `docs/releases/<标签>.md`，运行 `python3 scripts/release.py check-version --tag v2.0` 检查；为已审查的提交创建版本标签，再用一次 `git push --atomic origin main v2.0` 同时推送提交与标签。后续发布使用新的版本号，不移动旧标签。
 
 如只需要当前分支的三端测试包，可在 Actions → **Build test packages** 手动运行，或执行 `gh workflow run build.yml --ref main`；它复用三端构建和测试并上传 Actions artifacts，不创建或发布 Release。分支测试包不是版本标签发布包，保留 14 天。
 
@@ -353,7 +353,7 @@ Linux 首先支持 Intel / x86_64 的统信 UOS：X11 显示器、窗口和区�
 
 Release 提供 Windows x64、Mac Apple Silicon / Intel 和 Linux x64 安装包。Linux 在 Debian 10 / glibc 2.28 基线上构建，私有捆绑 FFmpeg、C++、字体等依赖并审计 ELF 符号版本，不替换系统 glibc 或显卡驱动。图形界面使用宿主 Vulkan / OpenGL 驱动；Linux 当前提供软件 H.264 / AAC 路径，UOS 实机性能仍需按设备验证。
 
-当前 Actions 的 Mac Apple Silicon 包要求 macOS 14+，Intel 包要求 macOS 15+；本机 Homebrew 打包的最低版本单独计算，不能把本机 macOS 26 的要求套到云端包。Linux 的 CPU 窗口渲染优先选择 OpenGL，以避开已复现的软件 Vulkan 空白窗口；硬件 GPU 和无窗口计算保留原排序。
+Actions 使用 macOS 26 的 Apple Silicon 和 Intel 构建机；每个应用包的最低系统版本根据实际捆绑库计算，以 Release 附带的验证信息和应用包声明为准。本机 Homebrew 打包的最低版本单独计算。Linux 的 CPU 窗口渲染优先选择 OpenGL，以避开已复现的软件 Vulkan 空白窗口；硬件 GPU 和无窗口计算保留原排序。
 
 Linux 下载 `OpenCap-linux-x64.deb` 安装，或解压 `OpenCap-linux-x64.tar.gz` 后运行 `OpenCap/AppRun`，保留整个目录。构建和兼容检查见 [docs/build-and-linux.md](docs/build-and-linux.md)。Mac 图标由同一套绿色 / 红色图源生成 ICNS 并在签名前装入应用包，Dock 随录制状态切换；系统权限列表使用应用包图标。
 
