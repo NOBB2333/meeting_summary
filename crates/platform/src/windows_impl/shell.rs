@@ -31,7 +31,7 @@ pub fn exclude_from_capture(hwnd: isize) -> Result<()> {
 
 /// Call before creating windows, so the development build gets a distinct
 /// taskbar identity even when a production build is running at the same time.
-pub unsafe fn set_developer_app_identity() -> Result<()> {
+pub fn set_developer_app_identity() -> Result<()> {
     unsafe {
         windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(w!(
             "org.opencap.OpenCap.Dev"

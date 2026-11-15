@@ -145,6 +145,10 @@ struct Slot {
     texture: StagingTexture,
     pending: Option<Pending>,
 }
+struct FrameTiming {
+    pts_us: i64,
+    generation: u64,
+}
 
 struct Readback {
     device: ID3D11Device,
@@ -169,8 +173,7 @@ impl Readback {
         texture: &ID3D11Texture2D,
         desc: D3D11_TEXTURE2D_DESC,
         crop: Option<Rect>,
-        pts_us: i64,
-        generation: u64,
+        timing: FrameTiming,
         metrics: &CaptureMetrics,
     ) -> Result<()> {
         let (width, height) = crop.map_or((desc.Width, desc.Height), |r| (r.width, r.height));
@@ -239,8 +242,8 @@ impl Readback {
             _frame: frame,
             width,
             height,
-            pts_us,
-            generation,
+            pts_us: timing.pts_us,
+            generation: timing.generation,
             submitted,
             flushed: false,
         });
@@ -459,8 +462,7 @@ fn run(
                     &texture,
                     desc,
                     args.crop,
-                    pts_us,
-                    generation,
+                    FrameTiming { pts_us, generation },
                     &args.metrics,
                 )?;
             }

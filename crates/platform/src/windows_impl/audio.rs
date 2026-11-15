@@ -238,17 +238,10 @@ pub struct AudioMonitor {
     warning_rx: Receiver<String>,
     denoise: bool,
 }
+#[derive(Default)]
 struct MonitorState {
     meters: [AudioMeter; 2],
     inputs: [AudioMeter; 2],
-}
-impl Default for MonitorState {
-    fn default() -> Self {
-        Self {
-            meters: [AudioMeter::default(), AudioMeter::default()],
-            inputs: [AudioMeter::default(), AudioMeter::default()],
-        }
-    }
 }
 impl Drop for AudioMonitor {
     fn drop(&mut self) {

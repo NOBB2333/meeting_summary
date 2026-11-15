@@ -2038,7 +2038,7 @@ fn main() {
     }
     #[cfg(windows)]
     if is_dev_profile() {
-        let result = unsafe { opencap_platform::set_developer_app_identity() };
+        let result = opencap_platform::set_developer_app_identity();
         if let Err(error) = result {
             eprintln!("无法设置开发版 Windows 身份：{error}");
         }
