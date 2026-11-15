@@ -384,8 +384,6 @@ mod tests {
                 provider,
                 base_url: url,
                 model: "test".into(),
-                background: false,
-                deep_reasoning: false,
             };
             let dir = std::env::temp_dir().join(format!(
                 "opencap-proofread-{}-{}",
@@ -456,13 +454,11 @@ mod tests {
         let base = dir.join("meeting");
         transcript.checkpoint(&base).unwrap();
         let before = std::fs::read(base.with_extension("transcript.json")).unwrap();
-        let (url, _, server) = mock(vec![reply(AiProvider::ChatCompletions, "[]")]);
+        let (url, _, server) = mock(vec![reply(AiProvider::Responses, "[]")]);
         let config = AiConfig {
-            provider: AiProvider::ChatCompletions,
+            provider: AiProvider::Responses,
             base_url: url,
             model: "test".into(),
-            background: false,
-            deep_reasoning: false,
         };
         assert!(
             correct_transcript(

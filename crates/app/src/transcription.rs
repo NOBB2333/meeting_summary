@@ -126,6 +126,27 @@ fn read_transcript_file(
     })
 }
 
+/// Load a separate, immutable document without touching the active ASR session.
+pub(super) fn read_transcript_snapshot(
+    source: &std::path::Path,
+    expected_meeting_id: Option<&str>,
+) -> anyhow::Result<Transcript> {
+    let loaded = read_transcript_file(source, None)?;
+    anyhow::ensure!(loaded.still_current(source), "逐字稿读取后发生变化，请重试");
+    if let Some(id) = expected_meeting_id {
+        anyhow::ensure!(
+            loaded
+                .transcript
+                .run
+                .as_ref()
+                .and_then(|run| run.meeting_id.as_deref())
+                .is_none_or(|recorded| recorded == id),
+            "逐字稿与会议身份不一致"
+        );
+    }
+    Ok(loaded.transcript)
+}
+
 fn resolve_loaded_source(source: &std::path::Path, transcript: &mut Transcript) -> bool {
     if transcript
         .extra
@@ -2826,27 +2847,77 @@ impl Recorder {
             ));
         });
     }
-    pub(super) fn live_transcript_card(&self, cx: &Context<Self>) -> Div {
-        if self.active() && self.recording_without_live_due_to_task {
-            return ui::card().child(label("实时文字暂不可用")).child(label(
-                "另一场会议的任务仍在运行，本次媒体会继续保存。录制结束后可从会议库补转。",
-            ));
-        }
+    /// At-a-glance recognition configuration for the recording workspace.
+    /// Compact first-screen controls; the transcript itself is on the next screen.
+    pub(super) fn recording_models_summary(&self, cx: &Context<Self>) -> Div {
+        let busy = self.active() || self.transcription_busy();
+        let plan = self.asr_models.live_plan_for(
+            self.config.live_asr_model,
+            self.config.offline_asr_model,
+            self.config.transcription_context_revision,
+        );
+        let live = plan.map(|plan| plan.kind.label()).unwrap_or("未就绪");
+        let review_ready = self
+            .asr_models
+            .ready(ModelKind::from_offline(self.config.offline_asr_model));
+        let live_options = div().w(px(240.)).flex().flex_col().gap_1().children(
+            LiveAsrModel::ALL.into_iter().enumerate().map(|(i, model)| {
+                button(
+                    ("quick-live-model", i),
+                    model.label(),
+                    self.config.live_asr_model == model,
+                )
+                .w_full()
+                .justify_start()
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.config.live_asr_model = model;
+                    this.save();
+                    this.transcription_status = "实时模型将在下次识别生效。".into();
+                    cx.notify();
+                }))
+            }),
+        );
+        let review_options = div().w(px(240.)).flex().flex_col().gap_1().children(
+            OfflineAsrModel::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, model)| {
+                    button(
+                        ("quick-offline-model", i),
+                        model.label(),
+                        self.config.offline_asr_model == model,
+                    )
+                    .w_full()
+                    .justify_start()
+                    .disabled(busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.config.offline_asr_model = model;
+                        this.save();
+                        this.transcription_status = "文件模型将在下次识别生效。".into();
+                        cx.notify();
+                    }))
+                }),
+        );
         ui::card()
             .child(
                 div()
                     .flex()
-                    .justify_between()
                     .items_center()
-                    .child(label("实时文字"))
-                    .child(button("open-live-text", "查看完整逐字稿", false).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.transcription_tab = true;
-                            this.settings = false;
-                            this.meeting_page = workspace::MeetingPage::Transcript;
-                            cx.notify();
-                        }),
-                    )),
+                    .justify_between()
+                    .gap_2()
+                    .child(ui::section_title("识别与 AI", "配置在下一次任务生效"))
+                    .child(
+                        ui::icon_button(
+                            "summary-models-settings",
+                            gpui::component::IconName::Settings,
+                            "识别设置",
+                        )
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_ai_settings(crate::settings::SettingsPage::Recognition, cx)
+                        })),
+                    ),
             )
             .child(
                 div()
@@ -2855,15 +2926,15 @@ impl Recorder {
                     .gap_2()
                     .child(
                         button(
-                            "recording-live-toggle",
+                            "summary-live-toggle",
                             if self.config.realtime_transcription {
-                                "实时转录：开"
+                                "实时转写：开"
                             } else {
-                                "实时转录：关"
+                                "实时转写：关"
                             },
                             self.config.realtime_transcription,
                         )
-                        .disabled(self.active() || self.transcription_busy())
+                        .disabled(busy)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.config.realtime_transcription =
                                 !this.config.realtime_transcription;
@@ -2873,7 +2944,7 @@ impl Recorder {
                     )
                     .child(
                         button(
-                            "recording-revision-toggle",
+                            "summary-revision-toggle",
                             if self.config.transcription_context_revision {
                                 "断句校正：开"
                             } else {
@@ -2881,137 +2952,137 @@ impl Recorder {
                             },
                             self.config.transcription_context_revision,
                         )
-                        .disabled(self.active() || self.transcription_busy())
+                        .disabled(busy)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.config.transcription_context_revision =
                                 !this.config.transcription_context_revision;
                             this.save();
                             cx.notify();
                         })),
-                    )
-                    .child(
-                        button(
-                            "recording-high-quality",
-                            if self.asr.as_ref().is_some_and(|asr| !asr.finished()) {
-                                match self.transcript.run.as_ref() {
-                                    Some(run) if run.revision_scheduled => {
-                                        match self.revision_runtime {
-                                            Some(opencap_asr::RevisionRuntimeState::Ready) => {
-                                                "本次断句复核：模型已就绪"
-                                            }
-                                            Some(opencap_asr::RevisionRuntimeState::Failed) => {
-                                                "本次断句复核：不可用，保留原文"
-                                            }
-                                            _ => "本次断句复核：正在加载",
-                                        }
-                                    }
-                                    Some(run)
-                                        if run
-                                            .extra
-                                            .get("revision_requested")
-                                            .and_then(|value| value.as_bool())
-                                            == Some(true) =>
-                                    {
-                                        "本次断句复核：已请求，未安排"
-                                    }
-                                    Some(_) => "本次断句复核：未请求",
-                                    None => "本次识别模型：准备中",
-                                }
-                            } else if self.config.realtime_transcription
-                                && self.config.transcription_context_revision
-                            {
-                                "下次高质量：已请求 · 点击关闭复核"
-                            } else {
-                                "启用实时高质量"
-                            },
-                            self.config.realtime_transcription
-                                && self.config.transcription_context_revision,
-                        )
-                        .disabled(self.active() || self.transcription_busy())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let requested = this.config.realtime_transcription
-                                && this.config.transcription_context_revision;
-                            this.config.realtime_transcription = true;
-                            this.config.transcription_context_revision = !requested;
-                            this.save();
-                            this.transcription_status = if requested {
-                                "已关闭下次录制的断句复核；实时转录保持开启".into()
-                            } else {
-                                "已请求下次录制启用实时转录与断句复核；实际方式取决于模型是否就绪"
-                                    .into()
-                            };
-                            cx.notify();
-                        })),
                     ),
             )
-            .when(!self.active(), |d| {
-                d.child(label(
-                    self.asr_models
-                        .live_plan_for(
-                            self.config.live_asr_model,
-                            self.config.offline_asr_model,
-                            self.config.transcription_context_revision,
-                        )
-                        .map(|p| p.description())
-                        .unwrap_or("所选语音模型未安装，请前往设置下载"),
-                ))
-            })
-            .when(
-                self.config.realtime_transcription
-                    && self.config.transcription_context_revision
-                    && !self
-                        .asr_models
-                        .live_plan_for(
-                            self.config.live_asr_model,
-                            self.config.offline_asr_model,
-                            true,
-                        )
-                        .is_some_and(|plan| plan.context_revision),
-                |d| {
-                    d.child(label(
-                        "当前双模型复核未就绪：请安装或选择流式模型及所选文件模型。",
-                    ))
-                },
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        label(if plan.is_some() {
+                            "实时模型 · 就绪"
+                        } else {
+                            "实时模型 · 未就绪"
+                        })
+                        .w(px(100.))
+                        .flex_shrink_0(),
+                    )
+                    .child(
+                        div().flex_1().min_w(px(0.)).child(
+                            gpui::component::popover::Popover::new("quick-live-model-menu")
+                                .anchor(Anchor::TopRight)
+                                .trigger(
+                                    ui::selector("quick-live-model-trigger", live).disabled(busy),
+                                )
+                                .child(live_options),
+                        ),
+                    ),
             )
-            .child(label(self.transcription_status.clone()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        label(if review_ready {
+                            "句段复核 · 已安装"
+                        } else {
+                            "句段复核 · 未安装"
+                        })
+                        .w(px(100.))
+                        .flex_shrink_0(),
+                    )
+                    .child(
+                        div().flex_1().min_w(px(0.)).child(
+                            gpui::component::popover::Popover::new("quick-offline-model-menu")
+                                .anchor(Anchor::TopRight)
+                                .trigger(
+                                    ui::selector(
+                                        "quick-offline-model-trigger",
+                                        self.config.offline_asr_model.label(),
+                                    )
+                                    .disabled(busy),
+                                )
+                                .child(review_options),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(label(format!(
+                                "AI 纪要 · {}",
+                                self.ai.config.provider.label()
+                            )))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(if self.ai.config.model.is_empty() {
+                                        "未配置".to_string()
+                                    } else {
+                                        self.ai.config.model.clone()
+                                    }),
+                            ),
+                    )
+                    .child(button("home-ai-settings", "配置", false).ghost().on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.open_ai_settings(crate::settings::SettingsPage::Ai, cx)
+                        }),
+                    )),
+            )
             .when_some(self.online_speaker_caption(), |d, status| {
                 d.child(label(status))
             })
-            .when(self.active() || self.live_notes.is_some(), |d| {
-                d.child(self.live_notes_panel(cx))
-            })
-            .when(self.asr_live && self.active(), |d| {
-                d.when_some(self.asr_processed_ms, |d, processed| {
-                    let recorded_ms = (self.stats.duration_seconds.max(0.) * 1000.) as u64;
-                    let delay = recorded_ms.saturating_sub(processed);
-                    d.child(label(if delay < 2000 {
-                        format!(
-                            "已处理至 {} · 基本同步",
-                            opencap_asr::timestamp(processed, '.')
-                        )
-                    } else {
-                        format!(
-                            "已处理至 {} · 落后录音约 {:.1} 秒",
-                            opencap_asr::timestamp(processed, '.'),
-                            delay as f64 / 1000.
-                        )
-                    }))
-                })
-            })
-            .child(
-                div()
-                    .h(px(
-                        if !self.config.realtime_transcription
-                            && self.transcript.segments.is_empty()
-                        {
-                            64.
-                        } else if self.config.audio_only {
-                            380.
-                        } else {
-                            320.
-                        },
-                    ))
-                    .child(self.transcript_view.clone()),
+    }
+
+    pub(super) fn home_transcript_detail_card(&self) -> Div {
+        ui::card()
+            .h_full()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .child(ui::section_title(
+                "实时逐字稿",
+                "滚动查看历史，回到最新后继续跟随",
+            ))
+            .when(
+                self.active() && self.recording_without_live_due_to_task,
+                |d| d.child(label("本场实时文字暂不可用，录制结束后可补转。")),
+            )
+            .when(
+                !(self.active() && self.recording_without_live_due_to_task),
+                |d| {
+                    d.child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_hidden()
+                            .child(self.home_detail_transcript.clone()),
+                    )
+                },
             )
     }
     fn speaker_history_comparison(&self, cx: &Context<Self>) -> Div {
@@ -3172,30 +3243,148 @@ impl Recorder {
         }
         let busy = self.transcription_busy();
         let ready = self.transcript.is_complete();
+        let correction_waiting = self.active()
+            || self.transcript_write_busy()
+            || self.ai.credentials_busy
+            || self.transcript.primary_save_pending;
+        let correction = button("correct-transcript", "AI 校正全文", false)
+            .disabled(!ready || correction_waiting)
+            .on_click(cx.listener(|this, _, _, cx| this.request_transcript_correction(cx)));
+        #[cfg(feature = "ui-smoke")]
+        let correction = div().child(correction).on_children_prepainted({
+            let bounds = self.ai.correction_bounds.clone();
+            move |children, _, _| bounds.set(children.first().copied())
+        });
         let speakers = self.transcript.speaker_count();
         let mut toolbar = div().flex().flex_wrap().items_center().gap_2();
+        toolbar = toolbar.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    primary_button("to-minutes", "AI 对话与纪要")
+                        .disabled(!ready || self.active() || busy)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.meeting_page = workspace::MeetingPage::Minutes;
+                            this.page_scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        })),
+                )
+                .child(correction)
+                .when(!ready, |d| d.child(label("逐字稿完成后可校正")))
+                .when(
+                    ready && correction_waiting && self.ai.correction_task.is_none(),
+                    |d| d.child(label("等待录制、保存或当前写入任务结束")),
+                )
+                .when(self.transcript.correction.is_some(), |d| {
+                    d.child(
+                        button("restore-transcript-original", "恢复识别原文", false)
+                            .disabled(busy || self.active())
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.restore_transcript_original(cx)),
+                            ),
+                    )
+                })
+                .when(self.ai.correction_task.is_some(), |d| {
+                    d.child(
+                        button("cancel-transcript-correction", "停止校正", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.ai
+                                    .cancelled
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                })
+                .when(self.asr.as_ref().is_some_and(|a| !a.finished()), |d| {
+                    d.child(
+                        button(
+                            "cancel-asr",
+                            if self.asr.as_ref().is_some_and(|asr| asr.cancel_requested()) {
+                                "正在取消…"
+                            } else {
+                                "取消转录"
+                            },
+                            false,
+                        )
+                        .danger()
+                        .disabled(self.asr.as_ref().is_some_and(|asr| asr.cancel_requested()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(asr) = &mut this.asr {
+                                asr.cancel();
+                                this.transcription_status =
+                                    "正在取消转录；等待当前处理结束，已识别内容将保留。".into();
+                            }
+                            cx.notify();
+                        })),
+                    )
+                }),
+        );
+
         #[cfg(feature = "online-speaker")]
-        if ready || self.word_timing_cancel.is_some() || !self.word_timing_status.is_empty() {
+        if (self.transcript_tools_open && ready)
+            || self.word_timing_cancel.is_some()
+            || !self.word_timing_status.is_empty()
+        {
             let running = self.word_timing_cancel.is_some();
             let cancelling = self
                 .word_timing_cancel
                 .as_ref()
                 .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
-            toolbar = toolbar.child(div().w_full().p_3().rounded_lg().bg(rgb(SOFT))
-                .child(label("模型词时间 · 实验：需要可信 NeMo 库和固定版本 ASR 模型；仅应用文字一致且时间落在句段内的结果，词边界精度尚未验收。"))
-                .when(!self.word_timing_status.is_empty(), |d| d.child(label(self.word_timing_status.clone())))
-                .when(running, |d| d.child(button("cancel-word-timing", if cancelling { "正在停止…" } else { "停止生成词时间" }, false)
-                    .ghost().disabled(cancelling).on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(flag) = &this.word_timing_cancel {
-                            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                            this.word_timing_status = "正在停止，需等待当前模型调用结束。".into();
-                        }
-                        cx.notify();
-                    }))))
-                .when(!running, |d| d.child(button("generate-word-timing", "生成模型词时间…", false)
-                    .ghost().disabled(!ready || busy || self.active() || self.transcript.primary_save_pending
-                        || self.transcript_output.is_none() || self.transcript.source.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_word_timing_model(cx))))));
+            toolbar = toolbar.child(
+                div()
+                    .w_full()
+                    .p_2()
+                    .rounded_lg()
+                    .bg(rgb(BG))
+                    .child(label("模型词时间（实验）：使用可信模型；词边界仍需核对。"))
+                    .when(!self.word_timing_status.is_empty(), |d| {
+                        d.child(label(self.word_timing_status.clone()))
+                    })
+                    .when(running, |d| {
+                        d.child(
+                            button(
+                                "cancel-word-timing",
+                                if cancelling {
+                                    "正在停止…"
+                                } else {
+                                    "停止生成词时间"
+                                },
+                                false,
+                            )
+                            .ghost()
+                            .disabled(cancelling)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(flag) = &this.word_timing_cancel {
+                                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    this.word_timing_status =
+                                        "正在停止，需等待当前模型调用结束。".into();
+                                }
+                                cx.notify();
+                            })),
+                        )
+                    })
+                    .when(!running, |d| {
+                        d.child(
+                            button("generate-word-timing", "生成模型词时间…", false)
+                                .ghost()
+                                .disabled(
+                                    !ready
+                                        || busy
+                                        || self.active()
+                                        || self.transcript.primary_save_pending
+                                        || self.transcript_output.is_none()
+                                        || self.transcript.source.is_none(),
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.choose_word_timing_model(cx)),
+                                ),
+                        )
+                    }),
+            );
         }
         let mut untimed = self
             .transcript
@@ -3604,12 +3793,24 @@ impl Recorder {
                 )
             }).unwrap_or_else(|| "本次识别配置：历史版本未记录。".into());
             toolbar = toolbar.child(
-                div()
-                    .w_full()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(BG))
-                    .child(label(run_detail)),
+                gpui::component::popover::Popover::new("transcript-run-details")
+                    .anchor(Anchor::TopRight)
+                    .trigger(
+                        button(
+                            "transcript-run-details-trigger",
+                            "识别参数与运行详情",
+                            false,
+                        )
+                        .ghost(),
+                    )
+                    .child(
+                        div()
+                            .id("transcript-run-details-scroll")
+                            .w(px(420.))
+                            .max_h(px(320.))
+                            .overflow_y_scroll()
+                            .child(label(run_detail)),
+                    ),
             );
             if let (Some(run), Some(source)) =
                 (self.transcript.run.clone(), self.transcript.source.clone())
@@ -3861,73 +4062,6 @@ impl Recorder {
             );
         }
 
-        toolbar = toolbar.child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .child(
-                    primary_button("to-minutes", "AI 对话与纪要")
-                        .disabled(!ready || self.active() || busy)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.meeting_page = workspace::MeetingPage::Minutes;
-                            this.page_scroll.set_offset(point(px(0.), px(0.)));
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    button("correct-transcript", "AI 校正全文", false)
-                        .disabled(!ready || self.active() || busy)
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.request_transcript_correction(cx)),
-                        ),
-                )
-                .when(self.transcript.correction.is_some(), |d| {
-                    d.child(
-                        button("restore-transcript-original", "恢复识别原文", false)
-                            .disabled(busy || self.active())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.restore_transcript_original(cx)),
-                            ),
-                    )
-                })
-                .when(self.ai.correction_task.is_some(), |d| {
-                    d.child(
-                        button("cancel-transcript-correction", "停止校正", false).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.ai
-                                    .cancelled
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                })
-                .when(self.asr.as_ref().is_some_and(|a| !a.finished()), |d| {
-                    d.child(
-                        button(
-                            "cancel-asr",
-                            if self.asr.as_ref().is_some_and(|asr| asr.cancel_requested()) {
-                                "正在取消…"
-                            } else {
-                                "取消转录"
-                            },
-                            false,
-                        )
-                        .danger()
-                        .disabled(self.asr.as_ref().is_some_and(|asr| asr.cancel_requested()))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(asr) = &mut this.asr {
-                                asr.cancel();
-                                this.transcription_status =
-                                    "正在取消转录；等待当前处理结束，已识别内容将保留。".into();
-                            }
-                            cx.notify();
-                        })),
-                    )
-                }),
-        );
         if self.historical_checking {
             toolbar = toolbar.child(
                 button(
@@ -4232,8 +4366,62 @@ impl Recorder {
                 );
         }
 
-        let mut media_content =
-            ui::card().child(ui::section_title("媒体与纪要", "回听原媒体，查看本场来源"));
+        if self.active() && self.asr_live {
+            toolbar = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(ui::badge("录制中", ui::SUCCESS, 0xe6f4ef))
+                .child(label("实时转写持续进行"))
+                .when(!wide, |d| {
+                    d.child(
+                        button(
+                            "live-toggle-meeting-pane",
+                            if self.transcript_media_tab {
+                                "查看逐字稿"
+                            } else {
+                                "媒体与纪要"
+                            },
+                            false,
+                        )
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.transcript_media_tab = !this.transcript_media_tab;
+                            cx.notify();
+                        })),
+                    )
+                });
+        }
+
+        let mut media_content = ui::card()
+            .items_start()
+            .child(ui::section_title("媒体与纪要", "回听原媒体，查看本场来源"));
+        let model = self
+            .transcript
+            .run
+            .as_ref()
+            .map(|run| run.model_id.as_str())
+            .filter(|model| !model.trim().is_empty())
+            .or_else(|| {
+                (!self.transcript.model.trim().is_empty()).then_some(self.transcript.model.as_str())
+            })
+            .unwrap_or("历史记录未提供");
+        media_content = media_content.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .pb_2()
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .child(label("本场转录模型"))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(model.to_owned()),
+                ),
+        );
         #[cfg(feature = "internal-player")]
         {
             if self.player.is_some() && self.player_base == self.transcript_output {
@@ -4244,6 +4432,7 @@ impl Recorder {
             ) {
                 media_content = media_content.child(
                     button("open-transcript-media", "打开本场媒体", false)
+                        .justify_start()
                         .disabled(self.active())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_internal_player(base.clone(), media.clone());
@@ -4262,8 +4451,85 @@ impl Recorder {
         {
             media_content = media_content.child(label("此构建未启用内置回放。"));
         }
+        if let Some(meeting) = self
+            .transcript_output
+            .as_ref()
+            .and_then(|base| self.meetings.iter().find(|meeting| &meeting.base == base))
+            && !meeting.media_items.is_empty()
+        {
+            let items = meeting.media_items.iter().enumerate().map(|(index, item)| {
+                let path = item.path.clone();
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "媒体文件".into());
+                let role = match item.role.as_str() {
+                    "recording_video" => "录制视频",
+                    "recording_audio" => "录制音频",
+                    "candidate_media" => "待核对媒体",
+                    "same_name_media" => "同名媒体 · 待核对",
+                    _ => "源媒体",
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        ui::icon(gpui::component::IconName::FolderOpen)
+                            .size(px(15.))
+                            .text_color(rgb(MUTED)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().text_sm().truncate().child(name))
+                            .child(label(format!(
+                                "{}{}",
+                                role,
+                                if item.available {
+                                    ""
+                                } else {
+                                    " · 文件缺失"
+                                }
+                            ))),
+                    )
+                    .child(
+                        button(("open-meeting-media-file", index), "打开", false)
+                            .ghost()
+                            .disabled(!item.available || self.active())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Err(error) = opencap_platform::open_path(&path) {
+                                    this.message = format!("无法打开媒体：{error:#}");
+                                }
+                                cx.notify();
+                            })),
+                    )
+            });
+            media_content = media_content.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child(label(format!(
+                        "本场媒体 · {} 个",
+                        meeting.media_items.len()
+                    )))
+                    .children(items),
+            );
+        }
         if self.asr.as_ref().is_some_and(|asr| !asr.finished()) || self.live_notes.is_some() {
-            media_content = media_content.child(self.live_notes_panel(cx));
+            if self.active() && !self.live_notes_management_open {
+                media_content = media_content.child(self.live_minutes_overview(cx));
+            } else {
+                media_content = media_content.child(self.live_notes_panel(cx));
+            }
         }
         let media_panel = div()
             .id("meeting-media-panel-scroll")
@@ -4288,16 +4554,20 @@ impl Recorder {
                 .child(document)
         };
         let body = if wide {
-            use gpui::component::resizable::{h_resizable, resizable_panel};
+            use gpui::component::resizable::resizable_panel;
             let media = resizable_panel()
                 .size(px(width * 0.44))
                 .size_range(px(280.)..px(width - 320.))
+                .when(self.config.meeting_media_on_right, |p| p.pl_2())
+                .when(!self.config.meeting_media_on_right, |p| p.pr_2())
                 .child(media_panel);
             let text = resizable_panel()
                 .size(px(width * 0.56))
                 .size_range(px(300.)..px(width - 300.))
+                .when(self.config.meeting_media_on_right, |p| p.pr_2())
+                .when(!self.config.meeting_media_on_right, |p| p.pl_2())
                 .child(text_panel);
-            let split = h_resizable("transcript-workspace-split");
+            let split = ui::spaced_split("transcript-workspace-split");
             let split = if self.config.meeting_media_on_right {
                 split.child(text).child(media)
             } else {
@@ -4337,56 +4607,256 @@ impl Recorder {
             self.config.transcription_context_revision,
         );
         let view = ui::card()
-            .child(div().text_lg().child("本地语音转录"))
-            .child(label("实时转录会自动保存逐字稿；可主动开启增量纪要。音频与视频使用同一套转录和导出流程。"))
-            .child(label("工作方式"))
-            .child(div().flex().flex_wrap().gap_2().children(
-                ["轻量实时", "实时与句段复核", "逐句模式", "仅文件转录"]
-                    .into_iter().enumerate().map(|(index, title)| {
-                        let selected = match index {
-                            0 => self.config.realtime_transcription && self.config.live_asr_model == LiveAsrModel::Compact && !self.config.transcription_context_revision,
-                            1 => self.config.realtime_transcription && self.config.live_asr_model == LiveAsrModel::Auto && self.config.transcription_context_revision,
-                            2 => self.config.realtime_transcription && self.config.live_asr_model == LiveAsrModel::Sentence,
-                            _ => !self.config.realtime_transcription,
-                        };
-                        button(("asr-work-mode", index), title, selected).disabled(busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                match index {
-                                    0 => { this.config.realtime_transcription = true; this.config.live_asr_model = LiveAsrModel::Compact; this.config.transcription_context_revision = false; }
-                                    1 => { this.config.realtime_transcription = true; this.config.live_asr_model = LiveAsrModel::Auto; this.config.transcription_context_revision = true; }
-                                    2 => { this.config.realtime_transcription = true; this.config.live_asr_model = LiveAsrModel::Sentence; this.config.transcription_context_revision = false; }
-                                    _ => this.config.realtime_transcription = false,
-                                }
-                                this.save();
-                                this.transcription_status = "工作方式将在下次任务生效；模型需单独安装。".into();
-                                cx.notify();
-                            }))
-                    }),
+            .child(ui::section_title(
+                "识别语言与本地模型矩阵",
+                "实时转录会自动保存逐字稿；音频与视频使用同一套识别设置",
             ))
+            .child(ui::section_title(
+                "识别语言偏好",
+                "语言偏好用于 SenseVoice 文件识别和句段复核",
+            ))
+            .child(div().flex().flex_wrap().gap_2().children(
+                TranscriptionLanguage::ALL.into_iter().map(|language| {
+                    button(
+                        ("asr-language", language as usize),
+                        language.label(),
+                        self.config.transcription_language == language,
+                    )
+                    .disabled(busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.config.transcription_language = language;
+                        this.save();
+                        cx.notify();
+                    }))
+                }),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(260.))
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(0xf8fafd))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("实时流式模型（录制中即时上屏）"),
+                            )
+                            .children(LiveAsrModel::ALL.into_iter().enumerate().map(
+                                |(i, model)| {
+                                    let installed = ModelKind::from_live(model)
+                                        .map(|kind| self.asr_models.ready(kind));
+                                    button(
+                                        ("live-asr-model", i),
+                                        format!(
+                                            "{}{}",
+                                            model.label(),
+                                            match installed {
+                                                Some(true) => " · 已安装",
+                                                Some(false) => " · 未安装",
+                                                None => "",
+                                            }
+                                        ),
+                                        self.config.live_asr_model == model,
+                                    )
+                                    .w_full()
+                                    .justify_start()
+                                    .disabled(busy)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if !this.transcription_busy() && !this.active() {
+                                                this.config.live_asr_model = model;
+                                                this.save();
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                },
+                            ))
+                            .child(label(
+                                "自动优先轻量实时；标准和增强模型会增加 CPU 与内存占用。",
+                            ))
+                            .when_some(live_model, |d, model| {
+                                d.child(
+                                    button(
+                                        "download-selected-live",
+                                        if self.asr_models.ready(model) {
+                                            format!("{} · 已安装", model.label())
+                                        } else {
+                                            format!("下载{}", model.label())
+                                        },
+                                        false,
+                                    )
+                                    .disabled(busy || self.asr_models.ready(model))
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.prepare_asr_model(model);
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(260.))
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(0xf8fafd))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("离线精转 / 句段复核模型"),
+                            )
+                            .children(OfflineAsrModel::ALL.into_iter().enumerate().map(
+                                |(i, model)| {
+                                    let installed =
+                                        self.asr_models.ready(ModelKind::from_offline(model));
+                                    button(
+                                        ("offline-asr-model", i),
+                                        format!(
+                                            "{} · {}",
+                                            model.label(),
+                                            if installed { "已安装" } else { "未安装" }
+                                        ),
+                                        self.config.offline_asr_model == model,
+                                    )
+                                    .w_full()
+                                    .justify_start()
+                                    .disabled(busy)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if !this.transcription_busy() && !this.active() {
+                                                this.config.offline_asr_model = model;
+                                                this.save();
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                },
+                            ))
+                            .child(label(
+                                "SenseVoice 支持中英日韩粤；Paraformer 支持中英及部分方言。",
+                            ))
+                            .child(
+                                button(
+                                    "download-selected-offline",
+                                    if self.asr_models.ready(offline_model) {
+                                        format!("{} · 已安装", offline_model.label())
+                                    } else {
+                                        format!("下载{}", offline_model.label())
+                                    },
+                                    false,
+                                )
+                                .disabled(busy || self.asr_models.ready(offline_model))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.prepare_asr_model(offline_model);
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    ),
+            );
+        let advanced = ui::card()
+            .child(ui::section_title(
+                "实时热词与识别方式",
+                "热词只影响流式中文识别",
+            ))
+            .child(Input::new(&self.hotwords_input).disabled(busy))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        button("apply-hotwords", "保存识别热词", false)
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.config.transcription_hotwords =
+                                    this.hotwords_input.read(cx).value().to_string();
+                                this.save();
+                                this.transcription_status =
+                                    "实时识别热词已保存，下次转录生效。".into();
+                                cx.notify();
+                            })),
+                    )
+                    .child(label("流式中文热词用逗号分隔；文件模型不接收热词。")),
+            )
+            .child(label("工作方式"))
+            .child(
+                div().flex().flex_wrap().gap_2().children(
+                    ["轻量实时", "实时与句段复核", "逐句模式", "仅文件转录"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, title)| {
+                            let selected = match index {
+                                0 => {
+                                    self.config.realtime_transcription
+                                        && self.config.live_asr_model == LiveAsrModel::Compact
+                                        && !self.config.transcription_context_revision
+                                }
+                                1 => {
+                                    self.config.realtime_transcription
+                                        && self.config.live_asr_model == LiveAsrModel::Auto
+                                        && self.config.transcription_context_revision
+                                }
+                                2 => {
+                                    self.config.realtime_transcription
+                                        && self.config.live_asr_model == LiveAsrModel::Sentence
+                                }
+                                _ => !self.config.realtime_transcription,
+                            };
+                            button(("asr-work-mode", index), title, selected)
+                                .disabled(busy)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    match index {
+                                        0 => {
+                                            this.config.realtime_transcription = true;
+                                            this.config.live_asr_model = LiveAsrModel::Compact;
+                                            this.config.transcription_context_revision = false;
+                                        }
+                                        1 => {
+                                            this.config.realtime_transcription = true;
+                                            this.config.live_asr_model = LiveAsrModel::Auto;
+                                            this.config.transcription_context_revision = true;
+                                        }
+                                        2 => {
+                                            this.config.realtime_transcription = true;
+                                            this.config.live_asr_model = LiveAsrModel::Sentence;
+                                            this.config.transcription_context_revision = false;
+                                        }
+                                        _ => this.config.realtime_transcription = false,
+                                    }
+                                    this.save();
+                                    this.transcription_status =
+                                        "工作方式将在下次任务生效；模型需单独安装。".into();
+                                    cx.notify();
+                                }))
+                        }),
+                ),
+            );
+        let detailed_options = div().flex().flex_col().gap_3().pt_2().border_t_1().border_color(rgb(BORDER))
             .child(label("轻量实时需要流式模型；实时与句段复核需要流式模型及所选文件模型；逐句模式需要所选文件模型。选择方式不会自动下载，也不保证某种模型识别更准。"))
             .child(div().flex().flex_wrap().gap_2()
                 .child(button("live-asr-toggle", if self.config.realtime_transcription { "实时转录：开启" } else { "实时转录：关闭" }, self.config.realtime_transcription).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.realtime_transcription = !this.config.realtime_transcription; this.save(); cx.notify(); })))
                 .child(button("context-revision", if self.config.transcription_context_revision { "断句校正：开启" } else { "断句校正：关闭" }, self.config.transcription_context_revision).disabled(busy).on_click(cx.listener(|this,_,_,cx| { this.config.transcription_context_revision = !this.config.transcription_context_revision; this.save(); cx.notify(); }))))
-            .child(label("实时识别模型"))
-            .child(div().flex().flex_wrap().gap_2().children(LiveAsrModel::ALL.into_iter().enumerate().map(|(i, model)| {
-                button(("live-asr-model", i), model.label(), self.config.live_asr_model == model)
-                    .disabled(busy)
-                    .on_click(cx.listener(move |this,_,_,cx| { if !this.transcription_busy() && !this.active() { this.config.live_asr_model = model; this.save(); } cx.notify(); }))
-            })))
-            .child(label("自动优先使用轻量实时模型，未安装时尝试所选文件模型；标准约 76 MB、增强约 167 MB，会增加 CPU 和内存占用。实时模型以中文为主。"))
-            .when_some(live_model, |d, model| d.child(button("download-selected-live", if self.asr_models.ready(model) { format!("{} · 已安装", model.label()) } else { format!("下载{}", model.label()) }, false)
-                .disabled(busy || self.asr_models.ready(model))
-                .on_click(cx.listener(move |this,_,_,cx| { this.prepare_asr_model(model); cx.notify(); }))))
-            .child(label("文件转录与断句校正模型"))
-            .child(div().flex().flex_wrap().gap_2().children(OfflineAsrModel::ALL.into_iter().enumerate().map(|(i, model)| {
-                button(("offline-asr-model", i), model.label(), self.config.offline_asr_model == model)
-                    .disabled(busy)
-                    .on_click(cx.listener(move |this,_,_,cx| { if !this.transcription_busy() && !this.active() { this.config.offline_asr_model = model; this.save(); } cx.notify(); }))
-            })))
-            .child(label("SenseVoice 支持中英日韩粤；Paraformer 支持中英及部分方言，轻量约 82 MB、标准约 227 MB。识别效果取决于录音，没有一种模型始终最好。"))
-            .child(button("download-selected-offline", if self.asr_models.ready(offline_model) { format!("{} · 已安装", offline_model.label()) } else { format!("下载{}", offline_model.label()) }, false)
-                .disabled(busy || self.asr_models.ready(offline_model))
-                .on_click(cx.listener(move |this,_,_,cx| { this.prepare_asr_model(offline_model); cx.notify(); })))
             .child(div().flex().flex_wrap().gap_2()
                 .child(button("punctuation-toggle", if self.config.transcription_punctuation { "自动标点：开启" } else { "自动标点：关闭" }, self.config.transcription_punctuation)
                     .disabled(busy)
@@ -4414,11 +4884,40 @@ impl Recorder {
             .when_some(plan, |d, plan| d.child(label(plan.kind.capabilities().description())))
             .child(label("断句校正使用所选文件模型，运行时占用更多资源；未安装时实时识别继续，长句或积压时保留流式原文。文件模型不使用实时热词，字幕时间为整句范围；Paraformer 不使用语言提示。"))
             .child(label("实时热词只使用当前模型词表支持的词；不支持的词会跳过，不再阻止识别。切换模型在下次任务生效。"))
-            .child(button("speech-vocabulary-settings", "配置全局词汇与语言", false).ghost().on_click(cx.listener(|this, _, _, cx| this.open_ai_settings(crate::settings::SettingsPage::Vocabulary, cx))))
             .child(button("stream-file-demo", "按原速试播所选模型", false).ghost().disabled(busy).on_click(cx.listener(|this,_,_,cx| this.choose_transcription_file(true,cx))));
         #[cfg(feature = "online-speaker")]
-        let view = view.child(self.online_speaker_settings(cx));
-        view
+        let detailed_options = detailed_options.child(self.online_speaker_settings(cx));
+        let advanced = advanced
+            .child(label(
+                plan.map(|p| p.description())
+                    .unwrap_or("所选实时模型尚不可用，请下载或切换模型"),
+            ))
+            .child(
+                div().flex().child(
+                    button(
+                        "recognition-details",
+                        if self.recognition_details_open {
+                            "收起高级选项"
+                        } else {
+                            "更多识别选项"
+                        },
+                        self.recognition_details_open,
+                    )
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.recognition_details_open = !this.recognition_details_open;
+                        cx.notify();
+                    })),
+                ),
+            )
+            .when(self.recognition_details_open, |d| d.child(detailed_options));
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(view)
+            .child(self.vocabulary_settings_view(cx))
+            .child(advanced)
     }
 
     #[cfg(feature = "online-speaker")]
@@ -4494,7 +4993,7 @@ impl Recorder {
 
 #[cfg(test)]
 mod model_output_tests {
-    use super::transcription_output;
+    use super::{read_transcript_snapshot, transcription_output};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -4527,6 +5026,35 @@ mod model_output_tests {
             transcription_output(&root, &source, true).unwrap(),
             original
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn readonly_snapshot_checks_identity_and_preserves_source() {
+        let root = std::env::temp_dir().join(format!(
+            "opencap-readonly-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("meeting.transcript.json");
+        let mut document = serde_json::to_value(opencap_asr::Transcript::default()).unwrap();
+        document["run"] = serde_json::json!({
+            "run_id":"old-run", "started_unix_ms":1, "application_version":"test",
+            "backend":"fixture", "runtime_version":"test", "model_id":"test", "provider":"cpu",
+            "threads":1, "requested_language":"zh", "requested_hotwords":"", "punctuation_requested":false,
+            "punctuation_effective":"off", "revision_scheduled":false, "input_kind":"file",
+            "state":"complete", "meeting_id":"old-meeting"
+        });
+        let original = serde_json::to_vec(&document).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let snapshot = read_transcript_snapshot(&path, Some("old-meeting")).unwrap();
+        assert_eq!(snapshot.run.unwrap().run_id, "old-run");
+        assert!(read_transcript_snapshot(&path, Some("other-meeting")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

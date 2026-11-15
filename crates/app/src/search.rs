@@ -265,6 +265,26 @@ pub(super) fn connect(path: &Path) -> Result<Connection> {
 
 /// Preserve the FTS row and its content while changing a meeting's location.
 /// Re-indexing changed title/content still happens in the normal scan.
+/// Re-key base paths after the entire storage root is relinked. FTS rows are
+/// content-linked by rowid and semantic chunks cascade from documents(base).
+pub(super) fn relink_root_index(path: &Path, mappings: &[(PathBuf, PathBuf)]) -> Result<()> {
+    if mappings.is_empty() {
+        return Ok(());
+    }
+    let mut connection = connect(path)?;
+    let transaction = connection.transaction()?;
+    for (old, new) in mappings {
+        let old = old.to_string_lossy();
+        let new = new.to_string_lossy();
+        transaction.execute(
+            "UPDATE documents SET base=?1 WHERE base=?2",
+            params![new.as_ref(), old.as_ref()],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 pub(super) fn relocate_index(path: &Path, moved: &opencap_core::RenamedMeeting) -> Result<()> {
     let mut connection = connect(path)?;
     let transaction = connection.transaction()?;

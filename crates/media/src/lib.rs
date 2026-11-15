@@ -20,4 +20,4 @@ pub fn initialize() -> anyhow::Result<()> {
     Ok(())
 }
 mod preview;
-pub use preview::RecordingPreview;
+pub use preview::{RecordingPreview, make_preview};

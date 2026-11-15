@@ -2,12 +2,15 @@
 extern crate gpui_kit as gpui;
 mod ai;
 mod ai_chat;
+#[cfg(feature = "ui-smoke")]
+mod design_check;
 mod live_notes;
 #[cfg(feature = "online-speaker")]
 mod online_speakers;
 #[cfg(feature = "internal-player")]
 mod player;
 mod recording;
+mod recording_preview;
 mod search;
 mod semantic;
 mod settings;
@@ -35,6 +38,23 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{collections::HashMap, path::PathBuf, rc::Rc, time::Duration};
 
 use ui::{ACCENT, BG, BORDER, MUTED, RED, SOFT, SURFACE, TEXT};
+
+actions!(opencap, [QuitApp]);
+
+struct RecorderHandle(Option<WeakEntity<Recorder>>);
+impl Global for RecorderHandle {}
+
+fn quit_app(_: &QuitApp, cx: &mut App) {
+    if let Some(entity) = cx
+        .try_global::<RecorderHandle>()
+        .and_then(|handle| handle.0.as_ref())
+        .and_then(WeakEntity::upgrade)
+    {
+        entity.update(cx, |this, cx| this.request_quit(cx));
+        return;
+    }
+    cx.quit();
+}
 
 struct Recorder {
     config: RecordingConfig,
@@ -70,6 +90,9 @@ struct Recorder {
     indicator_failed: bool,
     region_preview: bool,
     page_scroll: ScrollHandle,
+    recording_capture_scroll: ScrollHandle,
+    recording_config_scroll: ScrollHandle,
+    live_minutes_scroll: ScrollHandle,
     target_scroll: ScrollHandle,
     audio_picker: Option<AudioKind>,
     audio_scroll: ScrollHandle,
@@ -77,6 +100,8 @@ struct Recorder {
     boundary_started: Option<std::time::Instant>,
     preview_image: Option<std::sync::Arc<RenderImage>>,
     preview_pts: i64,
+    idle_preview: Option<recording_preview::IdlePreview>,
+    idle_preview_error: Option<String>,
     monitor: Option<opencap_platform::AudioMonitor>,
     monitor_maintenance_at: std::time::Instant,
     monitor_levels: (AudioRouteLevels, AudioRouteLevels),
@@ -107,6 +132,10 @@ struct Recorder {
     speaker_compare_version: Option<String>,
     speaker_compare_page: usize,
     transcript_view: Entity<transcript_view::TranscriptView>,
+    readonly_view: Entity<transcript_view::TranscriptView>,
+    home_detail_transcript: Entity<transcript_view::TranscriptView>,
+    home_detail_dirty: bool,
+    home_detail_new_document: bool,
     speakers_view: Entity<speakers::SpeakersView>,
     voice_busy: bool,
     transcript_dirty: bool,
@@ -121,6 +150,8 @@ struct Recorder {
     summary_task_base: Option<PathBuf>,
     summary_text: String,
     live_notes: Option<live_notes::Controller>,
+    live_notes_management_open: bool,
+    recording_token_usage: live_notes::RecordingTokenUsage,
     live_notes_status: String,
     live_archive_preview: Option<(PathBuf, String)>,
     live_archive_loading: bool,
@@ -174,6 +205,7 @@ struct Recorder {
     player_waveform_status: String,
     ai: ai::AiWorkspace,
     hotwords_input: Entity<InputState>,
+    recognition_details_open: bool,
     speaker_count: Entity<InputState>,
     speaker_threshold: Entity<InputState>,
     speaker_task: Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::Transcript>>>,
@@ -183,8 +215,11 @@ struct Recorder {
     text_document: Option<Entity<text_document::TextDocument>>,
     speaker_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     meeting_page: workspace::MeetingPage,
+    readonly_meeting: Option<workspace::ReadOnlyMeeting>,
+    readonly_load_generation: u64,
     meetings: Vec<workspace::MeetingFile>,
     meeting_list_page: usize,
+    meeting_collapsed_months: std::collections::BTreeSet<String>,
     meeting_selected_base: Option<PathBuf>,
     meeting_rows_scroll: ScrollHandle,
     meeting_list_focus: FocusHandle,
@@ -324,6 +359,8 @@ impl Recorder {
                 microphone: false,
                 exclude_app: false,
                 realtime_transcription: false,
+                // Rendering-only checks must not request screen capture.
+                show_recording_preview: !std::env::args().any(|arg| arg == "--ui-design-check"),
                 ..Default::default()
             };
         }
@@ -343,11 +380,7 @@ impl Recorder {
             if tray_available {
                 opencap_platform::show_native_window(hwnd, false);
             } else {
-                let _ = close_entity.update(cx, |this, cx| {
-                    this.quit_pending = true;
-                    this.request_recording_stop();
-                    cx.notify();
-                });
+                let _ = close_entity.update(cx, |this, cx| this.request_quit(cx));
             }
             false
         });
@@ -459,6 +492,9 @@ impl Recorder {
             indicator_failed: false,
             region_preview: false,
             page_scroll: ScrollHandle::new(),
+            recording_capture_scroll: ScrollHandle::new(),
+            recording_config_scroll: ScrollHandle::new(),
+            live_minutes_scroll: ScrollHandle::new(),
             target_scroll: ScrollHandle::new(),
             audio_picker: None,
             audio_scroll: ScrollHandle::new(),
@@ -466,12 +502,14 @@ impl Recorder {
             boundary_started: None,
             preview_image: None,
             preview_pts: 0,
+            idle_preview: None,
+            idle_preview_error: None,
             monitor: None,
             monitor_maintenance_at: std::time::Instant::now()
                 .checked_sub(Duration::from_secs(5))
                 .unwrap_or_else(std::time::Instant::now),
             monitor_levels: (AudioRouteLevels::default(), AudioRouteLevels::default()),
-            transcription_tab: !cfg!(feature = "ui-smoke"),
+            transcription_tab: false,
             asr: None,
             asr_live: false,
             revision_runtime: None,
@@ -552,6 +590,24 @@ impl Recorder {
                 .detach();
                 view
             },
+            readonly_view: cx.new(|_| {
+                let mut view = transcript_view::TranscriptView::new();
+                view.set_read_only();
+                view
+            }),
+            home_detail_transcript: {
+                let view = cx.new(|_| transcript_view::TranscriptView::new());
+                cx.subscribe(
+                    &view,
+                    |this, _, event: &transcript_view::ReviewSelection, cx| {
+                        this.select_sentence_review(event, cx)
+                    },
+                )
+                .detach();
+                view
+            },
+            home_detail_dirty: true,
+            home_detail_new_document: true,
             transcript_dirty: true,
             transcript_new_document: true,
             task_display_second: 0,
@@ -563,6 +619,8 @@ impl Recorder {
             summary_task_base: None,
             summary_text: String::new(),
             live_notes: None,
+            live_notes_management_open: false,
+            recording_token_usage: live_notes::RecordingTokenUsage::default(),
             live_notes_status: String::new(),
             live_archive_preview: None,
             live_archive_loading: false,
@@ -626,6 +684,7 @@ impl Recorder {
             player_waveform_status: String::new(),
             ai,
             hotwords_input,
+            recognition_details_open: false,
             speaker_count,
             speaker_threshold,
             speaker_task: None,
@@ -635,8 +694,11 @@ impl Recorder {
             text_document: None,
             speaker_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             meeting_page: workspace::MeetingPage::Library,
+            readonly_meeting: None,
+            readonly_load_generation: 0,
             meetings: Vec::new(),
             meeting_list_page: 0,
+            meeting_collapsed_months: std::collections::BTreeSet::new(),
             meeting_selected_base: None,
             meeting_rows_scroll: ScrollHandle::new(),
             meeting_list_focus: cx.focus_handle().tab_stop(true),
@@ -649,7 +711,7 @@ impl Recorder {
             pending_legacy_import_page: 0,
             meeting_search_input: {
                 let input = cx.new(|cx| {
-                    InputState::new(window, cx).placeholder("搜索标题、逐字稿、纪要和笔记")
+                    InputState::new(window, cx).placeholder("搜索会议标题、逐字稿、纪要或笔记…")
                 });
                 cx.subscribe(&input, |this, input, event, cx| {
                     if matches!(event, gpui::component::input::InputEvent::PressEnter { .. }) {
@@ -746,6 +808,19 @@ impl Recorder {
             self.stats.state = RecordingState::Stopping;
         }
     }
+    /// Single graceful quit entry used by the sidebar, tray, native menu and
+    /// Command+Q. The existing poll loop drains tasks before `cx.quit()`.
+    fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.quit_pending {
+            return;
+        }
+        self.persist_minutes_draft(cx);
+        self.persist_notes(cx);
+        self.quit_pending = true;
+        self.request_recording_stop();
+        opencap_platform::show_native_window(self.hwnd, true);
+        cx.notify();
+    }
     fn save(&mut self) {
         #[cfg(feature = "ui-smoke")]
         if smoke::isolated_dir().is_some() {
@@ -820,6 +895,8 @@ impl Recorder {
             self.indicator_failed = false;
             self.region_preview = false;
             self.boundary_started = None;
+            self.idle_preview.take();
+            self.idle_preview_error = None;
             if let Some(image) = self.preview_image.take() {
                 cx.drop_image(image, None);
             }
@@ -892,6 +969,12 @@ impl Recorder {
             } else {
                 self.start_live_asr()
             };
+            self.recording_token_usage = live_notes::RecordingTokenUsage::default();
+            self.live_notes_management_open = false;
+            if observer.is_some() {
+                self.recording_token_usage.run_id =
+                    self.transcript.run.as_ref().map(|run| run.run_id.clone());
+            }
             #[cfg(feature = "online-speaker")]
             let (observers, speaker_started) = {
                 let mut observers: Vec<_> = observer
@@ -966,6 +1049,8 @@ impl Recorder {
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
         let mut needs_render = false;
+        needs_render |= self.poll_idle_preview(cx);
+        needs_render |= self.poll_ai_models(cx);
         let task_second = if self.summary_task.is_some() || self.ai.correction_task.is_some() {
             self.ai_clock.elapsed().as_secs()
         } else if self.speaker_task.is_some() {
@@ -1016,8 +1101,7 @@ impl Recorder {
                     let _ = opencap_platform::open_path(&self.config.output_dir);
                 }
                 ShellEvent::Quit => {
-                    self.quit_pending = true;
-                    self.request_recording_stop();
+                    self.request_quit(cx);
                 }
                 ShellEvent::Locked => {
                     if self.active() {
@@ -1494,6 +1578,9 @@ impl Recorder {
         }
     }
     fn poll_audio_levels(&mut self, cx: &mut Context<Self>) {
+        if !self.config.monitor_levels {
+            return;
+        }
         let next = if self.active() {
             self.session.as_ref().map(RecordingSession::audio_levels)
         } else {
@@ -1976,7 +2063,7 @@ fn main() {
         _ => log::LevelFilter::Warn,
     };
     log::set_max_level(level);
-    let application = gpui::application().with_assets(gpui::assets::Assets);
+    let application = gpui::application().with_assets(gpui::assets::AllAssets);
     #[cfg(target_os = "macos")]
     let reopen_view = Rc::new(std::cell::Cell::new(0isize));
     #[cfg(target_os = "macos")]
@@ -1989,6 +2076,14 @@ fn main() {
     application.run(move |cx: &mut App| {
         gpui::init(cx);
         ui::init_theme(cx);
+        cx.on_action(quit_app);
+        #[cfg(target_os = "macos")]
+        {
+            cx.bind_keys([KeyBinding::new("cmd-q", QuitApp, None)]);
+            cx.set_menus(
+                [Menu::new(app_name()).items([MenuItem::action("退出 OpenCap", QuitApp)])],
+            );
+        }
         let initial_size = size(px(1200.), px(820.));
         #[cfg(feature = "ui-smoke")]
         let initial_size = smoke::preview_size().unwrap_or(initial_size);
@@ -2014,6 +2109,7 @@ fn main() {
             )
             .expect("Create recorder window");
         let entity = main_entity.expect("recorder entity");
+        cx.set_global(RecorderHandle(Some(entity.downgrade())));
         #[cfg(target_os = "macos")]
         reopen_view.set(entity.read(cx).hwnd);
         let weak = entity.downgrade();
@@ -2095,7 +2191,11 @@ fn main() {
         #[cfg(feature = "ui-smoke")]
         smoke::scroll_benchmark(main_window, entity.clone(), cx);
         #[cfg(feature = "ui-smoke")]
+        design_check::run(main_window, entity.clone(), cx);
+        #[cfg(feature = "ui-smoke")]
         ai::chat_benchmark(main_window, entity.clone(), cx);
+        #[cfg(feature = "ui-smoke")]
+        ai::correction_benchmark(main_window, entity.clone(), cx);
         #[cfg(feature = "ui-smoke")]
         if let Some(path) = smoke::output_dir() {
             smoke::run(main_window, entity, path, cx);

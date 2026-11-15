@@ -1867,26 +1867,39 @@ pub fn request_live_notes(
     request: &LiveNotesRequest,
     cancelled: &AtomicBool,
 ) -> Result<NoteProposal> {
-    config.validate()?;
-    ensure!(
-        config.is_local() || !key.trim().is_empty(),
-        "请先配置 AI 密钥"
-    );
-    let client = crate::summary::AiClient::new(config, key)?;
-    let body = serde_json::to_string(request)?;
-    // Count the actual serialized request, including citations, labels and
-    // completion metadata; source text alone is not an upper bound.
-    ensure!(
-        body.len() <= 1_000_000,
-        "实时纪要请求超过 1 MB；已有正文保留，请先减少来源或分段整理"
-    );
-    let text = client.generate(
-        LIVE_SYSTEM,
-        &format!("input_complete 为 false、input_cancelled 为 true 或 input_gaps 非空时，来源不完整；不要暗示覆盖整场会议。timing_precision 为 unavailable 时该句时间不可用，不要将其解释为可定位时间。\n<待分析资料>\n{body}\n</待分析资料>"),
-        cancelled,
-    )?;
-    crate::summary::check_cancel(cancelled)?;
-    serde_json::from_str(&text).context("实时纪要返回内容不是有效的约定 JSON；已有正文保留")
+    request_live_notes_with_usage(config, key, request, cancelled).0
+}
+
+/// Return service-reported token usage even if its generated JSON is invalid.
+pub fn request_live_notes_with_usage(
+    config: &AiConfig,
+    key: &str,
+    request: &LiveNotesRequest,
+    cancelled: &AtomicBool,
+) -> (Result<NoteProposal>, Option<crate::AiTokenUsage>) {
+    let mut usage = None;
+    let result = (|| {
+        config.validate()?;
+        ensure!(
+            config.is_local() || !key.trim().is_empty(),
+            "请先配置 AI 密钥"
+        );
+        let client = crate::summary::AiClient::new(config, key)?;
+        let body = serde_json::to_string(request)?;
+        ensure!(
+            body.len() <= 1_000_000,
+            "实时纪要请求超过 1 MB；已有正文保留，请先减少来源或分段整理"
+        );
+        let text = client.generate_with_usage(
+            LIVE_SYSTEM,
+            &format!("input_complete 为 false、input_cancelled 为 true 或 input_gaps 非空时，来源不完整；不要暗示覆盖整场会议。timing_precision 为 unavailable 时该句时间不可用，不要将其解释为可定位时间。\n<待分析资料>\n{body}\n</待分析资料>"),
+            cancelled,
+            &mut usage,
+        )?;
+        crate::summary::check_cancel(cancelled)?;
+        serde_json::from_str(&text).context("实时纪要返回内容不是有效的约定 JSON；已有正文保留")
+    })();
+    (result, usage)
 }
 
 #[cfg(test)]

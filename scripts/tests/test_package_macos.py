@@ -51,6 +51,14 @@ class PackageMacosTests(unittest.TestCase):
         self.assertEqual(parser.parse_args([]).profile, "release")
         self.assertEqual(parser.parse_args(["--release"]).profile, "release")
         self.assertEqual(parser.parse_args(["--profile", "debug"]).profile, "debug")
+        args = parser.parse_args(["--dev", "--no-build", "--binary", "/tmp/opencap"])
+        self.assertEqual(args.binary, "/tmp/opencap")
+
+    def test_custom_binary_cannot_be_used_for_a_release_or_during_build(self):
+        with self.assertRaisesRegex(SystemExit, "requires --dev and --no-build"):
+            package_macos.package("debug", "-", build=False, binary_override="/tmp/opencap")
+        with self.assertRaisesRegex(SystemExit, "requires --dev and --no-build"):
+            package_macos.package("debug", "-", dev=True, binary_override="/tmp/opencap")
 
     def test_running_default_gets_unique_safe_paths(self):
         with patch.object(package_macos, "running_pids", return_value=["99"]), contextlib.redirect_stdout(io.StringIO()):
@@ -78,9 +86,30 @@ class PackageMacosTests(unittest.TestCase):
     def package_with(self, side_effect, builder=None):
         with patch.object(package_macos, "__file__", str(self.root / "scripts/package-macos.py")), \
              patch.object(package_macos, "running_pids", side_effect=side_effect), \
+             patch.object(package_macos, "run", return_value="OpenCap\n"), \
              patch.object(package_macos, "build_bundle", side_effect=builder or self.fake_bundle), \
              contextlib.redirect_stdout(io.StringIO()):
             package_macos.package("release", "-", build=False)
+
+    def test_developer_bundle_uses_explicit_shared_cache_binary(self):
+        binary = self.root / "target/debug/opencap"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("shared debug executable")
+        destination = self.root / "Preview.app"
+
+        def build_dev(root, source, staging, identity, dev=False):
+            self.assertTrue(dev)
+            self.assertEqual(source, binary.resolve())
+            return self.fake_bundle(root, source, staging, identity)
+
+        with patch.object(package_macos, "__file__", str(self.root / "scripts/package-macos.py")), \
+             patch.object(package_macos, "running_pids", return_value=[]), \
+             patch.object(package_macos, "run", return_value="OpenCap Dev\n"), \
+             patch.object(package_macos, "build_bundle", side_effect=build_dev), \
+             contextlib.redirect_stdout(io.StringIO()):
+            package_macos.package("debug", "-", build=False, output=str(destination), dev=True,
+                                  binary_override=str(binary))
+        self.assertEqual((destination / "new-version").read_text(), "shared debug executable")
 
     def test_running_app_is_preserved_and_new_bundle_is_separate(self):
         self.package_with([["99"], []])

@@ -337,20 +337,30 @@ struct PlayerResume {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum MeetingPage {
     Library,
+    ReadOnly,
     Transcript,
     Minutes,
     Notes,
+}
+pub(super) struct ReadOnlyMeeting {
+    base: PathBuf,
+    title: String,
+    pub(super) loading: bool,
+    pub(super) error: Option<String>,
 }
 #[derive(Clone)]
 pub(super) struct MeetingFile {
     pub base: PathBuf,
     pub media: Option<PathBuf>,
+    pub(super) media_items: Vec<MeetingMedia>,
     media_is_candidate: bool,
     relink_asset_id: Option<String>,
     relink_is_candidate: bool,
     manifest_meeting_id: Option<String>,
     manifest_fingerprint: Option<opencap_core::MediaFingerprint>,
     pub modified: std::time::SystemTime,
+    /// Recording start from the report when its basis is trustworthy; else None.
+    pub recording_started_ms: Option<u64>,
     available: bool,
     summary_available: bool,
     media_available: Option<bool>,
@@ -367,8 +377,62 @@ pub(super) struct MeetingFile {
     details: String,
     display_stamp: String,
 }
+#[derive(Clone)]
+pub(super) struct MeetingMedia {
+    pub path: PathBuf,
+    pub role: String,
+    pub available: bool,
+}
+
+fn list_meeting_media(
+    base: &Path,
+    manifest: Option<&opencap_core::MeetingManifest>,
+    fallback: Option<&Path>,
+) -> Vec<MeetingMedia> {
+    let mut items = Vec::new();
+    if let Some(manifest) = manifest {
+        for asset in &manifest.assets {
+            if !opencap_core::is_input_media_asset(asset) && asset.role != "candidate_media" {
+                continue;
+            }
+            if let Ok(Some(path)) =
+                opencap_core::resolve_asset_in_manifest(base, manifest, &asset.asset_id)
+                && !items.iter().any(|item: &MeetingMedia| item.path == path)
+            {
+                let available = path.is_file();
+                items.push(MeetingMedia {
+                    path,
+                    role: asset.role.clone(),
+                    available,
+                });
+            }
+        }
+    } else {
+        if let Some(path) = fallback {
+            items.push(MeetingMedia {
+                path: path.to_path_buf(),
+                role: "source_media".into(),
+                available: path.is_file(),
+            });
+        }
+        // Older meetings have no manifest. Show same-name files as candidates,
+        // without claiming that their timelines match the transcript.
+        for extension in ["mp4", "m4a", "mov", "wav", "mp3"] {
+            let path = base.with_extension(extension);
+            if path.is_file() && !items.iter().any(|item| item.path == path) {
+                items.push(MeetingMedia {
+                    path,
+                    role: "same_name_media".into(),
+                    available: true,
+                });
+            }
+        }
+    }
+    items
+}
 impl MeetingFile {
     /// True when the list can open this meeting's transcript and internal player.
+    #[cfg(feature = "ui-smoke")]
     pub(super) fn reviewable(&self) -> bool {
         self.transcript_available && self.media_available == Some(true) && !self.media_is_candidate
     }
@@ -390,7 +454,7 @@ impl MeetingFile {
     }
     fn status(&self) -> String {
         if !self.available {
-            return "会议文件暂不可访问 · 原索引已保留".into();
+            return "文件缺失 · 可重新定位".into();
         }
         let parts = [
             match self.complete {
@@ -411,7 +475,7 @@ impl MeetingFile {
         ]
         .join("  ·  ");
         let parts = if self.media_available == Some(false) {
-            format!("{parts}  ·  原媒体暂不可访问")
+            format!("{parts}  ·  原媒体缺失 · 可重新定位")
         } else {
             parts
         };
@@ -420,6 +484,88 @@ impl MeetingFile {
             .unwrap_or(parts)
     }
 }
+/// Local calendar month used by the library accordion. A trusted recording
+/// start is preferred; modified time is only a visible fallback.
+pub(super) fn meeting_month(meeting: &MeetingFile) -> String {
+    let ms = meeting.recording_started_ms.unwrap_or_else(|| {
+        meeting
+            .modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    });
+    month_from_ms(ms)
+}
+
+fn meeting_group_key(meeting: &MeetingFile, weekly: bool) -> String {
+    if !weekly {
+        return meeting_month(meeting);
+    }
+    let time = meeting
+        .recording_started_ms
+        .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+        .unwrap_or(meeting.modified);
+    week_key_for_time(time)
+}
+
+fn week_key_for_time(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(time)
+        .format("%G-W%V")
+        .to_string()
+}
+
+fn meeting_group_label(key: &str, weekly: bool) -> String {
+    if weekly {
+        key.split_once("-W")
+            .and_then(|(year, week)| {
+                week.parse::<u32>()
+                    .ok()
+                    .map(|week| format!("{year} 年第 {week} 周"))
+            })
+            .unwrap_or_else(|| key.to_owned())
+    } else {
+        month_label(key)
+    }
+}
+
+fn month_from_ms(ms: u64) -> String {
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+    chrono::DateTime::<chrono::Local>::from(time)
+        .format("%Y-%m")
+        .to_string()
+}
+
+pub(super) fn month_label(key: &str) -> String {
+    key.split_once('-')
+        .and_then(|(year, month)| {
+            month
+                .parse::<u32>()
+                .ok()
+                .map(|month| format!("{year}年{month}月"))
+        })
+        .unwrap_or_else(|| key.to_owned())
+}
+
+/// Read a recording start only when the report states the media-origin basis.
+/// This is intentionally stricter than the UI timestamp used for display.
+fn meeting_recording_started_ms(base: &Path) -> Option<u64> {
+    let path = base.with_extension("recording.json");
+    let bytes = search::source_bytes_cancellable(&path, None)
+        .ok()
+        .flatten()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if value.get("recording_start_basis").and_then(|v| v.as_str())
+        != Some("wall clock observed at media timeline origin")
+    {
+        return None;
+    }
+    value
+        .get("recording_started_unix_ms")
+        .and_then(|v| v.as_u64())
+        .filter(|ms| *ms > 0)
+}
+
 fn index_path() -> PathBuf {
     #[cfg(feature = "ui-smoke")]
     if let Some(path) = smoke::isolated_dir() {
@@ -692,12 +838,14 @@ fn discover_paths_cached(
                 display_stamp: String::new(),
                 base,
                 media: None,
+                media_items: Vec::new(),
                 media_is_candidate: false,
                 relink_asset_id: None,
                 relink_is_candidate: false,
                 manifest_meeting_id: None,
                 manifest_fingerprint: None,
                 modified: std::time::UNIX_EPOCH,
+                recording_started_ms: None,
                 available: false,
                 summary_available: false,
                 media_available: None,
@@ -775,6 +923,13 @@ fn discover_paths_cached(
             cached.available = true;
             cached.summary_available = base.with_extension("summary.md").exists();
             cached.transcript_available = transcript.exists();
+            if cached.manifest_present {
+                for item in &mut cached.media_items {
+                    item.available = item.path.is_file();
+                }
+            } else {
+                cached.media_items = list_meeting_media(&base, None, cached.media.as_deref());
+            }
             files.push(cached);
             continue;
         }
@@ -973,15 +1128,23 @@ fn discover_paths_cached(
             .as_ref()
             .map(|manifest| manifest.meeting_id.clone());
         let transcript_available = transcript.exists();
+        let recording_started_ms = meeting_recording_started_ms(&base);
+        let media_items = if meeting_identity_mismatch {
+            Vec::new()
+        } else {
+            list_meeting_media(&base, manifest.as_ref(), media.as_deref())
+        };
         files.push(MeetingFile {
             base,
             media,
+            media_items,
             media_is_candidate,
             relink_asset_id,
             relink_is_candidate,
             manifest_meeting_id,
             manifest_fingerprint,
             modified,
+            recording_started_ms,
             available: true,
             summary_available,
             media_available,
@@ -1126,9 +1289,6 @@ fn meeting_details(
 fn card() -> Div {
     ui::card()
 }
-pub(super) fn heading(title: &str, description: &str) -> Div {
-    ui::heading(title, description)
-}
 fn copy_export(
     source: &Path,
     destination: &Path,
@@ -1194,6 +1354,174 @@ impl Recorder {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    /// Re-point remembered meeting paths after a storage root move. Old paths
+    /// that cannot be found under the new root remain listed as missing.
+    fn apply_library_relink(
+        &mut self,
+        old_root: &Path,
+        new_root: &Path,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<(usize, usize)> {
+        let mut mappings = Vec::new();
+        for meeting in &self.meetings {
+            let Ok(relative) = meeting.base.strip_prefix(old_root) else {
+                continue;
+            };
+            let candidate = new_root.join(relative);
+            if candidate.with_extension("transcript.json").exists()
+                || candidate.with_extension("recording.json").exists()
+            {
+                mappings.push((meeting.base.clone(), candidate));
+            }
+        }
+        if mappings.is_empty() {
+            anyhow::bail!("新目录下没有找到可重新关联的会议");
+        }
+        let path = index_path();
+        if let Some(bytes) = search::source_bytes_cancellable(&path, None)? {
+            let mut paths: Vec<PathBuf> = serde_json::from_slice(&bytes)?;
+            for old in paths.iter_mut() {
+                if let Some((_, new)) = mappings.iter().find(|(from, _)| from == old) {
+                    *old = new.clone();
+                }
+            }
+            opencap_asr::atomic_write(&path, &serde_json::to_vec(&paths)?)?;
+        }
+        search::relink_root_index(&search_index_path(), &mappings)?;
+        for (old, new) in &mappings {
+            if self.transcript_output.as_ref() == Some(old) {
+                self.transcript_output = Some(new.clone());
+            }
+            if let Some(source) = &self.transcript.source
+                && source.starts_with(old_root)
+                && let Ok(relative) = source.strip_prefix(old_root)
+            {
+                self.transcript.source = Some(new_root.join(relative));
+            }
+        }
+        self.config.output_dir = new_root.to_path_buf();
+        self.save();
+        self.refresh_meetings();
+        cx.notify();
+        Ok((
+            mappings.len(),
+            self.meetings.len().saturating_sub(mappings.len()),
+        ))
+    }
+
+    pub(super) fn choose_relink_library_root(&mut self, cx: &mut Context<Self>) {
+        if self.active() || self.meeting_task_busy() || self.quit_pending {
+            self.message = "请先结束录制和其他会议任务，再重新定位存储根目录。".into();
+            cx.notify();
+            return;
+        }
+        let old_root = self.config.output_dir.clone();
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择会议存储库的新根目录；原文件不会被移动".into()),
+        });
+        cx.spawn(async move |entity, cx| {
+            if let Ok(Ok(Some(paths))) = prompt.await
+                && let Some(new_root) = paths.first().cloned()
+            {
+                let _ = entity.update(cx, |this, cx| {
+                    match this.apply_library_relink(&old_root, &new_root, cx) {
+                        Ok((mapped, missing)) => {
+                            this.message = format!(
+                                "已重新关联 {mapped} 场会议；{missing} 场仍未找到，保留为缺失条目。"
+                            );
+                        }
+                        Err(error) => {
+                            this.message = format!("重新定位存储根目录失败：{error:#}");
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn choose_relink_meeting(&mut self, old_base: PathBuf, cx: &mut Context<Self>) {
+        if self.active() || self.meeting_task_busy() || self.quit_pending {
+            self.message = "请先结束录制和其他会议任务，再重新定位会议。".into();
+            cx.notify();
+            return;
+        }
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择这场会议的新文件夹（包含同名转写或录制报告）".into()),
+        });
+        cx.spawn(async move |entity, cx| {
+            if let Ok(Ok(Some(paths))) = prompt.await
+                && let Some(folder) = paths.first().cloned()
+            {
+                let _ = entity.update(cx, |this, cx| {
+                    let Some(name) = folder
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                    else {
+                        this.message = "所选目录名称无效。".into();
+                        cx.notify();
+                        return;
+                    };
+                    let new_base = folder.join(&name);
+                    if !new_base.with_extension("transcript.json").exists()
+                        && !new_base.with_extension("recording.json").exists()
+                    {
+                        this.message = "所选目录中没有找到同名会议转写或录制报告。".into();
+                        cx.notify();
+                        return;
+                    }
+                    let old_id = opencap_core::meeting_manifest(&old_base)
+                        .ok()
+                        .flatten()
+                        .map(|manifest| manifest.meeting_id);
+                    if let Ok(Some(new_manifest)) = opencap_core::meeting_manifest(&new_base)
+                        && old_id.as_deref() != Some(new_manifest.meeting_id.as_str())
+                    {
+                        this.message = "所选会议身份与要重新定位的会议不一致。".into();
+                        cx.notify();
+                        return;
+                    }
+                    let path = index_path();
+                    if let Some(bytes) =
+                        search::source_bytes_cancellable(&path, None).ok().flatten()
+                        && let Ok(mut paths) = serde_json::from_slice::<Vec<PathBuf>>(&bytes)
+                    {
+                        for path in &mut paths {
+                            if *path == old_base {
+                                *path = new_base.clone();
+                            }
+                        }
+                        let _ = opencap_asr::atomic_write(
+                            &path,
+                            &serde_json::to_vec(&paths).unwrap_or_default(),
+                        );
+                    }
+                    let _ = search::relink_root_index(
+                        &search_index_path(),
+                        &[(old_base.clone(), new_base.clone())],
+                    );
+                    if this.transcript_output.as_ref() == Some(&old_base) {
+                        this.transcript_output = Some(new_base.clone());
+                    }
+                    if this.meeting_selected_base.as_ref() == Some(&old_base) {
+                        this.meeting_selected_base = Some(new_base.clone());
+                    }
+                    this.message = "已重新定位会议；原文件未被移动。".into();
+                    this.refresh_meetings();
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn choose_relink_media(
         &mut self,
         base: PathBuf,
@@ -3505,10 +3833,131 @@ impl Recorder {
     pub(super) fn meeting_workspace(&self, width: f32, height: f32, cx: &Context<Self>) -> Div {
         match self.meeting_page {
             MeetingPage::Library => self.library_view(width, height, cx),
+            MeetingPage::ReadOnly => self.readonly_meeting_view(cx),
             MeetingPage::Transcript => self.transcription_view(width, cx),
             MeetingPage::Minutes => self.minutes_view(width, height, cx),
             MeetingPage::Notes => self.notes_view(cx),
         }
+    }
+
+    fn readonly_meeting_view(&self, cx: &Context<Self>) -> Div {
+        let Some(meeting) = self.readonly_meeting.as_ref() else {
+            return div().child(label("未选择会议。"));
+        };
+        let mut content = div()
+            .h_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        button("readonly-back-library", "返回会议文件", false)
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.readonly_load_generation =
+                                    this.readonly_load_generation.wrapping_add(1);
+                                this.readonly_meeting = None;
+                                this.meeting_page = MeetingPage::Library;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(meeting.title.clone()),
+                    )
+                    .child(ui::badge("只读", ACCENT, SOFT))
+                    .child(
+                        button("readonly-return-recording", "返回录制", false)
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.transcription_tab = false;
+                                this.settings = false;
+                                this.page_scroll.set_offset(point(px(0.), px(0.)));
+                                cx.notify();
+                            })),
+                    ),
+            );
+        if meeting.loading {
+            content = content.child(label("正在读取逐字稿…"));
+        } else if let Some(error) = meeting.error.as_ref() {
+            content = content.child(label(format!("无法读取逐字稿：{error}")));
+        } else {
+            content = content.child(
+                ui::card()
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(self.readonly_view.clone()),
+            );
+        }
+        content
+    }
+
+    pub(super) fn open_readonly_library_meeting(
+        &mut self,
+        meeting: MeetingFile,
+        cx: &mut Context<Self>,
+    ) {
+        if !meeting.transcript_available {
+            self.message = "此会议没有可查看的逐字稿。".into();
+            cx.notify();
+            return;
+        }
+        let base = meeting.base.clone();
+        let path = base.with_extension("transcript.json");
+        let expected_id = meeting.manifest_meeting_id.clone();
+        self.readonly_load_generation = self.readonly_load_generation.wrapping_add(1);
+        let generation = self.readonly_load_generation;
+        self.readonly_meeting = Some(ReadOnlyMeeting {
+            base: base.clone(),
+            title: meeting.title(),
+            loading: true,
+            error: None,
+        });
+        self.settings = false;
+        self.transcription_tab = true;
+        self.meeting_page = MeetingPage::ReadOnly;
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    transcription::read_transcript_snapshot(&path, expected_id.as_deref())
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.readonly_load_generation != generation
+                    || this.meeting_page != MeetingPage::ReadOnly
+                    || this
+                        .readonly_meeting
+                        .as_ref()
+                        .is_none_or(|meeting| meeting.base != base)
+                {
+                    return;
+                }
+                if let Some(meeting) = this.readonly_meeting.as_mut() {
+                    meeting.loading = false;
+                    match result {
+                        Ok(transcript) => this
+                            .readonly_view
+                            .update(cx, |view, cx| view.replace(&transcript, true, false, cx)),
+                        Err(error) => meeting.error = Some(format!("{error:#}")),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
     fn select_library_meeting(&mut self, base: PathBuf) {
         if self.meeting_selected_base.as_ref() != Some(&base)
@@ -3547,8 +3996,8 @@ impl Recorder {
     }
 
     pub(super) fn open_library_meeting_for_review(&mut self, base: &Path, cx: &mut Context<Self>) {
-        if self.quit_pending || self.active() {
-            self.message = "录制或退出期间不能切换逐字稿或启动回放。".into();
+        if self.quit_pending {
+            self.message = "退出期间不能打开会议。".into();
             return;
         }
         let Some(meeting) = self
@@ -3560,6 +4009,10 @@ impl Recorder {
             self.message = "会议列表已变化，请重新选择。".into();
             return;
         };
+        if self.active() {
+            self.open_readonly_library_meeting(meeting, cx);
+            return;
+        }
         let transcript = meeting
             .transcript_available
             .then(|| meeting.base.with_extension("transcript.json"));
@@ -3634,12 +4087,18 @@ impl Recorder {
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .child(heading(
-                        "会议文件",
-                        "每一场会议的原文、纪要和笔记，集中在这里。",
-                    ))
+                    .gap_2()
+                    .child(
+                        div().flex_1().min_w(px(200.)).child(
+                            gpui::component::input::Input::new(&self.meeting_search_input)
+                                .prefix(
+                                    ui::icon(gpui::component::IconName::Search)
+                                        .size(px(16.))
+                                        .text_color(rgb(MUTED)),
+                                )
+                                .w_full(),
+                        ),
+                    )
                     .child(
                         primary_button("import-meeting", "导入音频 / 视频")
                             .icon(gpui::component::IconName::Plus)
@@ -3647,27 +4106,26 @@ impl Recorder {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.choose_transcription_file(false, cx)
                             })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(gpui::component::input::Input::new(&self.meeting_search_input).flex_1())
-                    .child(
-                        button("search-meetings", "搜索", false).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                let query = this.meeting_search_input.read(cx).value().to_string();
-                                this.start_meeting_search(query);
-                                cx.notify();
-                            },
-                        )),
                     )
                     .child(
-                        button(
+                        ui::icon_button(
+                            "search-meetings",
+                            gpui::component::IconName::Search,
+                            "搜索会议",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let query = this.meeting_search_input.read(cx).value().to_string();
+                            this.start_meeting_search(query);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        ui::icon_button(
                             "toggle-meeting-filters",
-                            "筛选",
+                            gpui::assets::IconName::ListFilter,
+                            "筛选会议",
+                        )
+                        .selected(
                             self.meeting_filter_open || !self.meeting_search_filters.is_empty(),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3681,18 +4139,79 @@ impl Recorder {
                             .is_some_and(|query| !query.is_empty()),
                         |d| {
                             d.child(
-                                button("clear-meeting-search", "清除搜索词", false)
-                                    .ghost()
-                                    .on_click(cx.listener(|this, _, window, cx| {
+                                ui::icon_button(
+                                    "clear-meeting-search",
+                                    gpui::assets::IconName::X,
+                                    "清除搜索词",
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
                                         this.meeting_search_input.update(cx, |input, cx| {
                                             input.set_value("", window, cx)
                                         });
                                         this.start_meeting_search(String::new());
                                         cx.notify();
-                                    })),
+                                    },
+                                )),
                             )
                         },
                     ),
+            )
+            .when(
+                self.meetings
+                    .iter()
+                    .any(|meeting| !meeting.available || meeting.media_available == Some(false)),
+                |d| {
+                    let count = self
+                        .meetings
+                        .iter()
+                        .filter(|meeting| {
+                            !meeting.available || meeting.media_available == Some(false)
+                        })
+                        .count();
+                    let first_missing = self
+                        .meetings
+                        .iter()
+                        .find(|meeting| !meeting.available)
+                        .map(|meeting| meeting.base.clone());
+                    d.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(ui::badge(
+                                format!("{count} 场文件或媒体缺失"),
+                                0x9a5a10,
+                                0xfff4e7,
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .when_some(first_missing, |row, base| {
+                                        row.child(
+                                            button("relink-first-missing", "逐场重新定位…", false)
+                                                .ghost()
+                                                .disabled(self.meeting_task_busy() || self.active())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.choose_relink_meeting(base.clone(), cx);
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        button("relink-library-root", "重新定位目录…", false)
+                                            .ghost()
+                                            .disabled(self.meeting_task_busy() || self.active())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.choose_relink_library_root(cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
             )
             .when(self.meeting_filter_open, |d| {
                 d.child(self.meeting_filter_panel(cx))
@@ -3702,59 +4221,6 @@ impl Recorder {
                     .as_ref()
                     .and_then(|result| result.notice.clone()),
                 |d, notice| d.child(label(notice)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(label(if self.meeting_search_query.is_some() {
-                        self.meeting_search_result
-                            .as_ref()
-                            .map(|result| {
-                                if result.semantic_model.is_some() && !result.semantic_fallback {
-                                    format!("{} 场候选 · 混合相关度排序", result.total)
-                                } else {
-                                    format!("{} 场会议匹配 · 最近更新优先", result.total)
-                                }
-                            })
-                            .unwrap_or_else(|| {
-                                if self.meeting_search_task.is_some() {
-                                    "正在搜索会议…".into()
-                                } else {
-                                    "搜索未完成，请重试。".into()
-                                }
-                            })
-                    } else {
-                        format!("共 {} 场会议 · 最近更新优先", self.meetings.len())
-                    }))
-                    .child(
-                        button(
-                            "meeting-density",
-                            if self.config.meeting_list_compact {
-                                "紧凑列表"
-                            } else {
-                                "普通列表"
-                            },
-                            self.config.meeting_list_compact,
-                        )
-                        .ghost()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.config.meeting_list_compact = !this.config.meeting_list_compact;
-                            this.save();
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        button("refresh-meetings", "刷新", false)
-                            .icon(gpui::component::IconName::RefreshCw)
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.refresh_meetings();
-                                cx.notify();
-                            })),
-                    ),
             )
             .when(self.meeting_scan.is_some(), |d| {
                 d.child(
@@ -3774,13 +4240,19 @@ impl Recorder {
             })
             .when(self.transcription_busy(), |d| {
                 d.child(
-                    card()
-                        .bg(rgb(SOFT))
-                        .child(ui::section_title(
-                            "正在处理会议",
-                            &self.transcription_status,
-                        ))
-                        .child(button("current-task", "查看当前任务", false).on_click(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(ui::badge("处理中", ACCENT, SOFT))
+                        .child(
+                            label(self.transcription_status.clone())
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate(),
+                        )
+                        .child(button("current-task", "查看", false).ghost().on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.meeting_page = MeetingPage::Transcript;
                                 cx.notify();
@@ -3792,9 +4264,7 @@ impl Recorder {
                 d.child(label("正在后台读取逐字稿…"))
             })
             .when(self.active(), |d| {
-                d.child(label(
-                    "录制期间暂停从会议库启动原媒体播放，以免系统声音被录入；请先结束录制。",
-                ))
+                d.child(label("录制中可查看其他逐字稿；播放需先停止录制。"))
             })
             .when_some(self.audio_export_job.as_ref(), |d, (base, _, cancel, _)| {
                 let expected = cancel.clone();
@@ -4066,6 +4536,10 @@ impl Recorder {
             );
         }
         let page_start = self.meeting_list_page * MEETINGS_PER_PAGE;
+        let weekly = self.config.meeting_group_by_week;
+        let grouped = (self.config.meeting_group_by_month || weekly)
+            && self.meeting_search_result.is_none()
+            && self.meeting_search_query.is_none();
         let rows: Vec<_> = if let Some(result) = &self.meeting_search_result {
             result
                 .hits
@@ -4080,6 +4554,31 @@ impl Recorder {
                 .collect()
         } else if self.meeting_search_query.is_some() {
             Vec::new()
+        } else if grouped {
+            let mut all: Vec<_> = self.meetings.iter().enumerate().collect();
+            all.sort_by(|(_, left), (_, right)| {
+                meeting_group_key(right, weekly)
+                    .cmp(&meeting_group_key(left, weekly))
+                    .then_with(|| {
+                        let l = left.recording_started_ms.unwrap_or_else(|| {
+                            left.modified
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64
+                        });
+                        let r = right.recording_started_ms.unwrap_or_else(|| {
+                            right
+                                .modified
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64
+                        });
+                        r.cmp(&l)
+                    })
+            });
+            all.into_iter()
+                .map(|(index, meeting)| (index, meeting, None))
+                .collect()
         } else {
             self.meetings
                 .iter()
@@ -4096,6 +4595,12 @@ impl Recorder {
         {
             view = view.child(label("没有找到匹配的会议。"));
         }
+        let is_visible = |meeting: &MeetingFile| {
+            !grouped
+                || !self
+                    .meeting_collapsed_months
+                    .contains(&meeting_group_key(meeting, weekly))
+        };
         let selected_base = self
             .meeting_selected_base
             .as_ref()
@@ -4104,6 +4609,7 @@ impl Recorder {
             .or_else(|| rows.first().map(|(_, meeting, _)| meeting.base.clone()));
         let visible_bases: Vec<_> = rows
             .iter()
+            .filter(|(_, meeting, _)| is_visible(meeting))
             .map(|(_, meeting, _)| meeting.base.clone())
             .collect();
         #[cfg(feature = "internal-player")]
@@ -4180,7 +4686,75 @@ impl Recorder {
         }
         let mut rows_view = div().w_full().flex().flex_col().gap_1();
         let mut detail_view: Option<Div> = None;
+        let mut last_month: Option<String> = None;
+        let mut visible_row_positions = Vec::new();
+        let mut row_position = 0usize;
         for (i, meeting, hit) in rows {
+            if grouped {
+                let month = meeting_group_key(meeting, weekly);
+                if last_month.as_deref() != Some(month.as_str()) {
+                    let collapsed = self.meeting_collapsed_months.contains(&month);
+                    let group_count = self
+                        .meetings
+                        .iter()
+                        .filter(|other| meeting_group_key(other, weekly) == month)
+                        .count();
+                    let month_for_click = month.clone();
+                    rows_view = rows_view.child(
+                        Button::new(("meeting-month", i))
+                            .accessibility_label(format!(
+                                "{}，{}场，{}",
+                                meeting_group_label(&month, weekly),
+                                group_count,
+                                if collapsed { "已收起" } else { "已展开" }
+                            ))
+                            .ghost()
+                            .w_full()
+                            .h(px(40.))
+                            .px_2()
+                            .rounded_md()
+                            .bg(rgb(0xf8fafd))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.meeting_collapsed_months.remove(&month_for_click) {
+                                    this.meeting_collapsed_months
+                                        .insert(month_for_click.clone());
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                ui::icon(if collapsed {
+                                                    gpui::component::IconName::ChevronRight
+                                                } else {
+                                                    gpui::component::IconName::ChevronDown
+                                                })
+                                                .size(px(14.)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(meeting_group_label(&month, weekly)),
+                                            ),
+                                    )
+                                    .child(label(format!("{group_count} 场"))),
+                            ),
+                    );
+                    row_position += 1;
+                    last_month = Some(month.clone());
+                }
+            }
             let row_base = meeting.base.clone();
             let selected_row = selected_base.as_ref() == Some(&meeting.base);
             let subtitle = hit
@@ -4196,71 +4770,94 @@ impl Recorder {
                         hit.excerpt.replace('\n', " ")
                     )
                 })
-                .unwrap_or_else(|| meeting.status());
+                .unwrap_or_else(|| format!("{} · {}", meeting.display_stamp, meeting.status()));
             let accessible_row = format!("{}，{}，{}", meeting.title(), subtitle, meeting.age());
-            rows_view = rows_view.child(
-                div()
-                    .id(("meeting-row", i))
-                    .role(gpui::Role::ListBoxOption)
-                    .aria_label(accessible_row)
-                    .aria_selected(selected_row)
-                    .when(selected_row, |row| row.aria_active_descendant())
-                    .h(px(if self.config.meeting_list_compact {
-                        44.
-                    } else {
-                        56.
-                    }))
-                    .flex_shrink_0()
-                    .px_3()
-                    .rounded_lg()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .cursor_pointer()
-                    .when(selected_row, |d| d.bg(rgb(SOFT)))
-                    .hover(|style| style.bg(rgb(SOFT)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(meeting.title()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .truncate()
-                                    .child(subtitle),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(meeting.age()),
-                    )
-                    .on_click(
-                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                            this.meeting_list_focus.focus(window, cx);
-                            this.select_library_meeting(row_base.clone());
-                            if event.click_count() == 2 {
-                                this.open_library_meeting_for_review(&row_base, cx);
-                            }
-                            cx.notify();
-                        }),
-                    ),
-            );
+            if is_visible(meeting) {
+                visible_row_positions.push(row_position);
+                row_position += 1;
+                rows_view = rows_view.child(
+                    div()
+                        .id(("meeting-row", i))
+                        .role(gpui::Role::ListBoxOption)
+                        .aria_label(accessible_row)
+                        .aria_selected(selected_row)
+                        .when(selected_row, |row| row.aria_active_descendant())
+                        .h(px(if self.config.meeting_list_compact {
+                            48.
+                        } else {
+                            60.
+                        }))
+                        .flex_shrink_0()
+                        .px_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(if selected_row { 0xc7d6ff } else { SURFACE }))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .cursor_pointer()
+                        .when(selected_row, |d| d.bg(rgb(SOFT)))
+                        .hover(|style| style.bg(rgb(SOFT)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .truncate()
+                                        .child(meeting.title()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .truncate()
+                                        .child(subtitle),
+                                ),
+                        )
+                        .child(ui::badge(
+                            if !meeting.available {
+                                "文件缺失"
+                            } else if meeting.transcript_read_error {
+                                "转写数据未能读取"
+                            } else if meeting.summary_available {
+                                "已生成纪要"
+                            } else if meeting.transcript_available {
+                                "仅逐字稿"
+                            } else {
+                                "待转录"
+                            },
+                            if meeting.summary_available {
+                                ui::SUCCESS
+                            } else {
+                                ACCENT
+                            },
+                            if meeting.summary_available {
+                                0xe6f4ef
+                            } else {
+                                SOFT
+                            },
+                        ))
+                        .on_click(cx.listener(
+                            move |this, event: &gpui::ClickEvent, window, cx| {
+                                this.meeting_list_focus.focus(window, cx);
+                                this.select_library_meeting(row_base.clone());
+                                if event.click_count() == 2 {
+                                    this.open_library_meeting_for_review(&row_base, cx);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                );
+            }
             if !selected_row {
                 continue;
             }
             let rename_base = meeting.base.clone();
+            let relink_folder_base = meeting.base.clone();
             let entity_base = meeting.base.clone();
             let migrate_reference = meeting.base.clone();
             let migrate_archive = meeting.base.clone();
@@ -4287,10 +4884,11 @@ impl Recorder {
                     if meeting.media_is_candidate {
                         "内置播放候选媒体"
                     } else {
-                        "内置播放"
+                        "播放原音 / 视频"
                     },
                     false,
                 )
+                .icon(gpui::component::IconName::Play)
                 .disabled(self.active())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.open_internal_player(base.clone(), path.clone());
@@ -4299,6 +4897,7 @@ impl Recorder {
             });
             #[cfg(not(feature = "internal-player"))]
             let internal_action: Option<Button> = None;
+            let has_internal_action = internal_action.is_some();
             let selected = transcript.clone();
             let hit_field = hit.map(|hit| hit.field.clone());
             let hit_query = self.meeting_search_query.clone().unwrap_or_default();
@@ -4426,50 +5025,110 @@ impl Recorder {
                 .parent()
                 .unwrap_or(Path::new("."))
                 .to_path_buf();
+            let external_media = media.clone();
+            let maintenance = div()
+                .w(px(230.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .when(has_internal_action, |d| {
+                    d.child(
+                        button(("play-external", i), "在系统播放器中打开", false)
+                            .ghost()
+                            .w_full()
+                            .justify_start()
+                            .disabled(!playable || self.active())
+                            .on_click(move |_, _, _| {
+                                if let Some(path) = &external_media {
+                                    let _ = opencap_platform::open_path(path);
+                                }
+                            }),
+                    )
+                })
+                .child(
+                    button(("rename-meeting-files", i), "修改名称与文件", false)
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .disabled(!managed || !meeting.available || self.rename_job.is_some())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.begin_rename(entity_base.clone(), true, window, cx)
+                        })),
+                )
+                .when(
+                    !meeting.manifest_present && !meeting.manifest_read_error,
+                    |d| {
+                        d.child(
+                            button(("migrate-reference", i), "迁移副本 · 引用媒体", false)
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .disabled(!meeting.available || self.rename_job.is_some())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_legacy_migration(
+                                        migrate_reference.clone(),
+                                        false,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            button(("migrate-archive", i), "迁移副本 · 复制媒体", false)
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .disabled(
+                                    !meeting.available || !playable || self.rename_job.is_some(),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_legacy_migration(
+                                        migrate_archive.clone(),
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    },
+                );
             detail_view = Some(
                 card()
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .size(px(40.))
-                                    .flex_shrink_0()
-                                    .rounded_lg()
-                                    .bg(rgb(SOFT))
-                                    .text_color(rgb(ACCENT))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(ui::icon(gpui::component::IconName::FileText)),
-                            )
+                            .gap_2()
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
                                     .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_base()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .truncate()
-                                            .child(meeting.title()),
-                                    )
-                                    .child(label(meeting.status())),
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(meeting.title()),
                             )
-                            .child(label(meeting.age())),
+                            .child(ui::badge(
+                                if !meeting.available { "文件缺失" } else if meeting.transcript_read_error { "转写数据未能读取" } else if meeting.summary_available { "已生成纪要" } else if meeting.transcript_available { "仅逐字稿" } else { "待转录" },
+                                if meeting.summary_available { ui::SUCCESS } else { ACCENT },
+                                if meeting.summary_available { 0xe6f4ef } else { SOFT },
+                            )),
                     )
+                    .child(label(format!("{} · {}", meeting.display_stamp, meeting.details)))
                     .child(
                         div()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(0xf8fafd))
+                            .flex().flex_col().gap_2()
                             .text_sm()
                             .text_color(rgb(TEXT))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(if meeting.summary_available { "纪要摘要" } else { "会议内容" }))
                             .child(meeting.preview.clone()),
                     )
-                    .child(label(meeting.details.clone()))
                     .when(hit.is_some(), |d| {
                         let hit = hit.unwrap();
                         let range = hit.start_ms.zip(hit.end_ms)
@@ -4492,71 +5151,32 @@ impl Recorder {
                             .flex()
                             .flex_wrap()
                             .gap_2()
-                            .child(
-                                button(("rename-meeting", i), "修改显示名称", false)
-                                    .ghost()
-                                    .disabled(busy || !meeting.available)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.begin_rename(rename_base.clone(), false, window, cx)
+                            .when(!meeting.available, |d| d.child(
+                                primary_button(("relink-meeting-folder", i), "重新定位此会议…")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.choose_relink_meeting(relink_folder_base.clone(), cx);
                                     })),
-                            )
+                            ))
                             .child(
-                                button(("rename-meeting-files", i), "修改名称与文件", false)
-                                    .ghost()
-                                    .disabled(
-                                        !managed || !meeting.available || self.rename_job.is_some(),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.begin_rename(entity_base.clone(), true, window, cx)
-                                    })),
-                            )
-                            .when(!meeting.manifest_present && !meeting.manifest_read_error, |d| {
-                                d.child(
-                                    button(("migrate-reference", i), "迁移副本 · 引用媒体", false)
-                                        .ghost()
-                                        .disabled(!meeting.available || self.rename_job.is_some())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.begin_legacy_migration(
-                                                migrate_reference.clone(),
-                                                false,
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                )
-                                .child(
-                                    button(("migrate-archive", i), "迁移副本 · 复制媒体", false)
-                                        .ghost()
-                                        .disabled(
-                                            !meeting.available
-                                                || !playable
-                                                || self.rename_job.is_some(),
-                                        )
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.begin_legacy_migration(
-                                                migrate_archive.clone(),
-                                                true,
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                )
-                            })
-                            .child(
-                                button(
+                                primary_button(
                                     ("open-meeting", i),
                                     if exists {
-                                        "查看逐字稿 / 纪要"
+                                        if self.active() { "查看逐字稿（只读）" } else { "查看逐字稿 / 纪要" }
                                     } else {
                                         "转录并查看"
                                     },
-                                    false,
                                 )
-                                .text_color(rgb(ACCENT))
-                                .disabled(busy || (!exists && (!playable || meeting.media_is_candidate)))
+                                .icon(gpui::component::IconName::FileText)
+                                .disabled(self.quit_pending || (!exists && (busy || !playable || meeting.media_is_candidate)) || (exists && busy && !self.active()))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         if exists {
+                                            if this.active() {
+                                                let base = opencap_core::meeting_base(&selected);
+                                                this.open_library_meeting_for_review(&base, cx);
+                                                return;
+                                            }
                                             let target = selected.clone();
                                             let field = hit_field.clone();
                                             let query = hit_query.clone();
@@ -4612,16 +5232,25 @@ impl Recorder {
                                     },
                                 )),
                             )
-                            .child(
+                            .when(!has_internal_action, |d| d.child(
                                 button(("play-meeting", i), if meeting.media_is_candidate { "播放候选媒体" } else { "播放原音 / 视频" }, false)
+                                    .icon(gpui::component::IconName::Play)
                                     .disabled(!playable || self.active())
                                     .on_click(move |_, _, _| {
                                         if let Some(path) = &media {
                                             let _ = opencap_platform::open_path(path);
                                         }
                                     }),
-                            )
+                            ))
                             .when_some(internal_action, |d, action| d.child(action))
+                            .child(div().flex_1().min_w(px(16.)))
+                            .child(
+                                ui::icon_button(("rename-meeting", i), gpui::assets::IconName::Pencil, "修改显示名称")
+                                    .disabled(busy || !meeting.available)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.begin_rename(rename_base.clone(), false, window, cx)
+                                    })),
+                            )
                             .when_some(audio_export, |d, (base, id, source)| {
                                 let running = self.audio_export_job.as_ref().is_some_and(|(job_base, _, _, _)| job_base == &base);
                                 let cancelling = self.audio_export_job.as_ref().is_some_and(|(job_base, _, flag, _)| job_base == &base && flag.load(std::sync::atomic::Ordering::Acquire));
@@ -4629,8 +5258,8 @@ impl Recorder {
                                 let stage_text = match self.audio_export_stage_seen {
                                     1 => "正在核对源录屏…", 2 => "正在导出音频…", 3 => "正在复核源录屏…", 4 => "正在登记并核对音频…", _ => "正在准备音频导出…",
                                 };
-                                d.child(button(("export-recording-audio", i), "导出独立音频", false)
-                                    .ghost().disabled(self.active() || self.quit_pending || self.audio_export_job.is_some())
+                                d.child(ui::icon_button(("export-recording-audio", i), gpui::assets::IconName::Download, "导出独立音频")
+                                    .disabled(self.active() || self.quit_pending || self.audio_export_job.is_some())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.start_recording_audio_export(base.clone(), id.clone(), source.clone(), cx);
                                     })))
@@ -4663,12 +5292,7 @@ impl Recorder {
                             })
                             .when(exists && playable && !meeting.media_is_candidate, |d| {
                                 d.child(
-                                    button(
-                                        ("retranscribe-meeting", i),
-                                        "用当前模型另存重转",
-                                        false,
-                                    )
-                                    .ghost()
+                                    ui::icon_button(("retranscribe-meeting", i), gpui::component::IconName::RefreshCw, "用当前模型另存重转")
                                     .disabled(busy)
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
@@ -4681,12 +5305,15 @@ impl Recorder {
                                 )
                             })
                             .child(
-                                button(("meeting-folder", i), "会议文件夹", false)
-                                    .ghost()
+                                ui::icon_button(("meeting-folder", i), gpui::component::IconName::Folder, "打开会议文件夹")
                                     .on_click(move |_, _, _| {
                                         let _ = opencap_platform::open_path(&folder);
                                     }),
-                            ),
+                            )
+                            .child(gpui::component::popover::Popover::new(("meeting-more-popover", i))
+                                .anchor(Anchor::TopRight)
+                                .trigger(ui::icon_button(("meeting-more", i), gpui::component::IconName::Ellipsis, "更多维护操作"))
+                                .child(maintenance)),
                     )
                     .when(self.player_base_matches(&meeting.base), |d| {
                         #[cfg(feature = "internal-player")]
@@ -4713,18 +5340,144 @@ impl Recorder {
                     self.meetings.len()
                 }
             });
-        let pages = count.saturating_sub(1) / MEETINGS_PER_PAGE + 1;
-        let visible_page = self.meeting_list_page;
+        let pages = if grouped {
+            1
+        } else {
+            count.saturating_sub(1) / MEETINGS_PER_PAGE + 1
+        };
+        let visible_page = if grouped { 0 } else { self.meeting_list_page };
+        let list_toolbar = div()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(0xf8fafd))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div().flex().gap_1().children(
+                    ["时间序", "按月折叠", "按周折叠"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, title)| {
+                            let selected = match i {
+                                1 => self.config.meeting_group_by_month && !weekly,
+                                2 => weekly,
+                                _ => !self.config.meeting_group_by_month && !weekly,
+                            };
+                            button(("meeting-group-mode", i), title, selected)
+                                .ghost()
+                                .when(selected, |b| b.bg(rgb(SURFACE)).text_color(rgb(ACCENT)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.config.meeting_group_by_month = i == 1;
+                                    this.config.meeting_group_by_week = i == 2;
+                                    this.meeting_collapsed_months.clear();
+                                    this.meeting_list_page = 0;
+                                    this.meeting_rows_scroll.set_offset(point(px(0.), px(0.)));
+                                    this.save();
+                                    cx.notify();
+                                }))
+                        }),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(grouped, |d| {
+                        d.child(
+                            ui::icon_button(
+                                "meeting-toggle-all",
+                                gpui::component::IconName::ChevronsUpDown,
+                                "全部展开 / 收起",
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.meeting_collapsed_months.is_empty() {
+                                    this.meeting_collapsed_months = this
+                                        .meetings
+                                        .iter()
+                                        .map(|meeting| {
+                                            meeting_group_key(
+                                                meeting,
+                                                this.config.meeting_group_by_week,
+                                            )
+                                        })
+                                        .collect();
+                                } else {
+                                    this.meeting_collapsed_months.clear();
+                                }
+                                cx.notify();
+                            })),
+                        )
+                    })
+                    .child(
+                        ui::icon_button(
+                            "meeting-density",
+                            gpui::assets::IconName::Rows3,
+                            if self.config.meeting_list_compact {
+                                "切换到普通列表"
+                            } else {
+                                "切换到紧凑列表"
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.config.meeting_list_compact = !this.config.meeting_list_compact;
+                            this.save();
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        ui::icon_button(
+                            "refresh-meetings",
+                            gpui::component::IconName::RefreshCw,
+                            "刷新会议列表",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_meetings();
+                            cx.notify();
+                        })),
+                    ),
+            );
         let mut list_panel = div()
             .h_full()
             .min_h(px(0.))
             .min_w(px(0.))
             .flex()
             .flex_col()
-            .gap_2()
-            .child(label(
-                "选择会议后可用上下键切换，按回车打开；翻页请使用下方按钮。",
-            ))
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .overflow_hidden()
+            .child(list_toolbar)
+            .when(self.meeting_search_query.is_some(), |d| {
+                d.child(
+                    label(
+                        self.meeting_search_result
+                            .as_ref()
+                            .map(|result| {
+                                if result.semantic_model.is_some() && !result.semantic_fallback {
+                                    format!("{} 场候选 · 混合相关度排序", result.total)
+                                } else {
+                                    format!("{} 场会议匹配 · 最近更新优先", result.total)
+                                }
+                            })
+                            .unwrap_or_else(|| {
+                                if self.meeting_search_task.is_some() {
+                                    "正在搜索会议…".into()
+                                } else {
+                                    "搜索未完成，请重试。".into()
+                                }
+                            }),
+                    )
+                    .px_3()
+                    .pt_2(),
+                )
+            })
             .child(
                 rows_view
                     .id("meeting-rows-scroll")
@@ -4736,10 +5489,7 @@ impl Recorder {
                     .role(gpui::Role::ListBox)
                     .aria_label("会议列表")
                     .aria_description("上下键选择，回车打开，翻页请使用下方按钮")
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .p_2()
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         if !this.meeting_list_focus.is_focused(window)
@@ -4750,8 +5500,9 @@ impl Recorder {
                         {
                             return;
                         }
-                        let current_rows: Vec<_> = if let Some(result) = &this.meeting_search_result
-                        {
+                        let current_rows: Vec<_> = if grouped {
+                            visible_bases.clone()
+                        } else if let Some(result) = &this.meeting_search_result {
                             result
                                 .hits
                                 .iter()
@@ -4792,7 +5543,8 @@ impl Recorder {
                         if this.meeting_selected_base.as_ref() != Some(&base) {
                             this.select_library_meeting(base.clone());
                         }
-                        this.meeting_rows_scroll.scroll_to_item(index);
+                        this.meeting_rows_scroll
+                            .scroll_to_item(visible_row_positions[index]);
                         if open {
                             this.open_library_meeting_for_review(&base, cx);
                         }
@@ -4848,19 +5600,21 @@ impl Recorder {
             .child(details);
         let wide = ui::two_columns(width);
         let body = if wide {
-            use gpui::component::resizable::{h_resizable, resizable_panel};
+            use gpui::component::resizable::resizable_panel;
             div().flex_1().min_h(px(0.)).child(
-                h_resizable("meeting-library-split")
+                ui::spaced_split("meeting-library-split")
                     .child(
                         resizable_panel()
                             .size(px(width * 0.48))
                             .size_range(px(280.)..px(width - 320.))
+                            .pr_2()
                             .child(list_panel),
                     )
                     .child(
                         resizable_panel()
                             .size(px(width * 0.52))
                             .size_range(px(300.)..px(width - 300.))
+                            .pl_2()
                             .child(detail_panel),
                     ),
             )
@@ -4938,6 +5692,8 @@ impl Recorder {
                 cx.notify();
             }));
         card()
+            .h_full()
+            .min_h(px(0.))
             .child(
                 div()
                     .flex()
@@ -5001,10 +5757,12 @@ impl Recorder {
                         )
                     }),
             )
-            .child(Textarea::new(&self.notes).disabled(
-                self.transcript_output.is_none()
-                    || self.notes_initial_load_pending
-                    || self.notes_reload_busy,
+            .child(div().flex_1().min_h(px(0.)).child(
+                Textarea::new(&self.notes).h(relative(1.)).disabled(
+                    self.transcript_output.is_none()
+                        || self.notes_initial_load_pending
+                        || self.notes_reload_busy,
+                ),
             ))
             .child(label(self.notes_status.clone()))
     }
@@ -5013,6 +5771,65 @@ impl Recorder {
 #[cfg(test)]
 mod export_tests {
     use super::{copy_export, meeting_details};
+
+    #[test]
+    fn media_inventory_lists_real_registered_files_and_rejects_unsafe_paths() {
+        use opencap_core::{AssetOwnership, MeetingAsset, MeetingManifest};
+        let root =
+            std::env::temp_dir().join(format!("opencap-media-inventory-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("video.mp4"), b"video").unwrap();
+        std::fs::write(root.join("audio.m4a"), b"audio").unwrap();
+        let asset = |id: &str, role: &str, path: &str| MeetingAsset {
+            asset_id: id.into(),
+            role: role.into(),
+            ownership: AssetOwnership::Managed,
+            path: path.into(),
+            extra: Default::default(),
+        };
+        let manifest = MeetingManifest {
+            schema_version: 1,
+            meeting_id: "test".into(),
+            title: "meeting".into(),
+            managed_directory: root.clone(),
+            transcription_runs: Vec::new(),
+            extra: Default::default(),
+            assets: vec![
+                asset("v", "recording_video", "video.mp4"),
+                asset("a", "recording_audio", "audio.m4a"),
+                asset("missing", "candidate_media", "missing.m4a"),
+                asset("unsafe", "recording_audio", "../outside.m4a"),
+            ],
+        };
+        let items = super::list_meeting_media(&root.join("meeting"), Some(&manifest), None);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items.iter().filter(|item| item.available).count(), 2);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.role == "candidate_media" && !item.available)
+        );
+        let legacy =
+            super::list_meeting_media(&root.join("video"), None, Some(&root.join("audio.m4a")));
+        assert_eq!(legacy.len(), 2);
+        assert!(
+            legacy
+                .iter()
+                .any(|item| item.role == "same_name_media" && item.path == root.join("video.mp4"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn weekly_groups_use_iso_week_year_across_new_year() {
+        let before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_609_502_400);
+        let after = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_609_761_600);
+        assert_eq!(super::week_key_for_time(before), "2020-W53");
+        assert_eq!(super::week_key_for_time(after), "2021-W01");
+        assert_eq!(
+            super::meeting_group_label("2020-W53", true),
+            "2020 年第 53 周"
+        );
+    }
     #[test]
     fn one_meeting_with_media_and_prefix_aliases_is_listed_once_without_moving_files() {
         let root =

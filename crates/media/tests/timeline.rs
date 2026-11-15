@@ -197,6 +197,7 @@ fn reference_encoding_preserves_variable_frame_durations() {
         encoder: Some("libx264".into()),
         adaptive: false,
         system_audio: false,
+        microphone: false,
         ..Default::default()
     };
     let mut writer = MediaWriter::new(&source, 320, 180, &config).unwrap();
@@ -228,6 +229,7 @@ fn interrupted_video_only_recording_remains_recoverable_without_an_invented_tail
     let config = RecordingConfig {
         encoder: Some("libx264".into()),
         system_audio: false,
+        microphone: false,
         ..Default::default()
     };
     let mut writer = MediaWriter::new(&partial, 320, 180, &config).unwrap();
@@ -325,6 +327,7 @@ fn resizing_source_keeps_output_geometry() {
     let config = RecordingConfig {
         encoder: Some("libx264".into()),
         system_audio: false,
+        microphone: false,
         ..Default::default()
     };
     let mut writer = MediaWriter::new(&path, 320, 180, &config).unwrap();

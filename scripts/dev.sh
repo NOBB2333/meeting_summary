@@ -27,8 +27,11 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-# Keep feature-selected developer binaries separate from release artifacts.
-if [[ "$task" == run || "$task" == bench ]]; then
+# Reuse the ordinary debug dependency cache; release developer artifacts remain
+# isolated so they cannot replace the production release binary.
+if [[ "$task" == run && " $* " != *" --release "* ]]; then
+  export CARGO_TARGET_DIR="$root/target"
+elif [[ "$task" == run || "$task" == bench ]]; then
   export CARGO_TARGET_DIR="$root/target/opencap-dev"
 fi
 
@@ -63,7 +66,8 @@ if [[ "$task" == run && "$(uname -s)" == Darwin ]]; then
   done
   echo "OpenCap Dev: building $run_profile and launching the isolated app bundle."
   cargo build -p opencap --features dev-profile --locked "${build_arguments[@]}"
-  python3 "$root/scripts/package-macos.py" --dev --profile "$run_profile" --no-build --require-default
+  python3 "$root/scripts/package-macos.py" --dev --profile "$run_profile" --no-build \
+    --binary "$CARGO_TARGET_DIR/$run_profile/opencap" --require-default
   exec open "$root/release/OpenCap Dev.app" --args "${app_arguments[@]}"
 fi
 

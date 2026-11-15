@@ -45,7 +45,8 @@ impl PreviewSlot {
         }
     }
 }
-fn make_preview(frame: &VideoFrame) -> RecordingPreview {
+/// Reduce a captured frame for display without writing it to disk.
+pub fn make_preview(frame: &VideoFrame) -> RecordingPreview {
     let scale = (640.0 / frame.width as f64)
         .min(360.0 / frame.height as f64)
         .min(1.0);

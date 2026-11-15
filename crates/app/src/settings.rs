@@ -3,19 +3,55 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsPage {
     Ai,
-    Vocabulary,
+    Recognition,
     Templates,
-    Transcription,
     Recording,
 }
 
 impl Recorder {
-    pub(super) fn settings_view(&self, cx: &Context<Self>) -> Div {
+    pub(super) fn settings_view(&self, _width: f32, cx: &Context<Self>) -> Div {
+        let pages = [
+            (SettingsPage::Ai, "AI 服务", "协议、地址、模型和密钥"),
+            (
+                SettingsPage::Recognition,
+                "语音识别与词表",
+                "语言、模型矩阵与全局专业词表",
+            ),
+            (
+                SettingsPage::Templates,
+                "纪要模板",
+                "默认风格、格式和参考文件",
+            ),
+            (
+                SettingsPage::Recording,
+                "录制偏好",
+                "画面、声音、存储和快捷键",
+            ),
+        ];
+        let nav = div().flex().flex_wrap().items_center().gap_2().children(
+            pages.into_iter().enumerate().map(|(i, (page, title, _))| {
+                button(("settings-page", i), title, self.settings_page == page)
+                    .ghost()
+                    .when(self.settings_page == page, |b| {
+                        b.bg(rgb(SOFT)).text_color(rgb(ACCENT))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_page = page;
+                        this.page_scroll.set_offset(point(px(0.), px(0.)));
+                        cx.notify();
+                    }))
+            }),
+        );
+        let content = match self.settings_page {
+            SettingsPage::Ai => self.ai_settings_view(cx),
+            SettingsPage::Recognition => self.transcription_settings(cx),
+            SettingsPage::Templates => self.template_settings_view(cx),
+            SettingsPage::Recording => self.recording_settings(cx),
+        };
         div()
             .flex()
             .flex_col()
             .gap_5()
-            .child(ui::heading("全局设置", "服务、词汇和模板对所有会议生效。"))
             .when(
                 self.transcription_tab && self.transcript_output.is_some(),
                 |d| {
@@ -33,38 +69,12 @@ impl Recorder {
                 },
             )
             .child(
-                div().flex().flex_wrap().gap_2().children(
-                    [
-                        (SettingsPage::Ai, "AI 服务"),
-                        (SettingsPage::Vocabulary, "词汇与语言"),
-                        (SettingsPage::Templates, "纪要模板"),
-                        (SettingsPage::Transcription, "识别模型"),
-                        (SettingsPage::Recording, "录制偏好"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (page, title))| {
-                        button(("settings-page", i), title, self.settings_page == page).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.settings_page = page;
-                                this.page_scroll.set_offset(point(px(0.), px(0.)));
-                                cx.notify();
-                            }),
-                        )
-                    }),
-                ),
-            )
-            .child(
                 div()
-                    .w_full()
-                    .max_w(px(860.))
-                    .child(match self.settings_page {
-                        SettingsPage::Ai => self.ai_settings_view(cx),
-                        SettingsPage::Vocabulary => self.vocabulary_settings_view(cx),
-                        SettingsPage::Templates => self.template_settings_view(cx),
-                        SettingsPage::Transcription => self.transcription_settings(cx),
-                        SettingsPage::Recording => self.recording_settings(cx),
-                    }),
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(nav)
+                    .child(div().flex_1().min_w(px(0.)).max_w(px(1100.)).child(content)),
             )
     }
     fn recording_settings(&self, cx: &Context<Self>) -> Div {
@@ -80,6 +90,19 @@ impl Recorder {
     fn interface_settings(&self, cx: &Context<Self>) -> Div {
         ui::card()
             .child(ui::section_title("界面与提示", "录制过程中显示什么"))
+            .child(ui::setting_row(
+                "录制画面预览",
+                "选择屏幕或窗口后显示画面，可随时在录制工作台收起",
+                button("settings-recording-preview", if self.config.show_recording_preview { "开启" } else { "关闭" }, self.config.show_recording_preview)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.show_recording_preview = !this.config.show_recording_preview;
+                        if !this.config.show_recording_preview && let Some(image) = this.preview_image.take() {
+                            cx.drop_image(image, None);
+                        }
+                        this.save();
+                        cx.notify();
+                    })),
+            ))
             .child(ui::setting_row(
                 "减少界面动画",
                 "减少弹层及其他界面动效，不影响录制和回放",
@@ -213,7 +236,7 @@ impl Recorder {
                     this.save();
                     cx.notify();
                 })),))
-            .child(ui::setting_row("实时电平检测", "录制前检查系统声音与麦克风", button(
+            .child(ui::setting_row("实时电平检测", "录制前或录制中检查系统声音与麦克风", button(
                     "monitor-levels",
                     if self.config.monitor_levels {
                         "开启"
@@ -224,6 +247,9 @@ impl Recorder {
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.config.monitor_levels = !this.config.monitor_levels;
+                    if let Some(session) = &this.session {
+                        session.command(RecordingCommand::SetLevelMeter(this.config.monitor_levels));
+                    }
                     this.monitor = None;
                     this.monitor_levels = (AudioRouteLevels::default(), AudioRouteLevels::default());
                     this.save();
@@ -260,6 +286,53 @@ impl Recorder {
     fn video_settings(&self, cx: &Context<Self>) -> Div {
         ui::card()
             .child(ui::section_title("画面与编码", "画面规格在下次录制生效"))
+            .child(label("画质与体积"))
+            .child(
+                div().flex().flex_wrap().gap_2().children(
+                    [
+                        (Preset::Space, "省空间"),
+                        (Preset::Balanced, "平衡"),
+                        (Preset::Quality, "高质量"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (preset, title))| {
+                        button(("preset", i), title, self.config.preset == preset)
+                            .disabled(self.active())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.active() {
+                                    this.config.apply_preset(preset);
+                                    this.save();
+                                }
+                                cx.notify();
+                            }))
+                    }),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        button("reduce-recording-load", "一键降低占用", false)
+                            .disabled(self.active())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.active() {
+                                    this.config.reduce_recording_load();
+                                    this.save();
+                                    this.message =
+                                        "已降低画面采集和编码负载；预览与实时转录保持原设置。"
+                                            .into();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(label(format!("当前最高 {} FPS", self.config.max_fps))),
+            )
+            .child(label(
+                "降低占用会使用较低帧率并加快软件编码；画面流畅度或质量可能降低，文件可能变大。",
+            ))
             .child(label("编码格式"))
             .child(
                 div().flex().flex_wrap().gap_2().children(

@@ -15,8 +15,6 @@ fn deepseek_responses_generates_minutes_for_synthetic_transcript() {
         base_url: std::env::var("OPENCAP_REAL_AI_BASE")
             .unwrap_or_else(|_| "https://api.deepseek.com".into()),
         model: std::env::var("OPENCAP_REAL_AI_MODEL").unwrap_or_else(|_| "deepseek-flash".into()),
-        background: false,
-        deep_reasoning: false,
     };
     let transcript = if let Some(path) = std::env::var_os("OPENCAP_REAL_AI_TRANSCRIPT") {
         let mut source: Transcript = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();

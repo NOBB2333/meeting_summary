@@ -21,6 +21,7 @@ pub enum RecordingCommand {
     Stop,
     SetAudio(AudioRouting),
     SetMicDenoise(bool),
+    SetLevelMeter(bool),
 }
 pub struct RecordingSession {
     commands: Sender<RecordingCommand>,
@@ -392,6 +393,7 @@ fn run(
     let mut peaks = [0.0f32; 2];
     let mut meters = [AudioMeter::default(), AudioMeter::default()];
     let mut inputs = [AudioMeter::default(), AudioMeter::default()];
+    let mut level_meter_enabled = config.monitor_levels;
     let mut meter_tick = Instant::now();
     let mut latest = first;
     let mut preview_tick = None;
@@ -513,6 +515,24 @@ fn run(
                 RecordingCommand::Stop => {
                     stop = true;
                     break;
+                }
+                RecordingCommand::SetLevelMeter(enabled) => {
+                    level_meter_enabled = enabled;
+                    meter_tick = Instant::now();
+                    for meter in meters.iter_mut().chain(inputs.iter_mut()) {
+                        meter.reset();
+                    }
+                    if !enabled {
+                        let mut s = stats.lock();
+                        s.system_rms = 0.0;
+                        s.system_peak = 0.0;
+                        s.microphone_rms = 0.0;
+                        s.microphone_peak = 0.0;
+                        s.system_input_rms = 0.0;
+                        s.system_input_peak = 0.0;
+                        s.microphone_input_rms = 0.0;
+                        s.microphone_input_peak = 0.0;
+                    }
                 }
                 RecordingCommand::SetMicDenoise(enabled) => {
                     if mic.enabled == enabled {
@@ -639,9 +659,13 @@ fn run(
                 continue;
             }
             let index = usize::from(chunk.kind == AudioKind::Microphone);
-            inputs[index].update(&chunk.samples, Instant::now());
+            if level_meter_enabled {
+                inputs[index].update(&chunk.samples, Instant::now());
+            }
             mic.apply(&mut chunk);
-            meters[index].update(&chunk.samples, Instant::now());
+            if level_meter_enabled {
+                meters[index].update(&chunk.samples, Instant::now());
+            }
             peaks[index] = chunk
                 .samples
                 .iter()
@@ -680,7 +704,7 @@ fn run(
             audio_write_max_ms = audio_write_max_ms.max(elapsed.as_secs_f64() * 1000.);
         }
         loop_max_ms = loop_max_ms.max(loop_started.elapsed().as_secs_f64() * 1000.);
-        if meter_tick.elapsed() >= Duration::from_millis(40) {
+        if level_meter_enabled && meter_tick.elapsed() >= Duration::from_millis(40) {
             let now = Instant::now();
             let mut s = stats.lock();
             let levels = if clock.is_paused() {
@@ -837,7 +861,9 @@ fn run(
         let paused = clock.is_paused();
         let now_us = (clock.now_us() - video_epoch).max(0);
         let mut timeout = Duration::from_secs(1).saturating_sub(tick.elapsed());
-        timeout = timeout.min(Duration::from_millis(40).saturating_sub(meter_tick.elapsed()));
+        if level_meter_enabled {
+            timeout = timeout.min(Duration::from_millis(40).saturating_sub(meter_tick.elapsed()));
+        }
         if !paused {
             if latest.is_some()
                 && let Some(next) = until_media_deadline(now_us, policy.next_due_us(&config))

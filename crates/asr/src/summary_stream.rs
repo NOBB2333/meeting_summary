@@ -1,4 +1,4 @@
-//! Real SSE/NDJSON transport. Only a terminal success can become a saved version.
+//! Real SSE transport. Only a terminal success can become a saved version.
 use crate::summary::{AiProvider, check_cancel, parse_reply};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -28,11 +28,7 @@ pub(super) fn read_stream(
         anyhow::ensure!(n <= 524_288, "AI 流式事件过大，未保存未完成稿件");
         let eof = n == 0;
         let line = line.trim_end_matches(['\r', '\n']);
-        if provider == AiProvider::Ollama {
-            if !line.is_empty() {
-                consume(provider, line, &mut text, &mut complete, &mut delta)?;
-            }
-        } else if line.is_empty() || eof {
+        if line.is_empty() || eof {
             if !data.is_empty() {
                 consume(
                     provider,
@@ -73,7 +69,7 @@ fn consume(
     }
     let v: Value = serde_json::from_str(data).context("AI 返回了无效的流式 JSON")?;
     anyhow::ensure!(
-        v.get("error").is_none(),
+        v.get("error").is_none_or(Value::is_null),
         "AI 服务报告生成错误；已有纪要保留"
     );
     let piece = match provider {
@@ -90,23 +86,6 @@ fn consume(
             }
             _ => None,
         },
-        AiProvider::ChatCompletions => {
-            let choice = &v["choices"][0];
-            anyhow::ensure!(
-                choice["delta"]["refusal"]
-                    .as_str()
-                    .is_none_or(str::is_empty),
-                "AI 未返回正文；已有纪要保留"
-            );
-            if let Some(reason) = choice["finish_reason"].as_str() {
-                anyhow::ensure!(
-                    reason == "stop",
-                    "AI 输出未完整完成（长度限制或模型停止）；已有纪要保留"
-                );
-                *complete = true;
-            }
-            choice["delta"]["content"].as_str()
-        }
         AiProvider::Anthropic => match v["type"].as_str().unwrap_or("") {
             "content_block_delta" if v["delta"]["type"] == "text_delta" => {
                 v["delta"]["text"].as_str()
@@ -127,16 +106,6 @@ fn consume(
             "error" => anyhow::bail!("AI 服务报告生成错误；已有纪要保留"),
             _ => None,
         },
-        AiProvider::Ollama => {
-            if v["done"].as_bool() == Some(true) {
-                anyhow::ensure!(
-                    v["done_reason"].as_str().is_none_or(|s| s == "stop"),
-                    "AI 输出达到长度限制；已有纪要保留"
-                );
-                *complete = true;
-            }
-            v["message"]["content"].as_str()
-        }
     };
     if let Some(piece) = piece.filter(|s| !s.is_empty()) {
         text.push_str(piece);
@@ -150,23 +119,15 @@ fn consume(
 mod tests {
     use super::*;
     #[test]
-    fn real_chunks_all_protocols_and_incomplete_streams() {
+    fn real_chunks_for_both_protocols_and_incomplete_streams() {
         let cases = [
             (
                 AiProvider::Responses,
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"会议\"}\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"会议\"}]}]}}\n\n",
             ),
             (
-                AiProvider::ChatCompletions,
-                ": keepalive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"会议\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-            ),
-            (
                 AiProvider::Anthropic,
                 "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"会议\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
-            ),
-            (
-                AiProvider::Ollama,
-                "{\"message\":{\"content\":\"会议\"},\"done\":false}\n{\"done\":true}\n",
             ),
         ];
         struct Bytewise<'a>(&'a [u8]);
@@ -191,12 +152,8 @@ mod tests {
             .unwrap();
             assert_eq!(text, "会议");
             assert_eq!(pieces, "会议");
-            let unfinished = if provider == AiProvider::Ollama {
-                "{\"message\":{\"content\":\"半稿\"}}\n"
-            } else {
-                &wire[..wire.find("data:").unwrap_or(0)
-                    + wire[wire.find("data:").unwrap_or(0)..].find('\n').unwrap()]
-            };
+            let unfinished = &wire[..wire.find("data:").unwrap_or(0)
+                + wire[wire.find("data:").unwrap_or(0)..].find('\n').unwrap()];
             assert!(
                 read_stream(
                     provider,
@@ -211,18 +168,18 @@ mod tests {
     #[test]
     fn cancellation_and_length_errors_do_not_succeed() {
         let cancelled = AtomicBool::new(false);
-        let wire = b"data: {\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n";
+        let wire = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"part\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
         assert!(
-            read_stream(AiProvider::ChatCompletions, &wire[..], &cancelled, |_| {
+            read_stream(AiProvider::Responses, &wire[..], &cancelled, |_| {
                 cancelled.store(true, std::sync::atomic::Ordering::Relaxed)
             })
             .is_err()
         );
-        for reason in ["length", "content_filter", "tool_calls"] {
-            let wire = format!("data: {{\"choices\":[{{\"finish_reason\":\"{reason}\"}}]}}\n\n");
+        for kind in ["response.failed", "response.incomplete", "error"] {
+            let wire = format!("data: {{\"type\":\"{kind}\"}}\n\n");
             assert!(
                 read_stream(
-                    AiProvider::ChatCompletions,
+                    AiProvider::Responses,
                     wire.as_bytes(),
                     &AtomicBool::new(false),
                     |_| {}
@@ -230,5 +187,15 @@ mod tests {
                 .is_err()
             );
         }
+        let wire = b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        assert!(
+            read_stream(
+                AiProvider::Anthropic,
+                &wire[..],
+                &AtomicBool::new(false),
+                |_| {}
+            )
+            .is_err()
+        );
     }
 }

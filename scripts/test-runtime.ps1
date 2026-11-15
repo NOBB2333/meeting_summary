@@ -55,12 +55,23 @@ function Invoke-CleanBench {
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         if ($Label -eq 'runtime-fixture') {
-            Start-Sleep -Milliseconds 150
-            $process.Refresh()
-            if ($process.HasExited) { throw 'Runtime fixture exited before DLL inspection.' }
             $expected = @(Get-OpenCapFfmpegRuntimeNames) + @('vcruntime140.dll')
-            $modules = @($process.Modules | Where-Object { $_.ModuleName -in $expected })
-            if ($modules.Count -ne $expected.Count) { throw 'The codec/VC runtime modules were not loaded.' }
+            # Release binaries can take longer than a fixed 150 ms to resolve all
+            # FFmpeg imports on a loaded runner. Poll briefly so this remains a
+            # runtime-loading check rather than a startup-speed race.
+            $moduleDeadline = [DateTime]::UtcNow.AddSeconds(3)
+            $modules = @()
+            do {
+                Start-Sleep -Milliseconds 100
+                $process.Refresh()
+                if ($process.HasExited) { throw 'Runtime fixture exited before DLL inspection.' }
+                $modules = @($process.Modules | Where-Object { $_.ModuleName -in $expected })
+                if ($modules.Count -eq $expected.Count) { break }
+            } while ([DateTime]::UtcNow -lt $moduleDeadline)
+            if ($modules.Count -ne $expected.Count) {
+                $loaded = @($process.Modules | ForEach-Object { $_.ModuleName })
+                throw "The codec/VC runtime modules were not loaded. expected=$($expected -join ','); loaded=$($loaded -join ',')"
+            }
             foreach ($module in $modules) {
                 if ((Split-Path -Parent $module.FileName) -ne $directoryPath) {
                     throw "Runtime loaded outside application directory: $($module.FileName)"

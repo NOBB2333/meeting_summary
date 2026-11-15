@@ -20,6 +20,7 @@ impl Recorder {
         let showing_document = self.ai.artifact_open && (wide || !self.ai.conversation_tab);
         let header = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_2()
@@ -36,6 +37,24 @@ impl Recorder {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .when(short, |d| {
+                        d.child(
+                            button("chat-latest-compact", "最新", false)
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.ai.chat.update(cx, |chat, cx| chat.follow_latest(cx));
+                                })),
+                        )
+                    })
+                    .when(self.ai.history.latest().is_empty(), |d| {
+                        d.child(
+                            primary_button("generate-minutes", "生成纪要")
+                                .disabled(busy || !ready || self.ai.editing)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.request_minutes(MinutesAction::Generate, cx);
+                                })),
+                        )
+                    })
                     .child(
                         button(
                             "minutes-format-settings",
@@ -77,7 +96,12 @@ impl Recorder {
             .pt_2()
             .border_t_1()
             .border_color(rgb(BORDER))
-            .child(Textarea::new(&self.ai.instruction).disabled(busy).w_full())
+            .child(
+                Textarea::new(&self.ai.instruction)
+                    .disabled(busy)
+                    .w_full()
+                    .when(short, |input| input.h(px(44.))),
+            )
             .child(
                 div()
                     .flex()
@@ -192,6 +216,7 @@ impl Recorder {
             .flex_col()
             .gap_2()
             .p_3()
+            .when(short, |d| d.gap_1().p_2())
             .rounded_lg()
             .bg(rgb(SURFACE))
             .child(
@@ -201,32 +226,42 @@ impl Recorder {
                     .overflow_hidden()
                     .child(self.ai.chat.clone()),
             )
-            .when(show_status, |d| {
-                d.child(
-                    div()
-                        .id("chat-status")
-                        .max_h(px(if short { 18. } else { 36. }))
-                        .overflow_y_scroll()
-                        .flex_shrink_0()
-                        .child(label(status).text_xs()),
-                )
-            })
+            .when(
+                show_status
+                    && (!short
+                        || busy
+                        || !self.ai.pending_request.is_empty()
+                        || status.contains("失败")
+                        || status.contains("错误")),
+                |d| {
+                    d.child(
+                        div()
+                            .id("chat-status")
+                            .max_h(px(if short { 18. } else { 36. }))
+                            .overflow_y_scroll()
+                            .flex_shrink_0()
+                            .child(label(status).text_xs()),
+                    )
+                },
+            )
             .child(composer);
         let document = self.minutes_artifact_view(cx);
         let mut body = div().w_full().flex_1().min_h(px(0.)).overflow_hidden();
         if wide && self.ai.artifact_open {
             body = body.child(
-                h_resizable("minutes-workspace-split")
+                ui::spaced_split("minutes-workspace-split")
                     .child(
                         resizable_panel()
-                            .size(px(width * 0.5))
+                            .size(px(width * 0.42))
                             .size_range(px(320.)..px(width - 350.))
+                            .pr_2()
                             .child(chat),
                     )
                     .child(
                         resizable_panel()
-                            .size(px(width * 0.5))
+                            .size(px(width * 0.58))
                             .size_range(px(340.)..px(width - 330.))
+                            .pl_2()
                             .child(document),
                     ),
             );

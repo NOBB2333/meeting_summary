@@ -166,7 +166,15 @@ pub struct RecordingConfig {
     pub semantic_embedding_model: Option<String>,
     /// User-selected visual density in the meeting library.
     pub meeting_list_compact: bool,
+    /// Group the meeting library by recording month instead of a flat list.
+    pub meeting_group_by_month: bool,
+    /// Group by ISO week instead; takes precedence if both flags are set.
+    pub meeting_group_by_week: bool,
     pub meeting_media_on_right: bool,
+    /// Collapse the main navigation to icons while retaining the current page.
+    pub sidebar_collapsed: bool,
+    /// Give the recording preview the full width when the configuration pane is hidden.
+    pub recording_transcript_collapsed: bool,
     /// Explicitly reduce interface animation, independent of capture settings.
     pub reduce_motion: bool,
     pub show_floating_controls: bool,
@@ -211,7 +219,7 @@ impl Default for RecordingConfig {
             codec: Codec::Auto,
             encoder: None,
             system_audio: true,
-            microphone: false,
+            microphone: true,
             system_device: None,
             microphone_device: None,
             reserve_audio_track: false,
@@ -233,7 +241,11 @@ impl Default for RecordingConfig {
             online_speaker_model: None,
             semantic_embedding_model: None,
             meeting_list_compact: false,
+            meeting_group_by_month: true,
+            meeting_group_by_week: false,
             meeting_media_on_right: false,
+            sidebar_collapsed: false,
+            recording_transcript_collapsed: false,
             reduce_motion: false,
             show_floating_controls: false,
             show_capture_border: !cfg!(target_os = "linux"),
@@ -378,6 +390,28 @@ pub fn config_path() -> PathBuf {
 mod border_tests {
     use super::*;
     #[test]
+    fn workspace_panels_default_open_and_remember_collapsed_state() {
+        let mut config = RecordingConfig::default();
+        assert!(!config.sidebar_collapsed && !config.recording_transcript_collapsed);
+        config.sidebar_collapsed = true;
+        config.recording_transcript_collapsed = true;
+        let restored: RecordingConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(restored.sidebar_collapsed && restored.recording_transcript_collapsed);
+    }
+    #[test]
+    fn fresh_config_enables_both_audio_sources_and_preview_without_overriding_saved_choices() {
+        let defaults = RecordingConfig::default();
+        assert!(defaults.microphone && defaults.system_audio && defaults.show_recording_preview);
+        let mut saved = defaults;
+        saved.microphone = false;
+        saved.system_audio = false;
+        saved.show_recording_preview = false;
+        let restored: RecordingConfig =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(!restored.microphone && !restored.system_audio && !restored.show_recording_preview);
+    }
+    #[test]
     fn old_settings_enable_punctuation_and_explicit_disable_survives_reload() {
         let mut old = serde_json::to_value(RecordingConfig::default()).unwrap();
         old.as_object_mut()
@@ -428,8 +462,18 @@ mod border_tests {
         assert!(!old.experimental_async_wgc);
         assert_eq!(old.live_asr_model, LiveAsrModel::Auto);
         assert!(old.transcription_context_revision);
+        assert!(old.meeting_group_by_month);
+        assert!(!old.meeting_group_by_week);
         assert_eq!(old.offline_asr_model, OfflineAsrModel::SenseVoice);
         assert_eq!(old.transcription_language, TranscriptionLanguage::Chinese);
+        let weekly = RecordingConfig {
+            meeting_group_by_month: false,
+            meeting_group_by_week: true,
+            ..Default::default()
+        };
+        let weekly: RecordingConfig =
+            serde_json::from_str(&serde_json::to_string(&weekly).unwrap()).unwrap();
+        assert!(weekly.meeting_group_by_week && !weekly.meeting_group_by_month);
         for language in TranscriptionLanguage::ALL {
             let config = RecordingConfig {
                 transcription_language: language,

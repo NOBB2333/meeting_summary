@@ -77,8 +77,13 @@ pub fn scroll_benchmark(
                     r.settings = false;
                     r.transcription_tab = transcript_page;
                     r.meeting_page = workspace::MeetingPage::Transcript;
-                    r.page_scroll.set_offset(point(px(0.), px(0.)));
-                    r.transcript_view.update(cx, |view, cx| {
+                    if transcript_page {
+                        r.page_scroll.set_offset(point(px(0.), px(0.)));
+                    } else {
+                        r.page_scroll.set_offset(point(px(0.), -r.page_scroll.max_offset().y));
+                    }
+                    let view = if transcript_page { &r.transcript_view } else { &r.home_detail_transcript };
+                    view.update(cx, |view, cx| {
                         view.state.scroll_to(ListOffset { item_ix: 10.min(count - 1), offset_in_item: px(0.) });
                         cx.notify();
                     });
@@ -86,28 +91,30 @@ pub fn scroll_benchmark(
                 });
                 futures_timer::Delay::new(Duration::from_millis(200)).await;
                 entity.update(cx, |r, cx| {
-                    let top = r.transcript_view.read(cx).state.viewport_bounds().top();
-                    r.page_scroll.set_offset(point(px(0.), px(190.) - top));
+                    if !transcript_page {
+                        r.page_scroll.set_offset(point(px(0.), -r.page_scroll.max_offset().y));
+                    }
                     cx.notify();
                 });
                 futures_timer::Delay::new(Duration::from_millis(200)).await;
                 let (position, parent_before, row_before) = entity.read_with(cx, |r, cx| {
-                    let state = &r.transcript_view.read(cx).state;
+                    let view = if transcript_page { &r.transcript_view } else { &r.home_detail_transcript };
+                    let state = &view.read(cx).state;
                     let bounds = state.viewport_bounds();
                     let top = bounds.top().max(px(160.));
                     let bottom = bounds.bottom().min(px(650.));
                     (point(bounds.center().x, (top + bottom) / 2.), r.page_scroll.offset(), state.logical_scroll_top().item_ix)
                 });
-                for _ in 0..30 {
+                for _ in 0..if transcript_page { 30 } else { 1 } {
                     main.update(cx, |_, window, cx| {
                         window.dispatch_event(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position, delta: ScrollDelta::Pixels(point(px(0.), px(240.))), ..Default::default()
+                            position, delta: ScrollDelta::Pixels(point(px(0.), if transcript_page { px(240.) } else { px(60.) })), ..Default::default()
                         }), cx);
                     })?;
                     futures_timer::Delay::new(Duration::from_millis(16)).await;
                 }
-                let (parent_after, row_after) = entity.read_with(cx, |r, cx| (r.page_scroll.offset(), r.transcript_view.read(cx).state.logical_scroll_top().item_ix));
-                anyhow::ensure!(row_before > 0 && row_after == 0, "wheel did not reach transcript top: {row_before} -> {row_after}");
+                let (parent_after, row_after) = entity.read_with(cx, |r, cx| (r.page_scroll.offset(), (if transcript_page { &r.transcript_view } else { &r.home_detail_transcript }).read(cx).state.logical_scroll_top().item_ix));
+                anyhow::ensure!(row_before > 0 && if transcript_page { row_after == 0 } else { row_after < row_before }, "wheel did not move the transcript: {row_before} -> {row_after}");
                 anyhow::ensure!(parent_before == parent_after, "transcript wheel moved outer page: {parent_before:?} -> {parent_after:?}");
                 main.update(cx, |_, window, cx| {
                     window.dispatch_event(PlatformInput::ScrollWheel(ScrollWheelEvent {
@@ -115,8 +122,8 @@ pub fn scroll_benchmark(
                     }), cx);
                 })?;
                 futures_timer::Delay::new(Duration::from_millis(100)).await;
-                let down = entity.read_with(cx, |r, cx| r.transcript_view.read(cx).state.logical_scroll_top().item_ix);
-                anyhow::ensure!(down > 0 && entity.read_with(cx, |r, _| r.page_scroll.offset()) == parent_before, "downward transcript wheel escaped its viewport");
+                let down = entity.read_with(cx, |r, cx| (if transcript_page { &r.transcript_view } else { &r.home_detail_transcript }).read(cx).state.logical_scroll_top().item_ix);
+                anyhow::ensure!(down > row_after && entity.read_with(cx, |r, _| r.page_scroll.offset()) == parent_before, "downward transcript wheel escaped its viewport");
                 wheel_checks.push(serde_json::json!({"page": if transcript_page {"transcript"} else {"live_text"}, "row_before":row_before,"row_after_up":row_after,"row_after_down":down,"parent_unchanged":true}));
             }
             std::fs::write(path.join("scroll-benchmark.json"), serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"source_rows":count,"samples":samples,"wheel_checks":wheel_checks,"definition":"actual wheel containment and distinct row layout requests; not FPS"}))?)?;
@@ -449,6 +456,33 @@ pub fn run(
                 });
                 futures_timer::Delay::new(Duration::from_millis(400)).await;
                 shot(hwnd,path.join("09-search")).await?;
+            }
+            if std::env::args().any(|arg| arg == "--ui-readme-shots") {
+                recorder.update(cx,|r,cx| {
+                    r.settings=true;
+                    r.transcription_tab=false;
+                    r.settings_page=settings::SettingsPage::Ai;
+                    cx.notify();
+                });
+                futures_timer::Delay::new(Duration::from_millis(400)).await;
+                shot(hwnd,path.join("10-settings-ai")).await?;
+                for (page,name) in [
+                    (settings::SettingsPage::Recognition,"11-settings-recognition"),
+                    (settings::SettingsPage::Templates,"12-settings-template"),
+                    (settings::SettingsPage::Recording,"13-settings-recording"),
+                ] {
+                    recorder.update(cx,|r,cx| { r.settings_page=page; cx.notify(); });
+                    futures_timer::Delay::new(Duration::from_millis(300)).await;
+                    shot(hwnd,path.join(name)).await?;
+                }
+                recorder.update(cx,|r,cx| {
+                    r.settings=false;
+                    r.transcription_tab=true;
+                    r.meeting_page=workspace::MeetingPage::Library;
+                    cx.notify();
+                });
+                futures_timer::Delay::new(Duration::from_millis(400)).await;
+                shot(hwnd,path.join("14-library-grouped")).await?;
             }
             let stats=recorder.read_with(cx,|r,_|r.stats.clone());
             std::fs::write(path.join("ui-smoke.json"),serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"stats":stats,"microphone_exercised":exercise_microphone,"maximized_columns":wide_columns,"real_meeting_exercised":recorder.read_with(cx,|r,_|r.transcript_output.is_some()),"scenarios":["23 real native-window previews","responsive expanded grid and last target","compact scrolling","small-window settings","live encoder preview","minimized target hides border","timed and disabled borders","UI start/pause/resume/stop","live audio and device switch","real meeting open, player seek, short-word search"]}))?)?;

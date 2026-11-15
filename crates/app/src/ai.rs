@@ -4,13 +4,14 @@ mod checks;
 mod correction;
 #[path = "ai/settings.rs"]
 mod global_settings;
+mod models;
 mod view;
 use super::*;
 #[cfg(feature = "ui-smoke")]
-pub(super) use checks::chat_benchmark;
+pub(super) use checks::{chat_benchmark, correction_benchmark};
 use gpui::component::{
     input::{Input, InputEvent, Textarea, TextareaState},
-    resizable::{h_resizable, resizable_panel},
+    resizable::resizable_panel,
     text::TextView,
 };
 use opencap_asr::{
@@ -36,9 +37,76 @@ fn read_minutes_draft(base: &std::path::Path) -> anyhow::Result<Option<String>> 
     Ok(Some(String::from_utf8(bytes)?))
 }
 
+/// Load a current or legacy ai.json. Removed protocols are mapped to a
+/// supported one with a visible notice; the original bytes are kept as a
+/// one-time backup and the migrated file is written atomically.
+fn load_ai_config_migrating(path: &std::path::Path) -> anyhow::Result<(AiConfig, String)> {
+    let bytes = std::fs::read(path)?;
+    if let Ok(config) = serde_json::from_slice::<AiConfig>(&bytes) {
+        return Ok((
+            config,
+            "AI 配置已载入；密钥仅在使用时从系统凭据库读取".into(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let provider = value
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Anthropic");
+    let (provider, notice) = match provider {
+        "Anthropic" => (AiProvider::Anthropic, None),
+        "Responses" => (AiProvider::Responses, None),
+        "ChatCompletions" => (
+            AiProvider::Responses,
+            Some("旧 Chat Completions 配置已改为 OpenAI Responses；请确认服务支持 /responses"),
+        ),
+        "Ollama" => (
+            AiProvider::Responses,
+            Some("旧 Ollama 配置已移除；请填写支持 Responses 的服务根地址"),
+        ),
+        _other => (
+            AiProvider::Anthropic,
+            Some("未知旧协议已改为 Anthropic Messages；请核对服务地址"),
+        ),
+    };
+    let base_url = value
+        .get("base_url")
+        .and_then(|value| value.as_str())
+        .unwrap_or(AiProvider::Anthropic.default_url())
+        .to_owned();
+    let model = value
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let config = AiConfig {
+        provider,
+        base_url,
+        model,
+    };
+    let backup = path.with_extension("json.bak-v3");
+    if !backup.exists() {
+        let _ = std::fs::write(&backup, &bytes);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&config) {
+        let _ = opencap_asr::atomic_write(path, &json);
+    }
+    let message = notice
+        .map(|notice| format!("{notice}；旧配置已备份为 ai.json.bak-v3"))
+        .unwrap_or_else(|| "AI 配置已迁移并载入".into());
+    Ok((config, message))
+}
+
+type ModelFetch = (
+    AiConfig,
+    crossbeam_channel::Receiver<Result<Vec<String>, String>>,
+);
+
 pub(super) struct AiWorkspace {
     #[cfg(feature = "ui-smoke")]
     send_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    #[cfg(feature = "ui-smoke")]
+    pub(super) correction_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     pub config: AiConfig,
     url: Entity<InputState>,
     model: Entity<InputState>,
@@ -62,6 +130,11 @@ pub(super) struct AiWorkspace {
     key_origin: Option<String>,
     credential_status: String,
     pending_key: Option<(String, String)>,
+    model_list_open: bool,
+    model_list: Vec<String>,
+    model_list_status: String,
+    model_list_service: Option<(AiProvider, String)>,
+    model_fetch: Option<ModelFetch>,
     chat: Entity<ai_chat::ChatView>,
     pub chat_dirty: bool,
     chat_reset: bool,
@@ -82,6 +155,9 @@ pub(super) struct AiWorkspace {
     pub history: MinutesHistory,
     pub status: String,
     pub credentials_busy: bool,
+    pub config_status: String,
+    pub confirm_delete_key: bool,
+    pub format_advanced_open: bool,
     pub cancelled: Arc<AtomicBool>,
     pub progress: Option<crossbeam_channel::Receiver<String>>,
 }
@@ -108,17 +184,14 @@ impl AiWorkspace {
     }
     pub fn new(window: &mut Window, cx: &mut Context<Recorder>) -> Self {
         let (config, status) = if ai_path().exists() {
-            match std::fs::read(ai_path())
-                .map_err(anyhow::Error::from)
-                .and_then(|b| serde_json::from_slice::<AiConfig>(&b).map_err(Into::into))
-            {
-                Ok(c) => (c, "AI 配置已载入；密钥仅在使用时从系统凭据库读取".into()),
+            match load_ai_config_migrating(&ai_path()) {
+                Ok((config, notice)) => (config, notice),
                 Err(_) => (AiConfig::default(), "AI 配置读取失败，请重新保存".into()),
             }
         } else {
             (
                 AiConfig::default(),
-                "默认 DeepSeek 官方 Responses；只需填写 API Key 并保存，重启后仍可使用".into(),
+                "默认 Anthropic Messages；填写兼容服务地址、模型和 API Key 后保存".into(),
             )
         };
         let format: MinutesFormat = std::fs::read(format_path())
@@ -158,6 +231,8 @@ impl AiWorkspace {
         Self {
             #[cfg(feature = "ui-smoke")]
             send_bounds: Rc::new(std::cell::Cell::new(None)),
+            #[cfg(feature = "ui-smoke")]
+            correction_bounds: Rc::new(std::cell::Cell::new(None)),
             terminology: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .placeholder("每行一条，例如：\n欧盆盖 => OpenCap\n统信 UOS\n张伟")
@@ -209,6 +284,11 @@ impl AiWorkspace {
             key_origin: None,
             credential_status: "尚未检查密钥".into(),
             pending_key: None,
+            model_list_open: false,
+            model_list: Vec::new(),
+            model_list_status: String::new(),
+            model_list_service: None,
+            model_fetch: None,
             chat,
             chat_dirty: true,
             chat_reset: true,
@@ -226,6 +306,9 @@ impl AiWorkspace {
             history: MinutesHistory::default(),
             status,
             credentials_busy: false,
+            config_status: String::new(),
+            confirm_delete_key: false,
+            format_advanced_open: false,
             cancelled: Arc::new(AtomicBool::new(false)),
             progress: None,
         }
@@ -233,6 +316,22 @@ impl AiWorkspace {
 }
 impl Recorder {
     pub(super) fn sync_ai_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ai.chat.update(cx, |chat, cx| {
+            chat.set_compact(f32::from(window.viewport_size().height) < 620., cx);
+        });
+        if self
+            .ai
+            .model_list_service
+            .as_ref()
+            .is_some_and(|(provider, url)| {
+                *provider != self.ai.config.provider || url != self.ai.url.read(cx).value().trim()
+            })
+        {
+            self.ai.model_list_open = false;
+            self.ai.model_list.clear();
+            self.ai.model_fetch = None;
+            self.ai.model_list_service = None;
+        }
         if self.ai.editor_base != self.transcript_output {
             self.persist_minutes_draft(cx);
             self.ai.editing = false;
@@ -466,9 +565,21 @@ impl Recorder {
         self.ai.credential_for = Some(origin.clone());
         self.ai.credential_status = "正在检查系统凭据库…".into();
         self.ai.credentials_busy = true;
-        let task = cx.read_credentials(&origin);
+        // Try the normalized service identity first, then legacy provider+URL
+        // identities so a protocol/URL migration does not lose the key.
+        let tasks: Vec<_> = config
+            .credential_aliases()
+            .iter()
+            .map(|id| cx.read_credentials(id))
+            .collect();
         cx.spawn(async move |entity, cx| {
-            let result = task.await;
+            let mut result = Ok(None);
+            for task in tasks {
+                result = task.await;
+                if matches!(&result, Ok(Some(_))) {
+                    break;
+                }
+            }
             let _ = entity.update(cx, |this, cx| {
                 this.ai.credentials_busy = false;
                 if this
@@ -891,8 +1002,6 @@ impl Recorder {
             provider: self.ai.config.provider,
             base_url: self.ai.url.read(cx).value().trim().into(),
             model: "credential-check".into(),
-            background: false,
-            deep_reasoning: false,
         };
         config.validate()?;
         Ok(config)
@@ -902,8 +1011,6 @@ impl Recorder {
             provider: self.ai.config.provider,
             base_url: self.ai.url.read(cx).value().trim().into(),
             model: self.ai.model.read(cx).value().trim().into(),
-            background: self.ai.config.background,
-            deep_reasoning: self.ai.config.deep_reasoning,
         };
         config.validate()?;
         Ok(config)
@@ -976,8 +1083,6 @@ impl Recorder {
                         && current.model == config.model
                         && current.provider == config.provider
                         && current.base_url == config.base_url
-                        && current.background == config.background
-                        && current.deep_reasoning == config.deep_reasoning
                 }) {
                     this.live_notes_status = "AI 服务设置已变化，本轮未开始发送。".into();
                     cx.notify();
@@ -1075,8 +1180,6 @@ impl Recorder {
                             && config.model == expected_config.model
                             && config.provider == expected_config.provider
                             && config.base_url == expected_config.base_url
-                            && config.background == expected_config.background
-                            && config.deep_reasoning == expected_config.deep_reasoning
                     });
                 match result {
                     Ok(controller) if current => {
@@ -1096,23 +1199,6 @@ impl Recorder {
             });
         })
         .detach();
-    }
-    fn set_ai_preset(&mut self, config: AiConfig, window: &mut Window, cx: &mut Context<Self>) {
-        self.ai
-            .url
-            .update(cx, |s, cx| s.set_value(config.base_url.clone(), window, cx));
-        self.ai
-            .model
-            .update(cx, |s, cx| s.set_value(config.model.clone(), window, cx));
-        self.ai.key.update(cx, |s, cx| {
-            s.set_masked(true, window, cx);
-            s.set_value("", window, cx);
-        });
-        self.ai.config = config;
-        self.ai.key_origin = None;
-        self.ai.credential_for = None;
-        self.ai.status = "已选服务预设；密钥留空可使用此前保存的密钥，填写新密钥后点击保存".into();
-        cx.notify();
     }
     fn save_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.ai.credentials_busy {
@@ -1228,7 +1314,7 @@ impl Recorder {
             return;
         }
         let key = self.ai.key.read(cx).value().trim().to_string();
-        if !key.is_empty() || (config.is_local() && config.provider == AiProvider::Ollama) {
+        if !key.is_empty() || (config.is_local()) {
             self.start_minutes(config, key, action, instruction);
             cx.notify();
             return;
@@ -1272,8 +1358,6 @@ impl Recorder {
                     && this.ai_config_from_inputs(cx).is_ok_and(|current| {
                         current.credential_id() == config.credential_id()
                             && current.model == config.model
-                            && current.background == config.background
-                            && current.deep_reasoning == config.deep_reasoning
                     });
                 if !unchanged {
                     this.ai.status =

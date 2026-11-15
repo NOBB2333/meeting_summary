@@ -1212,7 +1212,14 @@ impl Recorder {
                     && self.transcript.source.as_deref() == Some(media))
                     || self.can_retry_library_player(base, media)
             });
-        ui::card()
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(rgb(0xf8fafd))
+            .border_1()
+            .border_color(rgb(0xf8fafd))
             .id("player-keyboard-scope")
             .track_focus(&self.player_keyboard_focus)
             .focus(|style| style.border_color(rgb(ACCENT)))
@@ -1239,19 +1246,20 @@ impl Recorder {
             }))
             .p_3()
             .gap_2()
-            .child(label(format!(
-                "内置回放 · {status} · {} / {duration}",
-                opencap_asr::timestamp(position, '.')
-            )))
+            .child(div().flex().items_center().justify_between().gap_2()
+                .child(label(format!(
+                    "内置回放 · {status} · {} / {duration}",
+                    opencap_asr::timestamp(position, '.')
+                )))
+                .child(ui::icon_button("focus-player-shortcuts", gpui::assets::IconName::Keyboard, "播放器键盘控制")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.player_keyboard_focus.focus(window, cx);
+                        this.message = "播放器键盘控制：空格播放或暂停，左右跳转 10 秒，上下调整音量。按 Tab 返回其他控件。".into();
+                        cx.notify();
+                    }))))
             .when_some(source_status, |view, status| view.child(label(status)))
             .when(self.player_matches_transcript_source(), |d|
                 d.child(label("选择两句“选段”可回听或循环连续范围。")))
-            .child(button("focus-player-shortcuts", "键盘控制", false).ghost()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.player_keyboard_focus.focus(window, cx);
-                    this.message = "播放器键盘控制：空格播放或暂停，左右跳转 10 秒，上下调整音量。按 Tab 返回其他控件。".into();
-                    cx.notify();
-                })))
             .child(
                 gpui::component::slider::Slider::new(&self.player_slider)
                     .w_full()
@@ -1269,8 +1277,9 @@ impl Recorder {
             .when(snapshot.has_video, |d| {
                 d.child(
                     div()
-                        .h(px(200.))
                         .w_full()
+                        .aspect_ratio(widgets::image_aspect(self.player_image.as_ref()))
+                        .min_h(px(120.))
                         .bg(rgb(0x090a0c))
                         .overflow_hidden()
                         .flex()
@@ -1365,11 +1374,7 @@ impl Recorder {
                     .flex_wrap()
                     .gap_2()
                     .child(
-                        button(
-                            "player-toggle",
-                            if playing { "暂停" } else { "播放" },
-                            false,
-                        )
+                        ui::icon_button("player-toggle", if playing { gpui::component::IconName::Pause } else { gpui::component::IconName::Play }, if playing { "暂停" } else { "播放" })
                         .disabled(
                             self.active()
                                 || matches!(
@@ -1389,7 +1394,7 @@ impl Recorder {
                         })),
                     )
                     .child(
-                        button("player-back", "后退 10 秒", false)
+                        ui::icon_button("player-back", gpui::assets::IconName::RotateCcw, "后退 10 秒")
                             .disabled(self.active())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.send_player(PlaybackCommand::Seek(
@@ -1399,7 +1404,7 @@ impl Recorder {
                             })),
                     )
                     .child(
-                        button("player-forward", "前进 10 秒", false)
+                        ui::icon_button("player-forward", gpui::component::IconName::RotateCw, "前进 10 秒")
                             .disabled(self.active())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.send_player(PlaybackCommand::Seek(
@@ -1409,7 +1414,7 @@ impl Recorder {
                             })),
                     )
                     .child(
-                        button("player-volume-down", "音量 −", false)
+                        ui::icon_button("player-volume-down", gpui::assets::IconName::Volume1, "降低音量")
                             .disabled(volume <= 0.)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.send_player(PlaybackCommand::SetVolume(
@@ -1420,7 +1425,7 @@ impl Recorder {
                     )
                     .child(label(format!("{:.0}%", volume * 100.)))
                     .child(
-                        button("player-volume-up", "音量 +", false)
+                        ui::icon_button("player-volume-up", gpui::assets::IconName::Volume2, "提高音量")
                             .disabled(volume >= 1.)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.send_player(PlaybackCommand::SetVolume(

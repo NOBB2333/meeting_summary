@@ -6,6 +6,78 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+const LIVE_FIRST_WAIT: Duration = Duration::from_secs(60);
+const LIVE_INTERVAL: Duration = Duration::from_secs(120);
+const LIVE_MAX_WAIT: Duration = Duration::from_secs(180);
+const LIVE_PAUSE: Duration = Duration::from_secs(8);
+
+fn live_request_due(
+    input_done: bool,
+    has_work: bool,
+    enough: bool,
+    stale: bool,
+    pending_age: Duration,
+    quiet_for: Duration,
+    since_request: Option<Duration>,
+) -> bool {
+    if input_done {
+        return since_request.is_none_or(|age| age >= Duration::from_secs(5));
+    }
+    if !has_work {
+        return false;
+    }
+    match since_request {
+        None => {
+            pending_age >= LIVE_FIRST_WAIT
+                && ((enough && quiet_for >= LIVE_PAUSE) || pending_age >= LIVE_INTERVAL)
+        }
+        Some(age) => {
+            age >= LIVE_INTERVAL
+                && (((enough || stale) && quiet_for >= LIVE_PAUSE) || age >= LIVE_MAX_WAIT)
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RecordingTokenUsage {
+    pub run_id: Option<String>,
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
+    pub reported: u32,
+    pub unreported: u32,
+}
+impl RecordingTokenUsage {
+    fn record(&mut self, usage: Option<opencap_asr::AiTokenUsage>) {
+        if let Some(usage) = usage {
+            self.input = self.input.saturating_add(usage.input_tokens);
+            self.output = self.output.saturating_add(usage.output_tokens);
+            self.cached = self.cached.saturating_add(usage.cached_input_tokens);
+            self.reported = self.reported.saturating_add(1);
+        } else {
+            self.unreported = self.unreported.saturating_add(1);
+        }
+    }
+    pub fn label(&self) -> String {
+        if self.reported > 0 {
+            format!(
+                "实时纪要 Token：入 {} / 出 {}{}",
+                self.input,
+                self.output,
+                if self.unreported > 0 {
+                    " · 部分未报告"
+                } else {
+                    ""
+                }
+            )
+        } else if self.unreported > 0 {
+            "实时纪要 Token：服务未报告".into()
+        } else {
+            "实时纪要 Token：暂无数据".into()
+        }
+    }
+}
+
 pub(super) struct Controller {
     pub base: PathBuf,
     pub notes: opencap_asr::LiveNotes,
@@ -17,7 +89,13 @@ pub(super) struct Controller {
     config: opencap_asr::AiConfig,
     key: String,
     cancelled: Arc<AtomicBool>,
-    response: Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::NoteProposal>>>,
+    response: Option<
+        crossbeam_channel::Receiver<(
+            anyhow::Result<opencap_asr::NoteProposal>,
+            Option<opencap_asr::AiTokenUsage>,
+        )>,
+    >,
+    usage_updates: Vec<Option<opencap_asr::AiTokenUsage>>,
     request: Option<opencap_asr::LiveNotesRequest>,
     pending_save: Option<(opencap_asr::LiveNotes, bool)>,
     export: Option<crossbeam_channel::Receiver<anyhow::Result<PathBuf>>>,
@@ -25,6 +103,9 @@ pub(super) struct Controller {
     export_status: Option<String>,
     indexed_revision: u64,
     last_started: Option<Instant>,
+    pending_signature: Option<(usize, u64)>,
+    pending_since: Option<Instant>,
+    stable_change_at: Option<Instant>,
     pub status: String,
     pub enabled: bool,
     pub finished: bool,
@@ -94,6 +175,7 @@ impl Controller {
             key,
             cancelled: Arc::new(AtomicBool::new(false)),
             response: None,
+            usage_updates: Vec::new(),
             request: None,
             pending_save: None,
             export: None,
@@ -101,6 +183,9 @@ impl Controller {
             export_status: None,
             indexed_revision,
             last_started: None,
+            pending_signature: None,
+            pending_since: None,
+            stable_change_at: None,
             status: "等待已稳定的转写内容…".into(),
             enabled: true,
             finished: false,
@@ -248,12 +333,13 @@ impl Controller {
             Ok(value) => Some(value),
             Err(crossbeam_channel::TryRecvError::Empty) => None,
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                Some(Err(anyhow::anyhow!("实时纪要线程已退出")))
+                Some((Err(anyhow::anyhow!("实时纪要线程已退出")), None))
             }
         });
-        if let Some(reply) = reply {
+        if let Some((reply, usage)) = reply {
             changed = true;
             self.response = None;
+            self.usage_updates.push(usage);
             if let Some(request) = self.request.take() {
                 match reply {
                     Ok(proposal) => {
@@ -419,20 +505,43 @@ impl Controller {
         let voiced_ms = pending.iter().fold(0u64, |sum, s| {
             sum.saturating_add(s.end_ms.saturating_sub(s.start_ms))
         });
-        let first_ready = pending.len() >= 3 || voiced_ms >= 20_000;
-        let interval_ready = self
-            .last_started
-            .is_none_or(|time| time.elapsed() >= Duration::from_secs(30));
+        let chars = pending
+            .iter()
+            .flat_map(|s| s.text.chars())
+            .take(300)
+            .count();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for segment in &pending {
+            segment.id.hash(&mut hasher);
+            segment.revision.hash(&mut hasher);
+        }
+        let signature = (!pending.is_empty()).then_some((pending.len(), hasher.finish()));
+        let now = Instant::now();
+        if signature != self.pending_signature {
+            self.pending_signature = signature;
+            self.stable_change_at = Some(now);
+        }
         let has_work = !pending.is_empty() || stale;
+        if !has_work {
+            self.pending_since = None;
+        } else if self.pending_since.is_none() {
+            self.pending_since = Some(now);
+            self.stable_change_at.get_or_insert(now);
+        }
         let final_pass = input_done && !has_work;
-        let ready = if input_done {
+        let ready = live_request_due(
+            input_done,
+            has_work,
+            pending.len() >= 6 || voiced_ms >= 45_000 || chars >= 300,
+            stale,
+            self.pending_since
+                .map_or(Duration::ZERO, |time| now.saturating_duration_since(time)),
+            self.stable_change_at
+                .map_or(Duration::ZERO, |time| now.saturating_duration_since(time)),
             self.last_started
-                .is_none_or(|time| time.elapsed() >= Duration::from_secs(5))
-        } else if self.last_started.is_none() {
-            first_ready
-        } else {
-            has_work && interval_ready
-        };
+                .map(|time| now.saturating_duration_since(time)),
+        );
         if !ready {
             return changed;
         }
@@ -470,7 +579,7 @@ impl Controller {
                 if let Err(error) = std::thread::Builder::new()
                     .name("opencap-live-notes-request".into())
                     .spawn(move || {
-                        let _ = tx.send(opencap_asr::request_live_notes(
+                        let _ = tx.send(opencap_asr::request_live_notes_with_usage(
                             &config, &key, &work, &cancelled,
                         ));
                     })
@@ -720,8 +829,143 @@ impl Recorder {
             self.meeting_scan_extra.insert(controller.base.clone());
             self.notes_index_pending = Some(Instant::now());
         }
+        // The ASR run identity arrives asynchronously after recording starts.
+        if self.recording_token_usage.run_id.is_none()
+            && !capture_inactive
+            && self.asr_live
+            && controller.matches_transcript(self.transcript_output.as_ref(), &self.transcript)
+        {
+            self.recording_token_usage.run_id = Some(controller.notes.run_id.clone());
+        }
+        if self.recording_token_usage.run_id.as_deref() == Some(controller.notes.run_id.as_str()) {
+            for usage in controller.usage_updates.drain(..) {
+                self.recording_token_usage.record(usage);
+            }
+        } else {
+            controller.usage_updates.clear();
+        }
         changed || export_changed
     }
+    /// Compact live output for the recording workspace. Full editing remains in meeting details.
+    pub(super) fn live_minutes_overview(&self, cx: &Context<Self>) -> Div {
+        let current = self.live_notes.as_ref().filter(|controller| {
+            !(self.active() && self.recording_without_live_due_to_task)
+                && controller.matches_transcript(self.transcript_output.as_ref(), &self.transcript)
+        });
+        let can_start = self.transcript_output.is_some()
+            && self.transcript.run.is_some()
+            && self.asr.as_ref().is_some_and(|asr| !asr.finished())
+            && !self.live_notes_credentials_busy
+            && !self.live_notes_preparing
+            && !self.recording_without_live_due_to_task
+            && self.live_notes.is_none();
+        let mut card = ui::card().min_h_full().child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(ui::section_title(
+                    "AI 实时纪要",
+                    "稳定句段合并整理，优先等待停顿",
+                ))
+                .when(current.is_some(), |d| {
+                    d.child(
+                        button("home-manage-live-notes", "查看与管理", false)
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.transcription_tab = true;
+                                this.settings = false;
+                                this.meeting_page = workspace::MeetingPage::Transcript;
+                                this.transcript_media_tab = true;
+                                this.live_notes_management_open = true;
+                                this.page_scroll.set_offset(point(px(0.), px(0.)));
+                                cx.notify();
+                            })),
+                    )
+                }),
+        );
+        if let Some(controller) = current {
+            card = card.child(label(controller.status.clone())).child(label(
+                "首次约 1–2 分钟；之后至少间隔 2 分钟，有新内容才更新。停止后会补齐。",
+            ));
+            if controller.notes.items.is_empty() {
+                card = card.child(label("等待可整理的稳定转写内容。"));
+            } else {
+                let count = controller.notes.items.len();
+                if count > 30 {
+                    card = card.child(label(format!(
+                        "显示最近 30 条，共 {count} 条；可打开完整纪要管理。"
+                    )));
+                }
+                card = card.children(
+                    controller
+                        .notes
+                        .items
+                        .iter()
+                        .skip(count.saturating_sub(30))
+                        .map(|item| {
+                            let kind = match item.kind {
+                                opencap_asr::LiveNoteKind::Topic => "议题",
+                                opencap_asr::LiveNoteKind::Point => "要点",
+                                opencap_asr::LiveNoteKind::Decision => "决定",
+                                opencap_asr::LiveNoteKind::Action => "待办",
+                                opencap_asr::LiveNoteKind::Risk => "风险",
+                                opencap_asr::LiveNoteKind::Unresolved => "待解决",
+                            };
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .pb_3()
+                                .border_b_1()
+                                .border_color(rgb(BORDER))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(ui::badge(kind, ACCENT, SOFT))
+                                        .when(item.needs_review, |d| d.child(label("待核对"))),
+                                )
+                                .child(div().text_sm().child(item.text.clone()))
+                                .when(item.owner.is_some() || item.due.is_some(), |d| {
+                                    d.child(label(format!(
+                                        "{}{}",
+                                        item.owner.as_deref().unwrap_or(""),
+                                        item.due
+                                            .as_ref()
+                                            .map(|due| format!(" · {due}"))
+                                            .unwrap_or_default()
+                                    )))
+                                })
+                        }),
+                );
+            }
+        } else {
+            card = card
+                .child(label(if self.live_notes.is_some() {
+                    "另一场会议的实时纪要仍在处理，本场尚未开启。"
+                } else if self.active() {
+                    "开启后会将稳定的转写文字发送给已配置的 AI 服务。"
+                } else {
+                    "开始录制并启动转写后，可以开启实时纪要。"
+                }))
+                .child(label("首次约 1–2 分钟，之后每次至少间隔 2 分钟，优先在停顿后处理；不会判断话题是否真正结束。"))
+                .when(!self.live_notes_status.is_empty(), |d| {
+                    d.child(label(self.live_notes_status.clone()))
+                })
+                .child(
+                    div().flex().child(
+                        button("home-enable-live-notes", "开启实时纪要", false)
+                            .disabled(!can_start)
+                            .on_click(cx.listener(|this, _, _, cx| this.enable_live_notes(cx))),
+                    ),
+                );
+        }
+        card
+    }
+
     pub(super) fn live_notes_panel(&self, cx: &Context<Self>) -> Div {
         let can_start = self.transcript_output.is_some()
             && self.transcript.run.is_some()
@@ -729,10 +973,15 @@ impl Recorder {
             && !self.live_notes_credentials_busy
             && !self.live_notes_preparing;
         let mut view = div()
+            .w_full()
             .flex()
             .flex_col()
+            .items_start()
             .gap_2()
-            .child(label("增量纪要（开启后向当前 AI 服务发送稳定转写）"));
+            .child(label("增量纪要（开启后向当前 AI 服务发送稳定转写）"))
+            .child(label(
+                "首次约 1–2 分钟，之后至少间隔 2 分钟；优先等待停顿，停止后补齐。",
+            ));
         if let Some(base) = &self.transcript_output
             && let Some(folder) = base.parent().map(|path| path.to_path_buf())
         {
@@ -2002,5 +2251,118 @@ impl Recorder {
             );
         }
         view
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::{RecordingTokenUsage, live_request_due};
+    use std::time::Duration;
+    #[test]
+    fn batches_live_requests_and_flushes_when_input_finishes() {
+        let sec = Duration::from_secs;
+        assert!(!live_request_due(
+            false,
+            true,
+            true,
+            false,
+            sec(59),
+            sec(9),
+            None
+        ));
+        assert!(live_request_due(
+            false,
+            true,
+            true,
+            false,
+            sec(60),
+            sec(8),
+            None
+        ));
+        assert!(!live_request_due(
+            false,
+            true,
+            false,
+            false,
+            sec(119),
+            sec(50),
+            None
+        ));
+        assert!(live_request_due(
+            false,
+            true,
+            false,
+            false,
+            sec(120),
+            sec(50),
+            None
+        ));
+        assert!(!live_request_due(
+            false,
+            true,
+            true,
+            false,
+            sec(120),
+            sec(8),
+            Some(sec(119))
+        ));
+        assert!(live_request_due(
+            false,
+            true,
+            true,
+            false,
+            sec(120),
+            sec(8),
+            Some(sec(120))
+        ));
+        assert!(live_request_due(
+            false,
+            true,
+            false,
+            false,
+            sec(5),
+            sec(0),
+            Some(sec(180))
+        ));
+        assert!(!live_request_due(
+            false,
+            false,
+            true,
+            false,
+            sec(300),
+            sec(300),
+            Some(sec(300))
+        ));
+        assert!(!live_request_due(
+            true,
+            true,
+            false,
+            false,
+            sec(0),
+            sec(0),
+            Some(sec(4))
+        ));
+        assert!(live_request_due(
+            true,
+            true,
+            false,
+            false,
+            sec(0),
+            sec(0),
+            Some(sec(5))
+        ));
+    }
+    #[test]
+    fn token_label_reports_missing_usage_without_estimating_it() {
+        let mut usage = RecordingTokenUsage::default();
+        assert!(usage.label().contains("暂无数据"));
+        usage.record(Some(opencap_asr::AiTokenUsage {
+            input_tokens: 150,
+            output_tokens: 20,
+            cached_input_tokens: 50,
+        }));
+        usage.record(None);
+        assert!(usage.label().contains("入 150 / 出 20"));
+        assert!(usage.label().contains("部分未报告"));
     }
 }

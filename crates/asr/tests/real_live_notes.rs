@@ -14,8 +14,6 @@ fn deepseek_live_notes_returns_valid_cited_json() {
         base_url: std::env::var("OPENCAP_REAL_AI_BASE")
             .unwrap_or_else(|_| "https://api.deepseek.com".into()),
         model: std::env::var("OPENCAP_REAL_AI_MODEL").unwrap_or_else(|_| "deepseek-flash".into()),
-        background: false,
-        deep_reasoning: false,
     };
     let run = TranscriptionRun {
         run_id: "run-real-test".into(),

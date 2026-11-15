@@ -2,6 +2,14 @@ use super::*;
 
 impl Recorder {
     pub(super) fn recording_view(&self, width: f32, height: f32, cx: &Context<Self>) -> Div {
+        let wide = ui::two_columns(width);
+        let show_live = !self.config.recording_transcript_collapsed;
+        let pane_height = (height - 150.).max(320.);
+        let capture_width = if wide && show_live {
+            width * 0.62
+        } else {
+            width
+        };
         let target = if let CaptureTarget::Region { rect, .. } = self.config.target {
             format!("录制区域 · {} × {}", rect.width, rect.height)
         } else {
@@ -9,21 +17,93 @@ impl Recorder {
                 .iter()
                 .find(|t| same_target(&t.target, &self.config.target))
                 .map(|t| format!("{} · {} × {}", t.name, t.width, t.height))
-                .unwrap_or_else(|| "选择要录制的画面".into())
+                .unwrap_or_else(|| match self.config.target {
+                    CaptureTarget::Monitor(index) => format!("显示器 {}", index + 1),
+                    _ => "选择要录制的画面".into(),
+                })
         };
         let screen = ui::card()
-            .flex_1()
-            .child(ui::section_title(
-                "录制方式",
-                "选择画面录制，或只保存会议声音",
-            ))
             .child(
-                div().flex().flex_wrap().gap_2().children(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(ui::section_title(
+                        "录制方式与画面",
+                        "选择要录制的屏幕或窗口",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .when(wide, |d| {
+                                d.child(
+                                    button("jump-live-workspace", "纪要与全文", false)
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.page_scroll.set_offset(point(
+                                                px(0.),
+                                                px(-(pane_height + 20.)),
+                                            ));
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .when(wide && show_live, |d| {
+                                d.child(
+                                    ui::icon_button(
+                                        "swap-recording-panes",
+                                        gpui::assets::IconName::ArrowLeftRight,
+                                        "交换左右区域",
+                                    )
+                                    .ghost()
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.config.meeting_media_on_right =
+                                                !this.config.meeting_media_on_right;
+                                            this.save();
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            })
+                            .child(
+                                ui::icon_button(
+                                    "toggle-home-transcript",
+                                    if show_live {
+                                        gpui::assets::IconName::PanelRightClose
+                                    } else {
+                                        gpui::assets::IconName::PanelRightOpen
+                                    },
+                                    if show_live {
+                                        "收起录制配置"
+                                    } else {
+                                        "展开录制配置"
+                                    },
+                                )
+                                .ghost()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.config.recording_transcript_collapsed =
+                                            !this.config.recording_transcript_collapsed;
+                                        this.save();
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    ),
+            )
+            .child(
+                div().flex().flex_wrap().gap_1().children(
                     ["整个屏幕", "应用窗口", "指定区域", "仅录音"]
                         .into_iter()
                         .enumerate()
                         .map(|(i, text)| {
                             button(("mode", i), text, self.mode == i)
+                                .ghost()
+                                .when(self.mode == i, |b| b.bg(rgb(SOFT)).text_color(rgb(ACCENT)))
                                 .disabled(self.active())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.change_mode(i);
@@ -34,12 +114,24 @@ impl Recorder {
             )
             .when(!self.config.audio_only, |d| {
                 d.child(
-                    button("target", target, false)
+                    Button::new("target")
+                        .accessibility_label(format!("{}，切换画面", target))
+                        .outline()
                         .w_full()
                         .min_w(px(0.))
                         .overflow_hidden()
-                        .justify_start()
-                        .h(px(42.))
+                        .h(px(40.))
+                        .bg(rgb(0xf8fafd))
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(div().min_w(px(0.)).truncate().child(target))
+                                .child(ui::badge("切换画面", ACCENT, SOFT)),
+                        )
                         .disabled(self.active())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.choose_target();
@@ -50,7 +142,13 @@ impl Recorder {
             .when(self.config.audio_only, |d| {
                 d.child(
                     div()
-                        .py_6()
+                        .h(px(250.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(0xf8fafd))
+                        .justify_center()
+                        .items_center()
                         .flex()
                         .flex_col()
                         .gap_3()
@@ -63,6 +161,9 @@ impl Recorder {
                             ))
                         }),
                 )
+            })
+            .when(self.config.audio_only && self.active(), |d| {
+                d.child(self.recording_timeline())
             })
             .when(self.mode == 2, |d| {
                 d.child(
@@ -82,88 +183,16 @@ impl Recorder {
                     })),
                 )
             })
-            .when(self.choosing_target, |d| {
-                d.child(self.target_picker(width - 40., cx))
-            })
-            .when(!self.choosing_target && !self.config.audio_only, |d| {
-                d.child(self.recording_preview(cx))
-            });
-        let content = if ui::two_columns(width) && !self.choosing_target {
-            use gpui::component::resizable::{h_resizable, resizable_panel};
-            let capture = div()
-                .id("recording-capture-scroll")
-                .size_full()
-                .min_h(px(0.))
-                .flex()
-                .flex_col()
-                .gap_3()
-                .overflow_y_scroll()
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .child(screen)
-                .child(self.recording_options(cx));
-            let text = div()
-                .id("recording-transcript-scroll")
-                .size_full()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .child(self.live_transcript_card(cx));
-            let capture = resizable_panel()
-                .size(px(width * 0.52))
-                .size_range(px(300.)..px(width - 320.))
-                .child(capture);
-            let text = resizable_panel()
-                .size(px(width * 0.48))
-                .size_range(px(300.)..px(width - 320.))
-                .child(text);
-            let split = h_resizable("recording-workspace-split");
-            let split = if self.config.meeting_media_on_right {
-                split.child(text).child(capture)
-            } else {
-                split.child(capture).child(text)
-            };
-            div().h(px((height - 220.).max(420.))).w_full().child(split)
-        } else {
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_5()
-                .child(screen)
-                .when(!self.choosing_target, |d| {
-                    d.child(self.recording_options(cx))
+            .when(!self.config.audio_only, |d| {
+                d.child(if self.choosing_target {
+                    self.target_picker(capture_width - 40., cx)
+                } else {
+                    self.recording_preview(cx)
                 })
-                .child(self.live_transcript_card(cx))
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(ui::heading(
-                        "录制工作台",
-                        "准备好画面和声音，专注会议本身。",
-                    ))
-                    .when(ui::two_columns(width) && !self.choosing_target, |d| {
-                        d.child(
-                            button("swap-recording-panes", "交换左右区域", false)
-                                .ghost()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.config.meeting_media_on_right =
-                                        !this.config.meeting_media_on_right;
-                                    this.save();
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            )
-            .child(content)
-            .when(!self.recoverables.is_empty(), |d| {
+            });
+        let capture_content = div().w_full().flex().flex_col().gap_3().child(screen).when(
+            !self.recoverables.is_empty(),
+            |d| {
                 d.child(
                     ui::card()
                         .child(ui::section_title(
@@ -183,7 +212,115 @@ impl Recorder {
                             })),
                         ),
                 )
-            })
+            },
+        );
+        let first = if wide {
+            let capture = widgets::pane_scrollable(
+                "recording-capture-scroll",
+                capture_content,
+                &self.recording_capture_scroll,
+            );
+            if show_live {
+                use gpui::component::resizable::resizable_panel;
+                let capture = resizable_panel()
+                    .size(px(width * 0.62))
+                    .size_range(px(320.)..px(width - 300.))
+                    .when(self.config.meeting_media_on_right, |p| p.pl_2())
+                    .when(!self.config.meeting_media_on_right, |p| p.pr_2())
+                    .child(capture);
+                let text = resizable_panel()
+                    .size(px(width * 0.38))
+                    .size_range(px(280.)..px(width - 320.))
+                    .when(self.config.meeting_media_on_right, |p| p.pr_2())
+                    .when(!self.config.meeting_media_on_right, |p| p.pl_2())
+                    .child(widgets::pane_scrollable(
+                        "recording-config-scroll",
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(self.recording_options(cx))
+                            .child(self.recording_models_summary(cx)),
+                        &self.recording_config_scroll,
+                    ));
+                let split = ui::spaced_split("recording-workspace-v3");
+                let split = if self.config.meeting_media_on_right {
+                    split.child(text).child(capture)
+                } else {
+                    split.child(capture).child(text)
+                };
+                div().w_full().h(px(pane_height)).child(split)
+            } else {
+                div().w_full().h(px(pane_height)).child(capture)
+            }
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(capture_content)
+                .when(show_live, |d| {
+                    d.child(self.recording_options(cx))
+                        .child(self.recording_models_summary(cx))
+                })
+        };
+        let notes = widgets::pane_scrollable(
+            "home-live-notes-scroll",
+            self.live_minutes_overview(cx),
+            &self.live_minutes_scroll,
+        );
+        let details = if wide {
+            div()
+                .w_full()
+                .h(px((pane_height - 48.).max(280.)))
+                .flex()
+                .gap_4()
+                .child(div().flex_1().min_w(px(0.)).h_full().child(notes))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h_full()
+                        .child(self.home_transcript_detail_card()),
+                )
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(div().h(px(400.)).child(notes))
+                .child(div().h(px(440.)).child(self.home_transcript_detail_card()))
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(first)
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(ui::section_title(
+                        "实时纪要与全文",
+                        "录制过程中可向上查看画面",
+                    ))
+                    .child(
+                        button("back-to-recording-preview", "返回画面", false)
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.page_scroll.set_offset(point(px(0.), px(0.)));
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(details)
     }
     fn target_picker(&self, width: f32, cx: &Context<Self>) -> Div {
         let targets: Vec<_> = self
@@ -236,7 +373,7 @@ impl Recorder {
                         .hover(|s| s.bg(rgb(SOFT)))
                         .child(
                             div()
-                                .h(px(120.))
+                                .h(px(92.))
                                 .w_full()
                                 .overflow_hidden()
                                 .bg(rgb(0x090a0c))
@@ -293,53 +430,37 @@ impl Recorder {
                         columns
                     )))
                     .child(
-                        button(
-                            "expand-targets",
-                            if self.targets_expanded {
-                                "收起列表"
-                            } else {
-                                "展开全部"
-                            },
-                            self.targets_expanded,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.targets_expanded = !this.targets_expanded;
-                            this.target_scroll.set_offset(point(px(0.), px(0.)));
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        button("refresh-targets", "刷新窗口", false).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.refresh_targets();
-                                cx.notify();
-                            },
-                        )),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(button("expand-targets", "返回预览", false).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_targets();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(button("refresh-targets", "刷新窗口", false).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.refresh_targets();
+                                    cx.notify();
+                                }),
+                            )),
                     ),
             )
-            .child(if self.targets_expanded {
-                content
-            } else {
+            .child(
                 div()
-                    .h(px(if self.mode == 1 { 345. } else { 195. }))
+                    .h(px(205.))
                     .flex_shrink_0()
-                    .child(widgets::scrollable(
+                    .child(widgets::contained_scrollable(
                         "target-list",
                         content,
                         &self.target_scroll,
-                    ))
-            })
+                    )),
+            )
     }
     fn recording_options(&self, cx: &Context<Self>) -> Div {
         ui::card()
-            .child(ui::section_title(
-                if self.config.audio_only {
-                    "录音声音"
-                } else {
-                    "声音与画质"
-                },
-                "录制前确认声音来源",
-            ))
             .child(
                 div()
                     .flex()
@@ -347,27 +468,31 @@ impl Recorder {
                     .items_center()
                     .flex_wrap()
                     .gap_3()
-                    .child(label("声音来源"))
-                    .when(!self.active(), |d| {
-                        d.child(
-                            button(
-                                "monitor-levels-inline",
-                                if self.config.monitor_levels {
-                                    "电平检测：开"
-                                } else {
-                                    "电平检测：关"
-                                },
-                                self.config.monitor_levels,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.config.monitor_levels = !this.config.monitor_levels;
-                                this.monitor = None;
-                                this.monitor_levels = (AudioRouteLevels::default(), AudioRouteLevels::default());
-                                this.save();
-                                cx.notify();
-                            })),
+                    .child(ui::section_title("声音来源", "录制前后均可检查电平"))
+                    .child(
+                        button(
+                            "monitor-levels-inline",
+                            if self.config.monitor_levels {
+                                "电平检测：开"
+                            } else {
+                                "电平检测：关"
+                            },
+                            self.config.monitor_levels,
                         )
-                    }),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.config.monitor_levels = !this.config.monitor_levels;
+                            if let Some(session) = &this.session {
+                                session.command(RecordingCommand::SetLevelMeter(
+                                    this.config.monitor_levels,
+                                ));
+                            }
+                            this.monitor = None;
+                            this.monitor_levels =
+                                (AudioRouteLevels::default(), AudioRouteLevels::default());
+                            this.save();
+                            cx.notify();
+                        })),
+                    ),
             )
             .child(
                 div()
@@ -381,53 +506,6 @@ impl Recorder {
                 d.child(label(
                     "打开“电平检测”可在未录制时确认这两路是否真的有声音。",
                 ))
-            })
-            .when(!self.config.audio_only, |d| {
-                d.child(label("画质与体积"))
-                    .child(
-                        div().flex().flex_wrap().gap_2().children(
-                            [
-                                (Preset::Space, "省空间"),
-                                (Preset::Balanced, "平衡"),
-                                (Preset::Quality, "高质量"),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (p, t))| {
-                                button(("preset", i), t, self.config.preset == p)
-                                    .disabled(self.active())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if !this.active() {
-                                            this.config.apply_preset(p);
-                                            this.save();
-                                        }
-                                        cx.notify();
-                                    }))
-                            }),
-                        ),
-                    )
-                    .child(label("省空间适合文档和会议；画面越动态，文件越大。"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                button("reduce-recording-load", "一键降低占用", false)
-                                    .disabled(self.active())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if !this.active() {
-                                            this.config.reduce_recording_load();
-                                            this.save();
-                                            this.message = "已降低画面采集和编码负载；预览与实时转录保持原设置。".into();
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(label(format!("当前最高 {} FPS", self.config.max_fps))),
-                    )
-                    .child(label("适合老电脑：最高 10 FPS、自动编码优先 H.264，并加快软件编码。预览和实时转录保持原设置；画面流畅度或质量可能降低，文件可能变大。"))
             })
             .when(self.config.audio_only, |d| {
                 d.child(label("无需采集或编码画面，适合长时间会议录音。"))
@@ -448,9 +526,9 @@ impl Recorder {
                     } else if self.active() {
                         "录制预览 · 正在写入的画面"
                     } else if self.preview_image.is_some() {
-                        "录制预览 · 最后一帧"
+                        "录制前预览 · 当前选择的画面"
                     } else {
-                        "录制预览"
+                        "录制前预览"
                     }))
                     .child(
                         button(
@@ -479,9 +557,16 @@ impl Recorder {
                 d.child(
                     div()
                         .w_full()
-                        .h(px(300.))
+                        .aspect_ratio(widgets::image_aspect(self.preview_image.as_ref()))
+                        .min_h(px(150.))
                         .rounded_lg()
-                        .bg(rgb(0x090a0c))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(if self.preview_image.is_some() {
+                            0x090a0c
+                        } else {
+                            0xeff3fb
+                        }))
                         .overflow_hidden()
                         .flex()
                         .items_center()
@@ -495,29 +580,66 @@ impl Recorder {
                                     .flex()
                                     .flex_col()
                                     .items_center()
-                                    .gap_3()
+                                    .gap_2()
                                     .child(
-                                        ui::icon(gpui::component::IconName::GalleryVerticalEnd)
-                                            .size(px(36.))
-                                            .text_color(rgb(0x8291aa)),
+                                        ui::icon(gpui::assets::IconName::Monitor)
+                                            .size(px(26.))
+                                            .text_color(rgb(MUTED)),
                                     )
-                                    .child(div().text_sm().text_color(rgb(0xc7d2e4)).child(
-                                        if self.active() {
-                                            "等待录制画面…"
-                                        } else {
-                                            "画面将在开始录制后显示"
-                                        },
-                                    ))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0x91a1ba))
-                                            .child("实际捕获画面 · 与保存的视频一致"),
-                                    ),
+                                    .child(label(if self.idle_preview_error.is_some() {
+                                        "无法获取预览画面，请检查屏幕录制权限和所选目标。"
+                                    } else if self.active() {
+                                        "等待录制画面…"
+                                    } else {
+                                        "正在获取所选画面…"
+                                    }))
+                                    .when_some(self.idle_preview_error.clone(), |d, error| {
+                                        d.child(label(error)).child(
+                                            button("retry-idle-preview", "重新尝试", false)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.idle_preview.take();
+                                                    this.idle_preview_error = None;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    }),
                             )
                         }),
                 )
             })
+            .when(self.active(), |d| d.child(self.recording_timeline()))
+    }
+    fn recording_timeline(&self) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .pt_1()
+            .child(ui::badge(
+                if self.stats.state == RecordingState::Paused {
+                    "已暂停"
+                } else {
+                    "LIVE"
+                },
+                RED,
+                0xfdecee,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().h(px(3.)).rounded_full().bg(rgb(ACCENT)))
+                    .child(div().size(px(8.)).rounded_full().bg(rgb(RED))),
+            )
+            .child(
+                div()
+                    .font_family(MONO_FONT)
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(time_text(self.stats.duration_seconds)),
+            )
     }
     fn audio_row(&self, kind: AudioKind, cx: &Context<Self>) -> Div {
         let enabled = if kind == AudioKind::System {
@@ -533,17 +655,27 @@ impl Recorder {
         let index: usize = if kind == AudioKind::System { 0 } else { 1 };
         let row = div()
             .flex()
-            .justify_between()
-            .items_center()
-            .gap_3()
+            .flex_col()
+            .items_start()
+            .gap_1()
+            .child(
+                button(
+                    ("audio", index),
+                    format!("{}：{}", name, if enabled { "开" } else { "关" }),
+                    enabled,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_audio(kind);
+                    cx.notify();
+                })),
+            )
             .child(
                 div()
-                    .flex_1()
+                    .w_full()
                     .min_w(px(0.))
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(name)
                     .child(
                         div()
                             .id(("device", index))
@@ -609,21 +741,10 @@ impl Recorder {
                         };
                         d.child(div().text_xs().text_color(rgb(MUTED)).child(detail))
                     }),
-            )
-            .child(
-                button(
-                    ("audio", index),
-                    if enabled { "已开启" } else { "已关闭" },
-                    enabled,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_audio(kind);
-                    cx.notify();
-                })),
             );
         // While recording the session reports levels; otherwise the optional idle
         // monitor does, so the bar means the same thing in both states.
-        let levels = if !enabled {
+        let levels = if !enabled || !self.config.monitor_levels {
             AudioRouteLevels::default()
         } else if self.active() {
             if kind == AudioKind::System {
@@ -662,60 +783,70 @@ impl Recorder {
         let mut result = div()
             .flex()
             .flex_col()
-            .gap_1()
-            .child(row)
+            .gap_2()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(0xf8fafd))
             .child(
                 div()
-                    .h(px(4.))
-                    .rounded_full()
-                    .w_full()
-                    .bg(rgb(BORDER))
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(level_bar(level.rms)))
-                            .bg(rgb(if level.peak > 0.95 { RED } else { 0x6cc5a2 })),
-                    ),
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(row.flex_1().min_w(px(0.)))
+                    .when(self.config.monitor_levels, |d| {
+                        d.child(
+                            div()
+                                .h(px(6.))
+                                .w(px(72.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(rgb(BORDER))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(level_bar(level.rms)))
+                                        .rounded_full()
+                                        .bg(rgb(if level.peak > 0.95 { RED } else { ui::SUCCESS })),
+                                ),
+                        )
+                    })
+                    .when(!self.config.monitor_levels, |d| d.child(label("检测关"))),
             )
-            .child(
-                div()
-                    .h(px(2.))
-                    .rounded_full()
-                    .w_full()
-                    .bg(rgb(BORDER))
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(level_bar(level.peak)))
-                            .bg(rgb(if level.peak >= 0.95 { RED } else { 0xb2d8c7 })),
-                    ),
-            )
-            .child(label(if !enabled {
-                "声音来源已关闭".to_string()
-            } else if !self.active() && !self.config.monitor_levels {
-                "电平检测未开启".to_string()
-            } else if level.peak <= 0.001 && levels.input.peak <= 0.001 {
-                "输入与处理后均未检测到信号".to_string()
-            } else {
-                let db = |value: f32| {
-                    if value <= 0.001 {
-                        "低于 −60".into()
+            .when(
+                enabled
+                    && self.config.monitor_levels
+                    && ((level.peak <= 0.001 && levels.input.peak <= 0.001) || level.peak >= 0.95),
+                |d| {
+                    d.child(label(if !enabled {
+                        "声音来源已关闭".to_string()
+                    } else if !self.active() && !self.config.monitor_levels {
+                        "电平检测未开启".to_string()
+                    } else if level.peak <= 0.001 && levels.input.peak <= 0.001 {
+                        "输入与处理后均未检测到信号".to_string()
                     } else {
-                        format!("{:.0}", 20. * value.log10())
-                    }
-                };
-                format!(
-                    "输入 RMS {} · 处理后 RMS {} · 峰值 {} dBFS（细条）{}",
-                    db(levels.input.rms),
-                    db(level.rms),
-                    db(level.peak),
-                    if level.peak >= 0.95 {
-                        " · 接近削波"
-                    } else {
-                        ""
-                    }
-                )
-            }));
+                        let db = |value: f32| {
+                            if value <= 0.001 {
+                                "低于 −60".into()
+                            } else {
+                                format!("{:.0}", 20. * value.log10())
+                            }
+                        };
+                        format!(
+                            "输入 RMS {} · 处理后 RMS {} · 峰值 {} dBFS（细条）{}",
+                            db(levels.input.rms),
+                            db(level.rms),
+                            db(level.peak),
+                            if level.peak >= 0.95 {
+                                " · 接近削波"
+                            } else {
+                                ""
+                            }
+                        )
+                    }))
+                },
+            );
         if self.audio_picker == Some(kind) {
             let selected = self.config.audio_routing().device(kind).clone();
             let entries = std::iter::once((None, "系统默认设备".to_string())).chain(

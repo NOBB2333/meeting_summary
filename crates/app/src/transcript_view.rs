@@ -196,6 +196,8 @@ pub(super) struct TranscriptView {
         Option<serde_json::Value>,
     )>,
     live: bool,
+    compact: bool,
+    read_only: bool,
     task_running: Option<bool>,
     speaker_turns: Vec<(u64, u64, u32, bool)>,
     speaker_names: Vec<(u32, String)>,
@@ -212,6 +214,8 @@ pub(super) struct TranscriptView {
     playback_follow: bool,
     #[cfg(feature = "internal-player")]
     playback_attached: bool,
+    #[cfg(feature = "internal-player")]
+    playback_available: bool,
     #[cfg(feature = "internal-player")]
     playback_words: std::collections::BTreeMap<u64, Vec<std::ops::Range<usize>>>,
     #[cfg(feature = "internal-player")]
@@ -241,6 +245,10 @@ impl EventEmitter<PlaybackTokenSeek> for TranscriptView {}
 #[cfg(feature = "internal-player")]
 impl EventEmitter<PlaybackWordRange> for TranscriptView {}
 impl TranscriptView {
+    #[cfg(feature = "ui-smoke")]
+    pub(super) fn smoke_row_count(&self) -> usize {
+        self.rows.len()
+    }
     pub(super) fn reveal_segment(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(index) = self.rows.iter().position(|row| row.id == id) {
             #[cfg(feature = "internal-player")]
@@ -263,6 +271,8 @@ impl TranscriptView {
             #[cfg(feature = "internal-player")]
             timing_run_key: None,
             live: false,
+            compact: false,
+            read_only: false,
             task_running: None,
             speaker_turns: Vec::new(),
             speaker_names: Vec::new(),
@@ -279,6 +289,8 @@ impl TranscriptView {
             playback_follow: true,
             #[cfg(feature = "internal-player")]
             playback_attached: false,
+            #[cfg(feature = "internal-player")]
+            playback_available: false,
             #[cfg(feature = "internal-player")]
             playback_words: Default::default(),
             #[cfg(feature = "internal-player")]
@@ -307,6 +319,22 @@ impl TranscriptView {
         self.task_running = Some(task_running);
         self.update_rows(transcript, new_document);
         cx.notify();
+    }
+    pub(super) fn set_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
+        if self.compact != compact {
+            self.compact = compact;
+            cx.notify();
+        }
+    }
+    pub(super) fn set_read_only(&mut self) {
+        self.read_only = true;
+    }
+    #[cfg(feature = "internal-player")]
+    pub(super) fn set_playback_available(&mut self, available: bool, cx: &mut Context<Self>) {
+        if self.playback_available != available {
+            self.playback_available = available;
+            cx.notify();
+        }
     }
     fn update_rows(&mut self, transcript: &Transcript, new_document: bool) {
         let live = self
@@ -679,6 +707,8 @@ impl Render for TranscriptView {
         #[cfg(feature = "internal-player")]
         let run_id = self.run_key.as_ref().map(|(id, _)| id.clone());
         let following = self.state.is_following_tail();
+        let compact = self.compact;
+        let read_only = self.read_only;
         let query = self.query.clone();
         let copy_rows = rows.clone();
         let selection_view = cx.entity().downgrade();
@@ -686,6 +716,8 @@ impl Render for TranscriptView {
         let playback_active = self.playback_active.clone();
         #[cfg(feature = "internal-player")]
         let playback_attached = self.playback_attached;
+        #[cfg(feature = "internal-player")]
+        let playback_available = self.playback_available;
         #[cfg(feature = "internal-player")]
         let playback_words = self.playback_words.clone();
         #[cfg(feature = "internal-player")]
@@ -696,13 +728,25 @@ impl Render for TranscriptView {
         let measured = self.measured_rows.clone();
         div()
             .size_full()
-            // Lists process the wheel first; consume the bubble before the outer page.
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+            // Let the containing home page move only once this list reaches
+            // the edge; otherwise keep trackpad scrolling inside the text.
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 #[cfg(feature = "internal-player")]
                 {
                     this.playback_follow = false;
                 }
-                cx.stop_propagation();
+                let delta = event.delta.pixel_delta(px(20.)).y;
+                let top = this.state.logical_scroll_top();
+                let at_top = top.item_ix == 0 && top.offset_in_item <= px(0.);
+                let remaining = this.state.max_offset_for_scrollbar().y
+                    + this.state.scroll_px_offset_for_scrollbar().y;
+                let at_end = this.state.is_following_tail()
+                    || this.state.is_scrolled_to_end() == Some(true)
+                    || remaining <= px(1.);
+                let page_edge = this.compact && ((delta > px(0.) && at_top) || (delta < px(0.) && at_end));
+                if !page_edge {
+                    cx.stop_propagation();
+                }
                 cx.notify();
             }))
             .on_mouse_down(
@@ -718,7 +762,7 @@ impl Render for TranscriptView {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
+            .when(!compact, |d| d.child(
                 div()
                     .flex()
                     .items_center()
@@ -774,7 +818,7 @@ impl Render for TranscriptView {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                         },
                     )),
-            )
+            ))
             .when(cfg!(feature = "internal-player"), |d| {
                 #[cfg(feature = "internal-player")]
                 {
@@ -847,7 +891,7 @@ impl Render for TranscriptView {
                             #[cfg(feature = "ui-smoke")]
                             measured.borrow_mut().insert(index);
                             let row = &rows[index];
-                            let review_selection = row.review.as_ref().and_then(|review| {
+                            let review_selection = (!read_only).then_some(row.review.as_ref()).flatten().and_then(|review| {
                                 let revised = review.revised_text.as_ref()?;
                                 if !row.finalized || revised == &review.original_text {
                                     return None;
@@ -888,9 +932,8 @@ impl Render for TranscriptView {
                             #[cfg(feature = "internal-player")]
                             let token_toggle_view = selection_view.clone();
                             #[cfg(feature = "internal-player")]
-                            let seek = Some(
+                            let seek = (playback_attached || playback_available).then(||
                                 button(("seek-transcript", row_id as usize), "从此处播放", false)
-                                    .ghost()
                                     .disabled(!row.confirmed || row.end_ms <= row.start_ms)
                                     .on_click(move |_, _, cx| {
                                         let _ = seek_view.update(cx, |_, cx| {
@@ -901,13 +944,12 @@ impl Render for TranscriptView {
                             #[cfg(not(feature = "internal-player"))]
                             let seek: Option<Button> = None;
                             #[cfg(feature = "internal-player")]
-                            let select = Some(
+                            let select = playback_attached.then(||
                                 button(
                                     ("select-transcript-segment", row_id as usize),
                                     "选段",
                                     false,
                                 )
-                                .ghost()
                                 .disabled(!playback_attached || !row.confirmed || row.end_ms <= row.start_ms)
                                 .on_click(move |_, _, cx| {
                                     let _ = select_view.update(cx, |_, cx| {
@@ -1033,6 +1075,7 @@ impl Render for TranscriptView {
                                 .w_full()
                                 .pr_3()
                                 .pb_3()
+                                .when(compact, |d| d.p_3().mb_2().rounded_md().border_1().border_color(rgb(BORDER)).bg(rgb(0xf8fafd)))
                                 .when(cfg!(feature = "internal-player"), |d| {
                                     #[cfg(feature = "internal-player")]
                                     {
@@ -1048,31 +1091,24 @@ impl Render for TranscriptView {
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_wrap()
                                         .items_center()
-                                        .justify_between()
                                         .gap_2()
-                                        .child(label(row.metadata.clone()))
-                                        .when_some(seek, |d, seek| d.child(seek))
-                                        .when_some(select, |d, select| d.child(select))
-                                        .when_some(token_toggle, |d, toggle| d.child(toggle))
-                                        .when_some(review_selection, |d, (original, title)| {
-                                            d.child(
-                                                button(
-                                                    ("review-selection", row_id as usize),
-                                                    title,
-                                                    false,
+                                        .child(label(row.metadata.clone()).flex_1().min_w(px(110.)))
+                                        .child(div().flex().flex_wrap().items_center().gap_1().ml_auto()
+                                            .when_some(seek, |d, seek| d.child(seek))
+                                            .when_some(select, |d, select| d.child(select))
+                                            .when_some(token_toggle, |d, toggle| d.child(toggle))
+                                            .when_some(review_selection, |d, (original, title)| {
+                                                d.child(
+                                                    button(("review-selection", row_id as usize), title, false)
+                                                        .ghost().on_click(move |_, _, cx| {
+                                                            let _ = selection_view.update(cx, |_, cx| {
+                                                                cx.emit(ReviewSelection { id: row_id, original });
+                                                            });
+                                                        }),
                                                 )
-                                                .ghost()
-                                                .on_click(move |_, _, cx| {
-                                                    let _ = selection_view.update(cx, |_, cx| {
-                                                        cx.emit(ReviewSelection {
-                                                            id: row_id,
-                                                            original,
-                                                        });
-                                                    });
-                                                }),
-                                            )
-                                        }),
+                                            })),
                                 )
                                 .when_some(token_panel, |d, panel| d.child(panel))
                                 .when_some(word_panel, |d, panel| d.child(panel))

@@ -87,9 +87,7 @@ fn generate_bundle_icons() {
             (b"ic09", 512),
             (b"ic10", 1024),
         ] {
-            let rgba = image
-                .resize_to_fill(size, size, image::imageops::FilterType::Lanczos3)
-                .to_rgba8();
+            let rgba = macos_rounded_icon(&image, size);
             let mut png = Vec::new();
             image::codecs::png::PngEncoder::new(&mut png)
                 .write_image(rgba.as_raw(), size, size, image::ExtendedColorType::Rgba8)
@@ -106,6 +104,52 @@ fn generate_bundle_icons() {
         icns.extend_from_slice(&entries);
         std::fs::write(assets.join(format!("{name}.icns")), icns).unwrap();
     }
+}
+
+/// macOS app icons live on a rounded-square grid. The authored JPEG is
+/// opaque and square, so a raw resize puts square corners in the Dock after
+/// `NSApp.applicationIconImage` is replaced at launch. Keep the artwork inset
+/// on a transparent canvas and clip it to a rounded square; Windows keeps the
+/// original square ICO treatment.
+fn macos_rounded_icon(source: &image::DynamicImage, size: u32) -> image::RgbaImage {
+    const INSET: f32 = 0.098;
+    const RADIUS: f32 = 0.225;
+    let canvas = image::RgbaImage::from_pixel(size, size, image::Rgba([0, 0, 0, 0]));
+    let inset = (size as f32 * INSET).round() as u32;
+    let content = size.saturating_sub(inset.saturating_mul(2));
+    if content == 0 {
+        return canvas;
+    }
+    let art = source
+        .resize_to_fill(content, content, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let radius = (content as f32 * RADIUS).clamp(0.0, content as f32 / 2.0);
+    let half = content as f32 / 2.0;
+    let edge = 1.0f32;
+    let mut out = canvas;
+    for y in 0..content {
+        for x in 0..content {
+            let px = x as f32 + 0.5 - half;
+            let py = y as f32 + 0.5 - half;
+            let qx = px.abs() - (half - radius);
+            let qy = py.abs() - (half - radius);
+            let outside = qx.max(0.0).hypot(qy.max(0.0));
+            let distance = outside + qx.max(qy).min(0.0) - radius;
+            // One-pixel antialiased edge; transparent outside the squircle.
+            let alpha = ((0.5 - distance / edge).clamp(0.0, 1.0) * 255.0) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let pixel = art.get_pixel(x, y);
+            let a = (u16::from(pixel[3]) * u16::from(alpha) / 255) as u8;
+            out.put_pixel(
+                inset + x,
+                inset + y,
+                image::Rgba([pixel[0], pixel[1], pixel[2], a]),
+            );
+        }
+    }
+    out
 }
 
 #[cfg(windows)]

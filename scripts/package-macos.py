@@ -172,10 +172,12 @@ def build_bundle(root, binary, staging, identity, dev=False):
     return len(copied), minimum_text
 
 
-def package(profile, identity, build=True, output=None, dev=False, require_default=False):
+def package(profile, identity, build=True, output=None, dev=False, require_default=False, binary_override=None):
     root = Path(__file__).resolve().parent.parent
     if require_default and output:
         raise SystemExit("--require-default cannot be combined with --output")
+    if binary_override and (build or not dev):
+        raise SystemExit("--binary requires --dev and --no-build")
     destination = select_destination(root, output, dev, require_default)
     if build:
         command = [str(root / "scripts/dev.sh"), "build", "-p", "opencap"]
@@ -188,7 +190,8 @@ def package(profile, identity, build=True, output=None, dev=False, require_defau
         if profile == "release":
             command.append("--release")
         subprocess.run(command, cwd=root, check=True, env=environment)
-    binary = root / "target" / ("opencap-dev" if dev else "") / profile / "opencap"
+    binary = (Path(binary_override).expanduser().resolve() if binary_override else
+              root / "target" / ("opencap-dev" if dev else "") / profile / "opencap")
     if not binary.is_file():
         raise SystemExit(f"Build first: scripts/dev.sh build {'--release' if profile == 'release' else ''}")
     expected_identity = "OpenCap Dev" if dev else "OpenCap"
@@ -234,6 +237,7 @@ def build_parser():
                           help="Alias for --profile release")
     parser.set_defaults(profile="release")
     parser.add_argument("--no-build", action="store_true", help="Package an existing binary without compiling; it may be older than the source")
+    parser.add_argument("--binary", help="Developer binary to package (requires --dev --no-build)")
     parser.add_argument("--dev", action="store_true", help="Build the separately identified, data-isolated developer application")
     parser.add_argument("--require-default", action="store_true", help="Fail if the default app is running rather than selecting a different destination")
     parser.add_argument("--output", help="Write to this new .app path; an existing non-default path is never overwritten")
@@ -244,4 +248,4 @@ def build_parser():
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    package(args.profile, args.identity, not args.no_build, args.output, args.dev, args.require_default)
+    package(args.profile, args.identity, not args.no_build, args.output, args.dev, args.require_default, args.binary)

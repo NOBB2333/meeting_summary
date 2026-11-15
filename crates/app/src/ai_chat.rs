@@ -25,6 +25,7 @@ pub(super) struct ChatView {
     running: bool,
     request: String,
     turn_starts: Vec<usize>,
+    compact: bool,
 }
 impl ChatView {
     #[cfg(feature = "ui-smoke")]
@@ -49,7 +50,19 @@ impl ChatView {
             running: false,
             request: String::new(),
             turn_starts: Vec::new(),
+            compact: false,
         }
+    }
+    pub(super) fn set_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
+        if self.compact != compact {
+            self.compact = compact;
+            cx.notify();
+        }
+    }
+    pub(super) fn follow_latest(&mut self, cx: &mut Context<Self>) {
+        self.state.set_follow_mode(FollowMode::Tail);
+        self.state.scroll_to_end();
+        cx.notify();
     }
     fn jump_turn(&self, turn: usize) {
         if let Some(&item_ix) = self.turn_starts.get(turn) {
@@ -216,6 +229,7 @@ impl Render for ChatView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows.clone();
         let running = self.running;
+        let compact = self.compact;
         let entity = cx.entity().downgrade();
         div()
             .size_full()
@@ -223,48 +237,50 @@ impl Render for ChatView {
             .flex_col()
             .gap_2()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_1()
-                    .flex_shrink_0()
-                    .child(label(format!("对话 · {} 轮", self.turn_starts.len())).text_xs())
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(
-                                button("chat-previous", "上一轮", false)
-                                    .ghost()
-                                    .disabled(self.turn_starts.is_empty())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.jump_turn(this.current_turn().saturating_sub(1));
+            .when(!compact, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_1()
+                        .flex_shrink_0()
+                        .child(label(format!("对话 · {} 轮", self.turn_starts.len())).text_xs())
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(
+                                    button("chat-previous", "上一轮", false)
+                                        .ghost()
+                                        .disabled(self.turn_starts.is_empty())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.jump_turn(this.current_turn().saturating_sub(1));
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    button("chat-next", "下一轮", false)
+                                        .ghost()
+                                        .disabled(self.turn_starts.is_empty())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.jump_turn(
+                                                (this.current_turn() + 1)
+                                                    .min(this.turn_starts.len().saturating_sub(1)),
+                                            );
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(button("chat-latest", "最新", false).ghost().on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.state.set_follow_mode(FollowMode::Tail);
+                                        this.state.scroll_to_end();
                                         cx.notify();
-                                    })),
-                            )
-                            .child(
-                                button("chat-next", "下一轮", false)
-                                    .ghost()
-                                    .disabled(self.turn_starts.is_empty())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.jump_turn(
-                                            (this.current_turn() + 1)
-                                                .min(this.turn_starts.len().saturating_sub(1)),
-                                        );
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(button("chat-latest", "最新", false).ghost().on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.state.set_follow_mode(FollowMode::Tail);
-                                    this.state.scroll_to_end();
-                                    cx.notify();
-                                }),
-                            )),
-                    ),
-            )
+                                    }),
+                                )),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex_1()

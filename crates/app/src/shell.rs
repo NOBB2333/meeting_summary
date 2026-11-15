@@ -1,8 +1,12 @@
 use super::*;
-use gpui::component::IconName;
+use gpui::assets::IconName;
 
 impl Recorder {
     fn task_banner(&self) -> Option<Div> {
+        // The live workspace displays recording progress alongside the transcript.
+        if self.settings || self.active() {
+            return None;
+        }
         if self.transcription_tab
             && !self.settings
             && matches!(
@@ -74,14 +78,14 @@ impl Recorder {
         cx.notify();
     }
 
-    fn navigation(&self, compact: bool, cx: &Context<Self>) -> Div {
+    fn navigation(&self, compact: bool, collapsed: bool, cx: &Context<Self>) -> Div {
         let mut nav = div()
             .flex()
             .gap_2()
-            .when(!compact, |d| d.flex_col().w_full());
+            .when(!compact || collapsed, |d| d.flex_col().w_full());
         for (i, (title, icon)) in [
-            ("录制工作台", IconName::GalleryVerticalEnd),
-            ("会议文件", IconName::FolderOpen),
+            ("录制工作台", IconName::Monitor),
+            ("会议文件", IconName::Folder),
             ("设置", IconName::Settings),
         ]
         .into_iter()
@@ -94,7 +98,13 @@ impl Recorder {
             } else {
                 !self.settings && !self.transcription_tab
             };
-            let item = if compact {
+            let item = if collapsed {
+                ui::icon_button(("main-navigation", i), icon, title)
+                    .ghost()
+                    .size(px(40.))
+                    .selected(selected)
+                    .when(selected, |b| b.bg(rgb(SOFT)).text_color(rgb(ACCENT)))
+            } else if compact {
                 button(("main-navigation", i), title, selected)
                     .icon(icon)
                     .ghost()
@@ -108,98 +118,130 @@ impl Recorder {
     }
 
     fn sidebar(&self, cx: &Context<Self>) -> Div {
+        let collapsed = self.config.sidebar_collapsed;
         div()
-            .w(px(208.))
+            .w(px(if collapsed { 64. } else { 212. }))
             .h_full()
             .flex_shrink_0()
-            .p_4()
+            .px_3()
+            .py_4()
             .bg(rgb(SURFACE))
             .border_r_1()
             .border_color(rgb(BORDER))
             .flex()
             .flex_col()
-            .gap_5()
+            .gap_4()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .px_2()
-                    .py_3()
+                    .justify_between()
+                    .gap_2()
+                    .when(collapsed, |d| d.flex_col())
+                    .py_1()
+                    .when(!collapsed, |d| {
+                        d.child(
+                            div()
+                                .size(px(28.))
+                                .rounded_lg()
+                                .bg(rgb(ACCENT))
+                                .text_color(rgb(SURFACE))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .child("OC"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(app_name()),
+                                )
+                                .child(label("会议记录工作台")),
+                        )
+                    })
                     .child(
-                        div()
-                            .size(px(34.))
-                            .rounded_lg()
-                            .bg(rgb(ACCENT))
-                            .text_color(rgb(SURFACE))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(ui::icon(IconName::GalleryVerticalEnd)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(app_name()),
-                            )
-                            .child(label("会议记录工作台")),
+                        ui::icon_button(
+                            "toggle-sidebar",
+                            if collapsed {
+                                IconName::PanelLeftOpen
+                            } else {
+                                IconName::PanelLeftClose
+                            },
+                            if collapsed {
+                                "展开导航栏"
+                            } else {
+                                "收起导航栏"
+                            },
+                        )
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.config.sidebar_collapsed = !this.config.sidebar_collapsed;
+                            this.save();
+                            cx.notify();
+                        })),
                     ),
             )
-            .child(label("工作空间").px_3())
-            .child(self.navigation(false, cx))
+            .child(self.navigation(false, collapsed, cx))
             .child(div().flex_1())
-            .child(
-                div()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(BG))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("从会议到行动"),
+            .when(!collapsed, |d| {
+                d.child(
+                    button("sidebar-folder", "打开保存根目录", false)
+                        .icon(IconName::FolderOpen)
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let _ = std::fs::create_dir_all(&this.config.output_dir);
+                            if let Err(e) = opencap_platform::open_path(&this.config.output_dir) {
+                                this.message = e.to_string();
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
+            .when(collapsed, |d| {
+                d.child(
+                    ui::icon_button(
+                        "sidebar-folder-icon",
+                        IconName::FolderOpen,
+                        "打开保存根目录",
                     )
-                    .child(label("录制 → 转写 → 纪要"))
-                    .child(label("文件与笔记保存在本机")),
-            )
-            .child(
-                button("sidebar-folder", "打开保存根目录", false)
-                    .icon(IconName::FolderOpen)
                     .ghost()
-                    .w_full()
-                    .justify_start()
                     .on_click(cx.listener(|this, _, _, cx| {
                         let _ = std::fs::create_dir_all(&this.config.output_dir);
                         if let Err(e) = opencap_platform::open_path(&this.config.output_dir) {
                             this.message = e.to_string();
-                            cx.notify();
                         }
+                        cx.notify();
                     })),
-            )
-            .child(
-                button("quit", "退出应用", false)
-                    .ghost()
-                    .w_full()
-                    .justify_start()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.persist_minutes_draft(cx);
-                        this.persist_notes(cx);
-                        this.quit_pending = true;
-                        if let Some(s) = &this.session {
-                            s.command(RecordingCommand::Stop);
-                        }
-                    })),
-            )
-            .child(label(format!("{} {}", app_name(), env!("CARGO_PKG_VERSION"))).px_3())
+                )
+            })
+            .when(!collapsed, |d| {
+                d.child(
+                    button("quit", "退出应用", false)
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .on_click(cx.listener(|this, _, _, cx| this.request_quit(cx))),
+                )
+            })
+            .when(collapsed, |d| {
+                d.child(
+                    ui::icon_button("quit-icon", IconName::LogOut, "退出应用")
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| this.request_quit(cx))),
+                )
+            })
+            .when(!collapsed, |d| {
+                d.child(label(format!("{} {}", app_name(), env!("CARGO_PKG_VERSION"))).px_3())
+            })
     }
 
     fn recording_status(&self) -> &'static str {
@@ -215,23 +257,30 @@ impl Recorder {
     }
 
     fn topbar(&self, compact: bool, cx: &Context<Self>) -> Div {
+        let model_ready = self
+            .asr_models
+            .live_plan_for(
+                self.config.live_asr_model,
+                self.config.offline_asr_model,
+                self.config.transcription_context_revision,
+            )
+            .is_some();
         let title = if self.settings {
-            "工作空间 / 设置"
+            "全局设置"
         } else if self.transcription_tab {
-            "工作空间 / 会议文件"
+            "会议文件"
         } else {
-            "工作空间 / 录制"
+            "录制工作台"
         };
         div()
             .flex_shrink_0()
-            .px_4()
-            .py_2()
+            .px_6()
+            .h(px(50.))
             .bg(rgb(SURFACE))
             .border_b_1()
             .border_color(rgb(BORDER))
             .flex()
-            .flex_col()
-            .gap_1()
+            .items_center()
             .when(!compact, |d| {
                 d.child(
                     div()
@@ -239,15 +288,49 @@ impl Recorder {
                         .items_center()
                         .justify_between()
                         .gap_3()
-                        .child(label(title))
-                        .child(ui::badge(
-                            self.recording_status(),
-                            if self.active() { RED } else { ui::SUCCESS },
-                            if self.active() { 0xffedf0 } else { 0xeaf6f0 },
-                        )),
+                        .w_full()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(title),
+                                )
+                                .child(ui::badge(
+                                    if self.active() {
+                                        self.recording_status()
+                                    } else if model_ready {
+                                        "本地模型就绪"
+                                    } else {
+                                        "本地模型未就绪"
+                                    },
+                                    if self.active() {
+                                        RED
+                                    } else if model_ready {
+                                        ui::SUCCESS
+                                    } else {
+                                        MUTED
+                                    },
+                                    if self.active() {
+                                        0xfdecee
+                                    } else if model_ready {
+                                        0xe6f4ef
+                                    } else {
+                                        0xeff2f7
+                                    },
+                                )),
+                        )
+                        .child(
+                            label(format!("输出目录：{}", self.config.output_dir.display()))
+                                .truncate(),
+                        ),
                 )
             })
-            .when(compact, |d| d.child(self.navigation(true, cx)))
+            .when(compact, |d| d.child(self.navigation(true, false, cx)))
     }
     fn recording_bar(&self, compact: bool, cx: &Context<Self>) -> Div {
         let active = self.active();
@@ -258,7 +341,7 @@ impl Recorder {
         div()
             .flex_shrink_0()
             .px_6()
-            .py_4()
+            .py_3()
             .bg(rgb(SURFACE))
             .border_t_1()
             .border_color(rgb(BORDER))
@@ -268,30 +351,32 @@ impl Recorder {
             .gap_4()
             .child(
                 div()
+                    .flex_1()
                     .min_w(px(0.))
                     .flex()
-                    .flex_col()
-                    .gap_1()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_3()
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().size(px(8.)).rounded_full().bg(rgb(if active {
-                                RED
-                            } else {
-                                MUTED
-                            })))
+                            .child(ui::badge(
+                                self.recording_status(),
+                                if active { RED } else { MUTED },
+                                if active { 0xfdecee } else { 0xeff2f7 },
+                            ))
                             .child(
                                 div()
                                     .font_family(MONO_FONT)
-                                    .text_2xl()
+                                    .text_base()
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(time_text(self.stats.duration_seconds)),
                             ),
                     )
-                    .child(label(if !compact && active {
-                        if self.config.audio_only {
+                    .when(active, |d| {
+                        d.child(label(if self.config.audio_only {
                             format!(
                                 "录音 · {:.0} kbps · {:.1} MB",
                                 self.stats.bitrate_kbps,
@@ -304,10 +389,11 @@ impl Recorder {
                                 self.stats.bitrate_kbps,
                                 self.stats.bytes as f64 / 1_000_000.
                             )
-                        }
-                    } else {
-                        self.recording_status().to_owned()
-                    })),
+                        }))
+                    })
+                    .when(active, |d| {
+                        d.child(label(self.recording_token_usage.label()))
+                    }),
             )
             .child(
                 div()
@@ -317,30 +403,28 @@ impl Recorder {
                     .when(!compact && !active, |d| {
                         d.child(label(format!("{} 开始 / 停止", self.config.hotkey_record)))
                     })
-                    .when(active, |d| {
-                        d.child(
-                            button(
-                                "pause",
-                                if self.stats.state == RecordingState::Paused {
-                                    "继续录制"
-                                } else {
-                                    "暂停"
-                                },
-                                false,
-                            )
-                            .icon(if self.stats.state == RecordingState::Paused {
-                                IconName::Play
+                    .child(
+                        button(
+                            "pause",
+                            if self.stats.state == RecordingState::Paused {
+                                "继续录制"
                             } else {
-                                IconName::Pause
-                            })
-                            .h(px(44.))
-                            .disabled(transitioning)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_pause();
-                                cx.notify();
-                            })),
+                                "暂停"
+                            },
+                            false,
                         )
-                    })
+                        .icon(if self.stats.state == RecordingState::Paused {
+                            IconName::Play
+                        } else {
+                            IconName::Pause
+                        })
+                        .h(px(32.))
+                        .disabled(transitioning || !active)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_pause();
+                            cx.notify();
+                        })),
+                    )
                     .when(
                         !active && self.stats.state == RecordingState::Finished && !compact,
                         |d| {
@@ -377,8 +461,8 @@ impl Recorder {
                             IconName::GalleryVerticalEnd
                         })
                         .danger()
-                        .h(px(44.))
-                        .min_w(px(144.))
+                        .h(px(32.))
+                        .min_w(px(112.))
                         .disabled(transitioning || (!active && self.recovering.is_some()))
                         .on_click(cx.listener(|this, _, _, cx| {
                             if this.mode == 2
@@ -507,8 +591,8 @@ impl Render for Recorder {
                 cx,
             )
         });
+        let task_running = self.asr.as_ref().is_some_and(|asr| !asr.finished());
         if self.transcript_dirty {
-            let task_running = self.asr.as_ref().is_some_and(|asr| !asr.finished());
             self.transcript_view.update(cx, |view, cx| {
                 view.replace(
                     &self.transcript,
@@ -517,17 +601,62 @@ impl Render for Recorder {
                     cx,
                 )
             });
+            self.home_detail_dirty = true;
+            self.home_detail_new_document |= self.transcript_new_document;
             self.transcript_dirty = false;
             self.transcript_new_document = false;
         }
+        // Do not reformat the entire live history twice while the second screen
+        // is offscreen. Its independent list catches up as soon as it is shown.
+        if self.home_detail_dirty
+            && !self.settings
+            && !self.transcription_tab
+            && self.page_scroll.offset().y < px(-32.)
+        {
+            self.home_detail_transcript.update(cx, |view, cx| {
+                view.replace(
+                    &self.transcript,
+                    self.home_detail_new_document,
+                    task_running,
+                    cx,
+                )
+            });
+            self.home_detail_dirty = false;
+            self.home_detail_new_document = false;
+        }
+        let compact_transcript = !self.settings && !self.transcription_tab;
+        self.transcript_view.update(cx, |view, cx| {
+            view.set_compact(compact_transcript, cx);
+        });
+        #[cfg(feature = "internal-player")]
+        self.transcript_view.update(cx, |view, cx| {
+            view.set_playback_available(
+                self.transcription_tab
+                    && !self.settings
+                    && !self.active()
+                    && self.transcript_output.is_some()
+                    && self.transcript.source.is_some(),
+                cx,
+            );
+        });
+        self.home_detail_transcript
+            .update(cx, |view, cx| view.set_compact(true, cx));
         let viewport = f32::from(window.viewport_size().width);
         let compact = ui::sidebar_width(viewport) == 0.;
-        let width = ui::content_width(viewport);
+        let width = ui::content_width(viewport)
+            + if !compact && self.config.sidebar_collapsed {
+                148.
+            } else {
+                0.
+            };
         let documents = self.transcription_tab
             && !self.settings
-            && self.meeting_page != workspace::MeetingPage::Library;
+            && !matches!(
+                self.meeting_page,
+                workspace::MeetingPage::Library | workspace::MeetingPage::ReadOnly
+            );
         let content = if self.settings {
-            self.settings_view(cx)
+            self.settings_view(width, cx)
         } else if self.transcription_tab {
             self.meeting_workspace(width, f32::from(window.viewport_size().height), cx)
         } else {
@@ -541,18 +670,21 @@ impl Render for Recorder {
             && matches!(
                 self.meeting_page,
                 workspace::MeetingPage::Library
+                    | workspace::MeetingPage::ReadOnly
                     | workspace::MeetingPage::Minutes
                     | workspace::MeetingPage::Transcript
+                    | workspace::MeetingPage::Notes
             );
         let page_content = if bounded_document {
-            div().size_full().min_h(px(0.)).px_4().py_2().child(content)
+            div().size_full().min_h(px(0.)).px_6().py_4().child(content)
         } else {
             widgets::scrollable(
                 "page-scroll",
                 div()
                     .w_full()
                     .min_h_full()
-                    .p(px(28.))
+                    .px_6()
+                    .py(px(18.))
                     .flex()
                     .flex_col()
                     .gap_5()
@@ -573,9 +705,7 @@ impl Render for Recorder {
         if let Some(notice) = self.notification(cx) {
             workspace = workspace.child(notice);
         }
-        if (!self.settings && !self.transcription_tab) || self.active() {
-            workspace = workspace.child(self.recording_bar(compact, cx));
-        }
+        workspace = workspace.child(self.recording_bar(compact, cx));
         div()
             .size_full()
             .bg(rgb(BG))
