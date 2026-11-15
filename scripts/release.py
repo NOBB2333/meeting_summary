@@ -67,6 +67,15 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def verify_binary_identity(binary, version, platform):
+    # Rust may store the application name and Cargo version in separate
+    # literals when formatting them at runtime. Require both independently;
+    # reject a version that is only a prefix of another numeric version.
+    exact_version = rb"(?<![0-9.])" + re.escape(version.encode()) + rb"(?![0-9.])"
+    require(b"OpenCap" in binary and re.search(exact_version, binary),
+            f"{platform} binary identity or version differs")
+
+
 def verify_packages(paths, version, report):
     checks = {}
     with zipfile.ZipFile(paths["windows-x64.zip"]) as archive:
@@ -79,7 +88,7 @@ def verify_packages(paths, version, report):
         require(binary[offset:offset + 4] == b"PE\0\0" and
                 struct.unpack_from("<H", binary, offset + 4)[0] == 0x8664,
                 "Windows executable must be x64")
-        require(f"OpenCap {version}".encode() in binary, "Windows binary version differs")
+        verify_binary_identity(binary, version, "Windows")
         dlls = [name for name in names if name.lower().endswith(".dll")]
         require(len(dlls) >= 7 and sum(name.endswith(".exe") for name in names) == 3,
                 "Windows runtime dependencies are missing")
@@ -93,7 +102,7 @@ def verify_packages(paths, version, report):
             require(binary[:4] == b"\xcf\xfa\xed\xfe" and
                     struct.unpack_from("<I", binary, 4)[0] == cpu,
                     f"macOS {arch} binary architecture differs")
-            require(f"OpenCap {version}".encode() in binary, f"macOS {arch} binary version differs")
+            verify_binary_identity(binary, version, f"macOS {arch}")
             require(archive.getinfo("OpenCap.app/Contents/Resources/OpenCap.icns").file_size > 0,
                     f"macOS {arch} icon is missing")
             libraries = [name for name in archive.namelist()
@@ -107,7 +116,7 @@ def verify_packages(paths, version, report):
         binary = archive.extractfile("OpenCap/usr/bin/opencap").read()
         require(binary[:5] == b"\x7fELF\x02" and struct.unpack_from("<H", binary, 18)[0] == 62,
                 "Linux binary must be x86_64 ELF")
-        require(f"OpenCap {version}".encode() in binary, "Linux binary version differs")
+        verify_binary_identity(binary, version, "Linux")
         audit = json.load(archive.extractfile("OpenCap/elf-audit.json"))
         maximum = max(tuple(map(int, entry["glibc"].split("."))) for entry in audit)
         require(maximum <= (2, 28), "Linux package exceeds glibc 2.28")

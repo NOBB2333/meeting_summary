@@ -25,6 +25,13 @@ class ReleaseTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return result
 
+    def test_binary_identity_handles_separate_rust_literals_and_rejects_other_versions(self):
+        binary = b"binary\x00OpenCap\x00other literals\x003.0.0\x00"
+        release.verify_binary_identity(binary, "3.0.0", "test")
+        for invalid in (b"OpenCap\x003.0.01\x00", b"other\x003.0.0\x00", b"OpenCap\x003.0.1\x00"):
+            with self.subTest(binary=invalid), self.assertRaisesRegex(ValueError, "identity or version"):
+                release.verify_binary_identity(invalid, "3.0.0", "test")
+
     def version_fixture(self):
         (self.root / "Cargo.toml").write_text('[workspace.package]\nversion = "1.2.0"\n')
         (self.root / "Cargo.lock").write_text('[[package]]\nname = "opencap"\nversion = "1.2.0"\n')
