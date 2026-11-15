@@ -333,7 +333,8 @@ pub fn start_capture(
         .and_then(|r| r.reply().ok());
     let first_started = Instant::now();
     metrics.callbacks.fetch_add(1, Ordering::Relaxed);
-    let first = frame(&c, screen, &config.target, config.cursor, clock.now_us())?;
+    let (first_time, first_paused, first_generation) = clock.snapshot();
+    let first = frame(&c, screen, &config.target, config.cursor, first_time)?;
     metrics.record_readback(
         first.stride * first.height as usize,
         first_started.elapsed(),
@@ -347,16 +348,20 @@ pub fn start_capture(
     let worker = thread::Builder::new()
         .name("opencap-x11".into())
         .spawn(move || {
-            let mut next = Some(first);
+            let mut next = (!first_paused).then_some((first, first_generation));
             while !worker_stop.load(Ordering::Acquire) {
                 let began = Instant::now();
-                if !clock.snapshot().1 {
-                    let result = if let Some(first) = next.take() {
+                let (now_us, paused, generation) = clock.snapshot();
+                if !paused {
+                    let result = if let Some((first, _)) = next
+                        .take()
+                        .filter(|(_, first_generation)| *first_generation == generation)
+                    {
                         Ok(first)
                     } else {
                         let started = Instant::now();
                         metrics.callbacks.fetch_add(1, Ordering::Relaxed);
-                        let result = frame(&c, screen, &target, cursor, clock.now_us());
+                        let result = frame(&c, screen, &target, cursor, now_us);
                         if let Ok(frame) = &result {
                             metrics.record_readback(
                                 frame.stride * frame.height as usize,
@@ -367,6 +372,10 @@ pub fn start_capture(
                     };
                     match result {
                         Ok(frame) => {
+                            let (_, paused, current_generation) = clock.snapshot();
+                            if paused || current_generation != generation {
+                                continue;
+                            }
                             if tx.is_full() && rx.try_recv().is_ok() {
                                 dropped.fetch_add(1, Ordering::Relaxed);
                             }

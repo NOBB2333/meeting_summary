@@ -54,15 +54,15 @@ def running_pids(destination, process_table=None):
     return found
 
 
-def reserve_build_path(root, label="build"):
+def reserve_build_path(root, label="build", dev=False):
     builds = root / "release" / "builds"
     builds.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.mkdtemp(prefix=f"{label}-{stamp}-", dir=builds)) / "OpenCap.app"
+    return Path(tempfile.mkdtemp(prefix=f"{label}-{stamp}-", dir=builds)) / ("OpenCap Dev.app" if dev else "OpenCap.app")
 
 
-def select_destination(root, output=None):
-    default = root / "release" / "OpenCap.app"
+def select_destination(root, output=None, dev=False, require_default=False):
+    default = root / "release" / ("OpenCap Dev.app" if dev else "OpenCap.app")
     destination = Path(os.path.abspath(os.path.expanduser(output))) if output else default
     if destination.suffix.lower() != ".app":
         raise SystemExit("The output path must end in .app")
@@ -71,19 +71,19 @@ def select_destination(root, output=None):
     if destination.exists() and destination != default:
         raise SystemExit(f"Output already exists; choose a new path: {destination}")
     pids = running_pids(destination)
-    if pids and output:
+    if pids and (output or require_default):
         raise SystemExit(
             f"OpenCap is running from {destination} (PID {', '.join(pids)}). "
             "Quit it before replacing this exact app, or run scripts/package.sh "
             "without --output to create a separate build."
         )
     if pids:
-        destination = reserve_build_path(root)
+        destination = reserve_build_path(root, dev=dev)
         print(f"OpenCap is running (PID {', '.join(pids)}); building a separate app at {destination}", flush=True)
     return destination
 
 
-def build_bundle(root, binary, staging, identity):
+def build_bundle(root, binary, staging, identity, dev=False):
     macos = staging / "Contents" / "MacOS"
     frameworks = staging / "Contents" / "Frameworks"
     resources = staging / "Contents" / "Resources"
@@ -155,6 +155,12 @@ def build_bundle(root, binary, staging, identity):
     with plist_path.open("rb") as handle:
         info = plistlib.load(handle)
     info["LSMinimumSystemVersion"] = minimum_text
+    if dev:
+        info["CFBundleName"] = "OpenCap Dev"
+        info["CFBundleDisplayName"] = "OpenCap Dev"
+        info["CFBundleIdentifier"] = "org.opencap.OpenCap.Dev"
+        info["NSMicrophoneUsageDescription"] = "OpenCap Dev 使用麦克风进行开发验证，录音保存在开发版目录。"
+        info["NSScreenCaptureUsageDescription"] = "OpenCap Dev 使用屏幕与系统音频权限进行开发验证。"
     if info.get("CFBundleIconFile") != "OpenCap.icns":
         raise RuntimeError("Application icon is missing from Info.plist")
     with plist_path.open("wb") as handle:
@@ -166,33 +172,47 @@ def build_bundle(root, binary, staging, identity):
     return len(copied), minimum_text
 
 
-def package(profile, identity, build=True, output=None):
+def package(profile, identity, build=True, output=None, dev=False, require_default=False):
     root = Path(__file__).resolve().parent.parent
-    destination = select_destination(root, output)
+    if require_default and output:
+        raise SystemExit("--require-default cannot be combined with --output")
+    destination = select_destination(root, output, dev, require_default)
     if build:
         command = [str(root / "scripts/dev.sh"), "build", "-p", "opencap"]
+        environment = os.environ.copy()
+        # Keep the artifact lookup and Cargo's actual output in the same tree,
+        # even when the invoking shell has a different CARGO_TARGET_DIR.
+        environment["CARGO_TARGET_DIR"] = str(root / "target" / ("opencap-dev" if dev else ""))
+        if dev:
+            command.extend(["--features", "opencap/dev-profile"])
         if profile == "release":
             command.append("--release")
-        subprocess.run(command, cwd=root, check=True)
-    binary = root / "target" / profile / "opencap"
+        subprocess.run(command, cwd=root, check=True, env=environment)
+    binary = root / "target" / ("opencap-dev" if dev else "") / profile / "opencap"
     if not binary.is_file():
         raise SystemExit(f"Build first: scripts/dev.sh build {'--release' if profile == 'release' else ''}")
+    expected_identity = "OpenCap Dev" if dev else "OpenCap"
+    if run(str(binary), "--build-identity").strip() != expected_identity:
+        raise SystemExit(f"Refusing to package a binary whose identity is not {expected_identity}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".OpenCap-staging-", dir=destination.parent) as temp:
         staging = Path(temp) / "OpenCap.app"
-        count, minimum_text = build_bundle(root, binary, staging, identity)
+        if dev:
+            count, minimum_text = build_bundle(root, binary, staging, identity, dev=True)
+        else:
+            count, minimum_text = build_bundle(root, binary, staging, identity)
         # A user may have opened the canonical app while the build was running.
         if running_pids(destination):
-            if output:
+            if output or require_default:
                 raise SystemExit(f"OpenCap started while building; existing app is untouched: {destination}")
-            destination = reserve_build_path(root)
+            destination = reserve_build_path(root, dev=dev)
             print(f"OpenCap started while building; using separate app at {destination}", flush=True)
-        default = root / "release" / "OpenCap.app"
+        default = root / "release" / ("OpenCap Dev.app" if dev else "OpenCap.app")
         if destination.is_symlink() or (destination.exists() and destination != default):
             raise SystemExit(f"Output appeared while building; existing path is untouched: {destination}")
         previous = None
         if destination.exists():
-            previous = reserve_build_path(root, "previous")
+            previous = reserve_build_path(root, "previous", dev=dev)
             destination.rename(previous)
         try:
             staging.rename(destination)
@@ -214,6 +234,8 @@ def build_parser():
                           help="Alias for --profile release")
     parser.set_defaults(profile="release")
     parser.add_argument("--no-build", action="store_true", help="Package an existing binary without compiling; it may be older than the source")
+    parser.add_argument("--dev", action="store_true", help="Build the separately identified, data-isolated developer application")
+    parser.add_argument("--require-default", action="store_true", help="Fail if the default app is running rather than selecting a different destination")
     parser.add_argument("--output", help="Write to this new .app path; an existing non-default path is never overwritten")
     parser.add_argument("--identity", default=os.environ.get("OPENCAP_SIGNING_IDENTITY", "-"),
                         help="codesign identity; use Apple Development/Developer ID for stable permissions")
@@ -222,4 +244,4 @@ def build_parser():
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    package(args.profile, args.identity, not args.no_build, args.output)
+    package(args.profile, args.identity, not args.no_build, args.output, args.dev, args.require_default)

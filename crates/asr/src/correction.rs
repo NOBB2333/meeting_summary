@@ -11,6 +11,8 @@ use std::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptCorrection {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub original_text: BTreeMap<u64, String>,
     pub model: String,
     pub created_unix: u64,
@@ -36,19 +38,73 @@ pub fn correct_transcript(
     instruction: &str,
     output: &Path,
     cancelled: &AtomicBool,
+    event: impl FnMut(MinutesEvent),
+) -> Result<Transcript> {
+    correct_transcript_inner(
+        transcript,
+        config,
+        key,
+        terminology,
+        instruction,
+        output,
+        cancelled,
+        None,
+        event,
+    )
+}
+
+/// Application entry point: preserve the generated result in memory if the
+/// saved transcript changed while the model was running.
+#[allow(clippy::too_many_arguments)]
+pub fn correct_transcript_guarded(
+    transcript: &Transcript,
+    config: &AiConfig,
+    key: &str,
+    terminology: &str,
+    instruction: &str,
+    output: &Path,
+    cancelled: &AtomicBool,
+    expected_sha256: &str,
+    event: impl FnMut(MinutesEvent),
+) -> Result<Transcript> {
+    correct_transcript_inner(
+        transcript,
+        config,
+        key,
+        terminology,
+        instruction,
+        output,
+        cancelled,
+        Some(expected_sha256),
+        event,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn correct_transcript_inner(
+    transcript: &Transcript,
+    config: &AiConfig,
+    key: &str,
+    terminology: &str,
+    instruction: &str,
+    output: &Path,
+    cancelled: &AtomicBool,
+    expected_sha256: Option<&str>,
     mut event: impl FnMut(MinutesEvent),
 ) -> Result<Transcript> {
-    ensure!(
-        transcript.complete && !transcript.cancelled,
-        "请先完整完成转录"
-    );
+    let _meeting_activity = opencap_core::managed_meeting_activity(output)?;
+    ensure!(transcript.is_complete(), "请先完整完成转录");
     config.validate()?;
     ensure!(
         config.is_local() || !key.trim().is_empty(),
         "请先配置 API Key"
     );
     ensure!(instruction.chars().count() <= 4000, "校正要求最多 4000 字");
-    let segments: Vec<_> = transcript.segments.iter().filter(|s| s.finalized).collect();
+    let segments: Vec<_> = transcript
+        .segments
+        .iter()
+        .filter(|s| s.is_confirmed())
+        .collect();
     ensure!(!segments.is_empty(), "没有可校正的文字");
     ensure!(
         segments
@@ -124,14 +180,28 @@ pub fn correct_transcript(
         }
     }
     corrected.correction = Some(TranscriptCorrection {
+        extra: transcript
+            .correction
+            .as_ref()
+            .map(|old| old.extra.clone())
+            .unwrap_or_default(),
         original_text,
         model: config.model.clone(),
         created_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         changed_segments,
     });
     // Recovery JSON is the commit point. Derived files may be locked by Word.
-    corrected.checkpoint(output)?;
-    corrected.sync_outputs(output);
+    if let Some(expected) = expected_sha256 {
+        if let Err(error) = corrected.sync_outputs_guarded(output, expected) {
+            corrected.primary_save_pending = true;
+            corrected
+                .output_warnings
+                .push(format!("逐字稿并发核对失败：{error:#}"));
+        }
+    } else {
+        corrected.checkpoint(output)?;
+        corrected.sync_outputs(output);
+    }
     Ok(corrected)
 }
 
@@ -186,6 +256,21 @@ fn validate_reply(reply: &str, targets: &[&Segment]) -> Result<BTreeMap<u64, Str
 
 impl Transcript {
     pub fn restore_recognized_text(&self, output: &Path) -> Result<Self> {
+        self.restore_recognized_text_inner(output, None)
+    }
+    pub fn restore_recognized_text_guarded(
+        &self,
+        output: &Path,
+        expected_sha256: &str,
+    ) -> Result<Self> {
+        self.restore_recognized_text_inner(output, Some(expected_sha256))
+    }
+    fn restore_recognized_text_inner(
+        &self,
+        output: &Path,
+        expected_sha256: Option<&str>,
+    ) -> Result<Self> {
+        let _meeting_activity = opencap_core::managed_meeting_activity(output)?;
         let mut restored = self.clone();
         let correction = restored.correction.take().context("当前没有 AI 校正记录")?;
         for segment in &mut restored.segments {
@@ -194,8 +279,17 @@ impl Transcript {
                 segment.revision += 1;
             }
         }
-        restored.checkpoint(output)?;
-        restored.sync_outputs(output);
+        if let Some(expected) = expected_sha256 {
+            if let Err(error) = restored.sync_outputs_guarded(output, expected) {
+                restored.primary_save_pending = true;
+                restored
+                    .output_warnings
+                    .push(format!("逐字稿并发核对失败：{error:#}"));
+            }
+        } else {
+            restored.checkpoint(output)?;
+            restored.sync_outputs(output);
+        }
         Ok(restored)
     }
 }
@@ -205,6 +299,7 @@ mod tests {
     use super::*;
     fn segment(id: u64, text: &str) -> Segment {
         Segment {
+            extra: Default::default(),
             id,
             text: text.into(),
             revision: 0,

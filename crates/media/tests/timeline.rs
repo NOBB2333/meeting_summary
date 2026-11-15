@@ -110,11 +110,13 @@ fn transcription_tap_has_mixed_audio_tail_without_stalling_full_queues() {
         let (tx, rx) = crossbeam_channel::bounded(capacity);
         writer.observe_audio(tx);
         writer.audio(AudioChunk {
+            generation: 0,
             kind: AudioKind::System,
             pts_us: 0,
             samples: vec![0.1; 48000 * 2],
         });
         writer.audio(AudioChunk {
+            generation: 0,
             kind: AudioKind::Microphone,
             pts_us: 0,
             samples: vec![0.2; 48000 * 2],
@@ -125,7 +127,7 @@ fn transcription_tap_has_mixed_audio_tail_without_stalling_full_queues() {
         assert!(
             chunks
                 .iter()
-                .flat_map(|c| &c.samples)
+                .flat_map(|c| c.samples.iter())
                 .all(|x| (*x - 0.3).abs() < 1e-6)
         );
         if capacity == 128 {
@@ -274,6 +276,7 @@ fn exports_a_same_timeline_m4a_without_video() {
             })
             .unwrap();
         writer.audio(AudioChunk {
+            generation: 0,
             kind: AudioKind::Microphone,
             pts_us: pts,
             samples: vec![0.15; 4_800 * 2],
@@ -391,6 +394,7 @@ fn initially_muted_recording_can_add_audio_without_restarting_mp4() {
                 })
                 .collect();
             writer.audio(AudioChunk {
+                generation: 0,
                 kind: AudioKind::Microphone,
                 pts_us: pts,
                 samples,
@@ -473,6 +477,7 @@ fn audio_only_encodes_real_aac_without_probing_video_and_recovers_without_video(
     writer.observe_audio(tx);
     for packet in 0..60 {
         writer.audio(AudioChunk {
+            generation: 0,
             kind: AudioKind::System,
             pts_us: packet * 20_000,
             samples: (0..960)

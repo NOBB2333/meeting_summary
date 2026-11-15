@@ -28,6 +28,17 @@ use windows::{
 pub fn exclude_from_capture(hwnd: isize) -> Result<()> {
     set_capture_exclusion(hwnd, true)
 }
+
+/// Call before creating windows, so the development build gets a distinct
+/// taskbar identity even when a production build is running at the same time.
+pub unsafe fn set_developer_app_identity() -> Result<()> {
+    unsafe {
+        windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(w!(
+            "org.opencap.OpenCap.Dev"
+        ))?
+    };
+    Ok(())
+}
 pub fn set_capture_exclusion(hwnd: isize, exclude: bool) -> Result<()> {
     unsafe {
         SetWindowDisplayAffinity(

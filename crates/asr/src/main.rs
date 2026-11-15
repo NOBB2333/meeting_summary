@@ -10,6 +10,55 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect saved status without reading or printing meeting text or secrets.
+    Status {
+        #[arg(long)]
+        meeting: Option<PathBuf>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Create a new JSON report; an existing file is never overwritten.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Decode an authorized sample and write a new, text-free JSON diagnostic report.
+    DiagnoseReplay {
+        input: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(long, value_enum, default_value = "none")]
+        fault: DiagnosticFault,
+    },
+    /// Replay the existing Zipformer live backend on the same POC PCM clock.
+    #[cfg(feature = "nemo-poc")]
+    BaselineAsrPoc {
+        input: PathBuf,
+        #[arg(long)]
+        model_root: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Replay Nemotron ASR using a trusted native library and pinned model.
+    #[cfg(feature = "nemo-poc")]
+    NemoAsrPoc {
+        input: PathBuf,
+        #[arg(long)]
+        library: PathBuf,
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Experimental, local-only streaming diarization replay using a trusted native library.
+    #[cfg(feature = "nemo-poc")]
+    NemoDiarizePoc {
+        input: PathBuf,
+        #[arg(long)]
+        library: PathBuf,
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     Prepare {
         #[arg(value_enum)]
         model: ModelKind,
@@ -68,7 +117,129 @@ enum Command {
     },
 }
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--is-production-build"))
+    {
+        std::process::exit(if opencap_core::is_dev_profile() {
+            43
+        } else {
+            42
+        });
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--build-identity")) {
+        println!("{}", opencap_core::app_name());
+        return Ok(());
+    }
     match Cli::parse().command {
+        Command::Status {
+            meeting,
+            config,
+            output,
+        } => {
+            let report = diagnostic_status(config.as_deref(), meeting.as_deref())?;
+            let text = serde_json::to_string_pretty(&report)?;
+            if let Some(path) = output {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                file.write_all(text.as_bytes())?;
+                file.sync_all()?;
+            } else {
+                println!("{text}");
+            }
+        }
+        Command::DiagnoseReplay {
+            input,
+            report,
+            fault,
+        } => diagnostic_replay(&input, &report, fault)?,
+        #[cfg(feature = "nemo-poc")]
+        Command::BaselineAsrPoc {
+            input,
+            model_root,
+            output,
+        } => {
+            let directory = model_root.join(ModelKind::Streaming.directory());
+            let mut files = Vec::new();
+            let mut model_fingerprints = Vec::new();
+            for name in ModelKind::Streaming.files() {
+                let (bytes, sha256) = fingerprint_poc_file(&directory.join(name))?;
+                files.push(serde_json::json!({"name":name,"bytes":bytes,"sha256":sha256.clone()}));
+                model_fingerprints.push((directory.join(name), bytes, sha256));
+            }
+            let punctuation_path = punctuation_model_path(&model_root);
+            let punctuation_present = punctuation_ready(&model_root);
+            let punctuation_fingerprint = if punctuation_present {
+                let (size_bytes, sha256) = fingerprint_poc_file(&punctuation_path)?;
+                Some(opencap_core::MediaFingerprint { size_bytes, sha256 })
+            } else {
+                None
+            };
+            let loading = std::time::Instant::now();
+            let mut backend = SherpaStreamingAsr::new(model_root.clone())?;
+            let metadata = serde_json::json!({"route":"A", "backend":"sherpa Zipformer", "provider":"cpu", "model_files":files,
+                "punctuation_fingerprint_before_replay":punctuation_fingerprint.clone(),
+                "startup_ms":loading.elapsed().as_millis(), "model_load_ms":"worker asynchronous; not separately measured",
+                "punctuation":"requested; effective status not independently measured", "word_timing":"raw token starts when supplied; not mapped or evaluated"});
+            replay_streaming_asr(&input, &output, &mut backend, metadata, || {
+                for (path, bytes, sha256) in &model_fingerprints {
+                    anyhow::ensure!(
+                        fingerprint_poc_file(path)? == (*bytes, sha256.clone()),
+                        "实验期间基线模型文件发生变化"
+                    );
+                }
+                anyhow::ensure!(
+                    punctuation_ready(&model_root) == punctuation_present,
+                    "实验期间标点模型可用状态发生变化"
+                );
+                if let Some(expected) = &punctuation_fingerprint {
+                    let (size_bytes, sha256) = fingerprint_poc_file(&punctuation_path)?;
+                    anyhow::ensure!(
+                        &opencap_core::MediaFingerprint { size_bytes, sha256 } == expected,
+                        "实验期间标点模型发生变化"
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        #[cfg(feature = "nemo-poc")]
+        Command::NemoAsrPoc {
+            input,
+            library,
+            model,
+            output,
+        } => {
+            let loading = std::time::Instant::now();
+            // The explicit path must name a trusted library built from the pinned ABI.
+            let mut backend = unsafe { NemoStreamingAsr::open(&library, &model)? };
+            let library_sha256 = backend.library_sha256.clone();
+            let metadata = serde_json::json!({"route":"B", "backend":"Nemotron 3.5 streaming", "provider":"cpu",
+                "reference_revision":NEMO_REFERENCE_REVISION,"binary_revision":"unverified",
+                "library_sha256":backend.library_sha256.as_str(),"model_bytes":NEMOTRON_ASR_BYTES,"model_sha256":NEMOTRON_ASR_SHA256,
+                "model_load_ms":loading.elapsed().as_millis(), "word_timing":"requested decoder emission times; not forced alignment or evaluated"});
+            replay_streaming_asr(&input, &output, &mut backend, metadata, || {
+                anyhow::ensure!(
+                    fingerprint_poc_file(&model)?
+                        == (NEMOTRON_ASR_BYTES, NEMOTRON_ASR_SHA256.to_owned()),
+                    "实验期间模型文件发生变化"
+                );
+                anyhow::ensure!(
+                    fingerprint_poc_file(&library)?.1 == library_sha256,
+                    "实验期间动态库发生变化"
+                );
+                Ok(())
+            })?;
+        }
+        #[cfg(feature = "nemo-poc")]
+        Command::NemoDiarizePoc {
+            input,
+            library,
+            model,
+            output,
+        } => {
+            replay_nemo_diarization(&input, &library, &model, &output)?;
+        }
         Command::ExportTranscript { transcript, output } => {
             let t: Transcript = serde_json::from_slice(&std::fs::read(transcript)?)?;
             t.save(&output)?;

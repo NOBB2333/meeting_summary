@@ -1,3 +1,4 @@
+use crate::audio_state::RouteTelemetry;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use opencap_core::*;
@@ -100,6 +101,7 @@ pub struct WindowsAudio {
 struct AudioRoute {
     kind: AudioKind,
     device: Option<String>,
+    telemetry: Arc<RouteTelemetry>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -138,10 +140,37 @@ pub fn start_audio(
     audio
 }
 impl WindowsAudio {
+    pub fn clear_sample_times(&self) {
+        for route in &self.routes {
+            route.telemetry.clear_sample();
+        }
+    }
+    pub fn route_status(&self) -> Vec<AudioRouteStatus> {
+        let generation = self.clock.snapshot().2;
+        self.routes
+            .iter()
+            .map(|route| {
+                if route
+                    .thread
+                    .as_ref()
+                    .is_none_or(|thread| thread.is_finished())
+                {
+                    route.telemetry.stopped_snapshot(generation)
+                } else {
+                    route.telemetry.snapshot(generation)
+                }
+            })
+            .collect()
+    }
     /// Stop only changed routes. The unchanged route retains its stream and clock.
     pub fn reconfigure(&mut self, routing: &AudioRouting) {
         self.routes.retain(|route| {
-            routing.enabled(route.kind) && routing.device(route.kind) == &route.device
+            routing.enabled(route.kind)
+                && routing.device(route.kind) == &route.device
+                && route
+                    .thread
+                    .as_ref()
+                    .is_some_and(|thread| !thread.is_finished())
         });
         for kind in [AudioKind::System, AudioKind::Microphone] {
             if !routing.enabled(kind) || self.routes.iter().any(|route| route.kind == kind) {
@@ -149,6 +178,7 @@ impl WindowsAudio {
             }
             let device = routing.device(kind).clone();
             let stop = Arc::new(AtomicBool::new(false));
+            let telemetry = Arc::new(RouteTelemetry::new(kind, device.clone()));
             let (worker_stop, clock, tx, warnings, worker_device) = (
                 stop.clone(),
                 self.clock.clone(),
@@ -156,28 +186,41 @@ impl WindowsAudio {
                 self.warnings.clone(),
                 device.clone(),
             );
-            let thread = thread::spawn(move || {
-                if let Err(e) = audio_loop(
-                    kind,
-                    worker_device,
-                    clock,
-                    worker_stop,
-                    tx,
-                    warnings.clone(),
-                ) {
-                    let name = if kind == AudioKind::System {
-                        "系统声音"
-                    } else {
-                        "麦克风"
-                    };
-                    let _ = warnings.try_send(format!(
-                        "{name}不可用，该路补静音；可切换设备或重新开启：{e:#}"
-                    ));
+            let worker_telemetry = telemetry.clone();
+            let thread = thread::Builder::new()
+                .name("opencap-wasapi-supervisor".into())
+                .spawn(move || {
+                    supervise_route(
+                        kind,
+                        worker_stop.clone(),
+                        worker_telemetry.clone(),
+                        warnings.clone(),
+                        || {
+                            audio_loop(
+                                kind,
+                                worker_device.clone(),
+                                clock.clone(),
+                                worker_stop.clone(),
+                                tx.clone(),
+                                warnings.clone(),
+                                worker_telemetry.clone(),
+                            )
+                        },
+                    );
+                });
+            let thread = match thread {
+                Ok(thread) => thread,
+                Err(error) => {
+                    let _ = self
+                        .warnings
+                        .try_send(format!("无法启动声音采集线程，将重试：{error}"));
+                    continue;
                 }
-            });
+            };
             self.routes.push(AudioRoute {
                 kind,
                 device,
+                telemetry,
                 stop,
                 thread: Some(thread),
             });
@@ -196,14 +239,14 @@ pub struct AudioMonitor {
     denoise: bool,
 }
 struct MonitorState {
-    value: [f32; 2],
-    updated: [Instant; 2],
+    meters: [AudioMeter; 2],
+    inputs: [AudioMeter; 2],
 }
 impl Default for MonitorState {
     fn default() -> Self {
         Self {
-            value: [0.0; 2],
-            updated: [Instant::now(); 2],
+            meters: [AudioMeter::default(), AudioMeter::default()],
+            inputs: [AudioMeter::default(), AudioMeter::default()],
         }
     }
 }
@@ -213,6 +256,10 @@ impl Drop for AudioMonitor {
     }
 }
 impl AudioMonitor {
+    pub fn maintain(&mut self, routing: &AudioRouting, denoise: bool) -> bool {
+        self.set_routing(routing, denoise);
+        true
+    }
     pub fn set_routing(&mut self, routing: &AudioRouting, denoise: bool) {
         if self.denoise != denoise {
             self.routes
@@ -220,37 +267,84 @@ impl AudioMonitor {
             self.denoise = denoise;
         }
         self.routes.retain(|route| {
-            routing.enabled(route.kind) && routing.device(route.kind) == &route.device
+            routing.enabled(route.kind)
+                && routing.device(route.kind) == &route.device
+                && route
+                    .thread
+                    .as_ref()
+                    .is_some_and(|thread| !thread.is_finished())
         });
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, kind) in [AudioKind::System, AudioKind::Microphone]
+                .into_iter()
+                .enumerate()
+            {
+                if !routing.enabled(kind) || !self.routes.iter().any(|route| route.kind == kind) {
+                    state.meters[index].reset();
+                    state.inputs[index].reset();
+                }
+            }
+        }
         for kind in [AudioKind::System, AudioKind::Microphone] {
             if !routing.enabled(kind) || self.routes.iter().any(|route| route.kind == kind) {
                 continue;
             }
             let device = routing.device(kind).clone();
             let stop = Arc::new(AtomicBool::new(false));
+            let telemetry = Arc::new(RouteTelemetry::new(kind, device.clone()));
             let state = self.state.clone();
             let worker_device = device.clone();
             let worker_stop = stop.clone();
             let warnings = self.warning_tx.clone();
-            let thread = thread::spawn(move || {
-                if let Err(error) = monitor_loop(kind, worker_device, worker_stop, state, denoise) {
-                    let _ = warnings.try_send(format!("{kind:?} 电平检测失败：{error:#}"));
+            let worker_telemetry = telemetry.clone();
+            let thread = thread::Builder::new()
+                .name("opencap-wasapi-meter".into())
+                .spawn(move || {
+                    supervise_route(
+                        kind,
+                        worker_stop.clone(),
+                        worker_telemetry.clone(),
+                        warnings,
+                        || {
+                            monitor_loop(
+                                kind,
+                                worker_device.clone(),
+                                worker_stop.clone(),
+                                state.clone(),
+                                denoise,
+                                worker_telemetry.clone(),
+                            )
+                        },
+                    );
+                });
+            let thread = match thread {
+                Ok(thread) => thread,
+                Err(error) => {
+                    let _ = self
+                        .warning_tx
+                        .try_send(format!("无法启动电平监测线程，将重试：{error}"));
+                    continue;
                 }
-            });
+            };
             self.routes.push(AudioRoute {
                 kind,
                 device,
+                telemetry,
                 stop,
                 thread: Some(thread),
             });
         }
     }
-    /// Latest peak level per route in the mixer's own order: system, microphone.
-    pub fn peaks(&self) -> (f32, f32) {
+    /// Latest processed levels in the mixer's order: system, microphone.
+    pub fn levels(&self) -> (AudioRouteLevels, AudioRouteLevels) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let peak =
-            |i: usize| state.value[i] * (-state.updated[i].elapsed().as_secs_f32() / 0.35).exp();
-        (peak(0), peak(1))
+        let now = Instant::now();
+        let route = |i: usize| AudioRouteLevels {
+            input: state.inputs[i].level(now),
+            processed: state.meters[i].level(now),
+        };
+        (route(0), route(1))
     }
     pub fn take_warning(&self) -> Option<String> {
         self.warning_rx.try_recv().ok()
@@ -271,37 +365,80 @@ pub fn start_audio_monitor(routing: &AudioRouting, denoise: bool) -> Result<Audi
     monitor.set_routing(routing, denoise);
     Ok(monitor)
 }
+
+/// Keep the other route alive while this route reconnects. A specifically
+/// selected endpoint is retried as-is; it never falls back to a different one.
+fn supervise_route<F>(
+    kind: AudioKind,
+    stop: Arc<AtomicBool>,
+    telemetry: Arc<RouteTelemetry>,
+    warnings: Sender<String>,
+    mut capture: F,
+) where
+    F: FnMut() -> Result<()>,
+{
+    let mut previous_error = String::new();
+    while !stop.load(Ordering::Acquire) {
+        telemetry.starting();
+        let began = Instant::now();
+        let result = capture();
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let error = result
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_else(|| "采集流意外结束".into());
+        telemetry.waiting(error.clone());
+        if error != previous_error || began.elapsed() >= Duration::from_secs(30) {
+            let name = if kind == AudioKind::System {
+                "系统声音"
+            } else {
+                "麦克风"
+            };
+            let _ = warnings.try_send(format!("{name}暂不可用，该路补静音并自动重试：{error}"));
+            previous_error = error;
+        }
+        for _ in 0..20 {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
 fn monitor_loop(
     kind: AudioKind,
     device_id: Option<String>,
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<MonitorState>>,
     denoise: bool,
+    telemetry: Arc<RouteTelemetry>,
 ) -> Result<()> {
     let mut denoiser = (denoise && kind == AudioKind::Microphone).then(|| MicDenoiser::new(48_000));
     let index = usize::from(kind == AudioKind::Microphone);
-    capture_loop(kind, device_id, stop, move |_latency, samples| {
-        let mut filtered;
-        let values: &[f32] = if let Some(denoiser) = denoiser.as_mut() {
-            filtered = samples.to_vec();
-            denoiser.process(&mut filtered);
-            &filtered
-        } else {
-            samples
-        };
-        let peak = values
-            .iter()
-            .filter(|value| value.is_finite())
-            .fold(0.0f32, |peak, value| peak.max(value.abs().min(1.0)));
-        let now = Instant::now();
-        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-        let elapsed = now
-            .saturating_duration_since(state.updated[index])
-            .as_secs_f32();
-        state.value[index] = (state.value[index] * (-elapsed / 0.35).exp()).max(peak);
-        state.updated[index] = now;
-        Ok(())
-    })
+    capture_loop(
+        kind,
+        device_id,
+        stop,
+        telemetry,
+        move |_latency, samples| {
+            let input = AudioLevel::measure(samples);
+            let mut filtered;
+            let values: &[f32] = if let Some(denoiser) = denoiser.as_mut() {
+                filtered = samples.to_vec();
+                denoiser.process(&mut filtered);
+                &filtered
+            } else {
+                samples
+            };
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            state.inputs[index].observe(input, now);
+            state.meters[index].update(values, now);
+            Ok(())
+        },
+    )
 }
 fn audio_loop(
     kind: AudioKind,
@@ -310,6 +447,7 @@ fn audio_loop(
     stop: Arc<AtomicBool>,
     tx: Sender<AudioChunk>,
     warnings: Sender<String>,
+    telemetry: Arc<RouteTelemetry>,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let counter = if kind == AudioKind::System {
@@ -319,42 +457,60 @@ fn audio_loop(
     };
     let mut timeline = AudioTimeline::default();
     let mut overrun_warned = false;
-    let result = capture_loop(kind, device_id, stop, |latency, samples| {
-        counter.fetch_add(1, Relaxed);
-        let peak = samples
-            .iter()
-            .filter(|value| value.is_finite())
-            .fold(0.0f32, |peak, value| peak.max(value.abs()));
-        if peak > 0.0 {
-            AUDIO_DIAG.capture_nonzero.fetch_add(1, Relaxed);
-        }
-        let millis = (peak.min(1.0) as f64 * 10_000.0) as u64;
-        AUDIO_DIAG.peak_millis.fetch_max(millis, Relaxed);
-        let Some(pts_us) = timeline.timestamp(&clock, latency, samples.len() / 2) else {
-            return Ok(());
-        };
-        match tx.try_send(AudioChunk {
-            kind,
-            pts_us,
-            samples: samples.to_vec(),
-        }) {
-            Ok(()) => {
-                AUDIO_DIAG.chunks_sent.fetch_add(1, Relaxed);
+    let capture_telemetry = telemetry.clone();
+    let result = capture_loop(
+        kind,
+        device_id,
+        stop,
+        capture_telemetry,
+        |latency, samples| {
+            let (_, paused, callback_generation) = clock.snapshot();
+            if paused {
+                return Ok(());
             }
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                AUDIO_DIAG.chunks_dropped.fetch_add(1, Relaxed);
-                if !overrun_warned {
-                    let _ = warnings
-                        .try_send(format!("{kind:?} 音频队列积压，部分采样丢失；采集会继续"));
-                    overrun_warned = true;
+            counter.fetch_add(1, Relaxed);
+            let peak = samples
+                .iter()
+                .filter(|value| value.is_finite())
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            if peak > 0.0 {
+                AUDIO_DIAG.capture_nonzero.fetch_add(1, Relaxed);
+            }
+            let millis = (peak.min(1.0) as f64 * 10_000.0) as u64;
+            AUDIO_DIAG.peak_millis.fetch_max(millis, Relaxed);
+            let Some((pts_us, generation)) =
+                timeline.timestamp_with_generation(&clock, latency, samples.len() / 2)
+            else {
+                return Ok(());
+            };
+            if generation != callback_generation {
+                return Ok(());
+            }
+            telemetry.sample(pts_us, generation);
+            match tx.try_send(AudioChunk {
+                generation,
+                kind,
+                pts_us,
+                samples: samples.to_vec(),
+            }) {
+                Ok(()) => {
+                    AUDIO_DIAG.chunks_sent.fetch_add(1, Relaxed);
+                }
+                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                    AUDIO_DIAG.chunks_dropped.fetch_add(1, Relaxed);
+                    if !overrun_warned {
+                        let _ = warnings
+                            .try_send(format!("{kind:?} 音频队列积压，部分采样丢失；采集会继续"));
+                        overrun_warned = true;
+                    }
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("Audio receiver closed")
                 }
             }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                anyhow::bail!("Audio receiver closed")
-            }
-        }
-        Ok(())
-    });
+            Ok(())
+        },
+    );
     if result.is_err() {
         AUDIO_DIAG.init_errors.fetch_add(1, Relaxed);
     }
@@ -367,6 +523,7 @@ fn capture_loop<F>(
     kind: AudioKind,
     device_id: Option<String>,
     stop: Arc<AtomicBool>,
+    telemetry: Arc<RouteTelemetry>,
     mut sink: F,
 ) -> Result<()>
 where
@@ -379,11 +536,14 @@ where
     } else {
         Direction::Capture
     };
+    let follows_default = device_id.is_none();
     let device = if let Some(id) = device_id {
         enumerator.get_device(&id)?
     } else {
         enumerator.get_default_device(&direction)?
     };
+    let resolved_id = device.get_id()?;
+    let resolved_name = device.get_friendlyname()?;
     let mut client = device.get_iaudioclient()?;
     // The Windows shared audio engine performs device-rate conversion to 48 kHz stereo.
     let format = WaveFormat::new(32, 32, &SampleType::Float, 48000, 2, None);
@@ -398,7 +558,15 @@ where
     let capture = client.get_audiocaptureclient()?;
     let mut bytes = vec![0u8; client.get_buffer_size()? as usize * 8];
     client.start_stream()?;
+    telemetry.opened(resolved_id.clone(), resolved_name);
+    let mut default_check = Instant::now();
     while !stop.load(Ordering::Acquire) {
+        if follows_default && default_check.elapsed() >= Duration::from_secs(2) {
+            default_check = Instant::now();
+            if enumerator.get_default_device(&direction)?.get_id()? != resolved_id {
+                anyhow::bail!("系统默认设备已更换");
+            }
+        }
         while !stop.load(Ordering::Acquire) && capture.get_next_packet_size()?.unwrap_or(0) > 0 {
             let (count, info) = capture.read_from_device(&mut bytes)?;
             AUDIO_DIAG

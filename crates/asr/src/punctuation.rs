@@ -1,11 +1,14 @@
 //! Local punctuation restoration; recognized words are never intentionally rewritten.
-use crate::models::{RemoteFile, copy_verified, download};
+use crate::models::{
+    CancellableReader, RemoteFile, copy_verified, download, ensure_download_active,
+};
 use anyhow::{Context, Result};
 use opencap_core::TranscriptionLanguage;
 use sherpa_onnx::{OfflinePunctuation, OfflinePunctuationConfig};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,17 +33,33 @@ pub fn punctuation_ready(root: &Path) -> bool {
         .metadata()
         .is_ok_and(|m| m.is_file() && m.len() == MODEL.size)
 }
+pub fn punctuation_model_path(root: &Path) -> PathBuf {
+    root.join(DIR).join(MODEL.name)
+}
+pub(crate) fn punctuation_reference_match(fingerprint: &opencap_core::MediaFingerprint) -> bool {
+    fingerprint.size_bytes == MODEL.size && fingerprint.sha256 == MODEL.sha256
+}
 
 /// Install only an independently verified official model or byte-identical mirror.
-pub fn prepare_punctuation(
+pub fn prepare_punctuation(root: &Path, progress: impl FnMut(u64, Option<u64>)) -> Result<PathBuf> {
+    prepare_punctuation_cancellable(root, &AtomicBool::new(false), progress)
+}
+
+pub fn prepare_punctuation_cancellable(
     root: &Path,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf> {
+    ensure_download_active(cancelled)?;
     let dest = root.join(DIR);
-    if punctuation_ready(root) {
-        return Ok(dest);
-    }
     fs::create_dir_all(root)?;
+    {
+        let _guard = crate::models::model_install_guard(root)?;
+        crate::models::recover_model_install(root, DIR)?;
+        if punctuation_ready(root) {
+            return Ok(dest);
+        }
+    }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let staging = root.join(format!(
         ".punctuation-download-{}-{nonce}",
@@ -50,11 +69,17 @@ pub fn prepare_punctuation(
     let result = (|| -> Result<PathBuf> {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(1800))
+            // Blocking reads use this per-operation timeout; long downloads
+            // can continue while progress is made, stalled reads terminate.
+            .timeout(Duration::from_secs(60))
             .build()?;
         let model_path = staging.join(MODEL.name);
         let direct = (|| -> Result<()> {
-            let mut response = download(&client, MIRROR)?;
+            let response = download(&client, MIRROR, cancelled)?;
+            let mut response = CancellableReader {
+                reader: response,
+                cancelled,
+            };
             let mut output = fs::File::create(&model_path)?;
             progress(0, Some(MODEL.size));
             copy_verified(&mut response, &mut output, &MODEL, |bytes| {
@@ -64,7 +89,13 @@ pub fn prepare_punctuation(
             Ok(())
         })();
         if direct.is_err() {
-            let mut response = download(&client, UPSTREAM).context("下载中英标点模型失败")?;
+            ensure_download_active(cancelled)?;
+            let response =
+                download(&client, UPSTREAM, cancelled).context("下载中英标点模型失败")?;
+            let mut response = CancellableReader {
+                reader: response,
+                cancelled,
+            };
             let archive_path = staging.join(ARCHIVE.name);
             let mut archive_file = fs::File::create(&archive_path)?;
             progress(0, Some(ARCHIVE.size));
@@ -76,40 +107,71 @@ pub fn prepare_punctuation(
                 tar::Archive::new(bzip2::read::BzDecoder::new(fs::File::open(archive_path)?));
             let mut found = false;
             for entry in archive.entries()? {
-                let mut entry = entry?;
+                ensure_download_active(cancelled)?;
+                let entry = entry?;
                 if !entry.header().entry_type().is_file()
                     || entry.path()?.as_ref() != Path::new(ARCHIVE_DIR).join(MODEL.name)
                 {
                     continue;
                 }
                 let mut output = fs::File::create(&model_path)?;
-                copy_verified(&mut entry, &mut output, &MODEL, |_| {})?;
+                copy_verified(
+                    &mut CancellableReader {
+                        reader: entry,
+                        cancelled,
+                    },
+                    &mut output,
+                    &MODEL,
+                    |_| {},
+                )?;
                 output.sync_all()?;
                 found = true;
                 break;
             }
             anyhow::ensure!(found, "标点模型压缩包缺少模型文件");
         }
+        ensure_download_active(cancelled)?;
         let extracted = staging.join(DIR);
         fs::create_dir(&extracted)?;
         fs::rename(&model_path, extracted.join(MODEL.name))?;
+        let _install_guard = crate::models::model_install_guard(root)?;
+        ensure_download_active(cancelled)?;
+        crate::models::recover_model_install(root, DIR)?;
         if punctuation_ready(root) {
             return Ok(dest);
         }
-        if dest.exists() {
-            let backup = root.join(format!(".incomplete-punctuation-{nonce}"));
-            fs::rename(&dest, &backup).context("无法保留原有标点模型目录")?;
-            if let Err(error) = fs::rename(&extracted, &dest) {
-                let _ = fs::rename(&backup, &dest);
-                return Err(error).context("无法保存标点模型");
+        if crate::models::model_path_exists(&dest)? {
+            let backup = crate::models::journal_model_replace(root, DIR, nonce)?;
+            opencap_core::rename_no_replace(&dest, &backup).context("无法保留原有标点模型目录")?;
+            if let Err(error) = opencap_core::rename_no_replace(&extracted, &dest) {
+                return match opencap_core::rename_no_replace(&backup, &dest) {
+                    Ok(()) => Err(error).context("无法保存标点模型，原目录已恢复"),
+                    Err(restore) => Err(error).context(format!(
+                        "无法保存标点模型；原目录保留在 {}，恢复失败：{restore}",
+                        backup.display()
+                    )),
+                };
             }
         } else {
-            fs::rename(extracted, &dest)?;
+            opencap_core::rename_no_replace(&extracted, &dest)?;
+        }
+        opencap_core::sync_parent_directory(&dest)
+            .context("标点模型已安装，但目录持久化确认失败")?;
+        if root.join(format!(".opencap-install-{DIR}.json")).exists() {
+            crate::models::finish_model_replace(root, DIR)
+                .context("标点模型已安装，但恢复日志清理失败")?;
         }
         Ok(dest)
     })();
-    let _ = fs::remove_dir_all(staging);
-    result
+    let cleanup = fs::remove_dir_all(&staging);
+    match (result, cleanup) {
+        (Ok(path), Ok(())) => Ok(path),
+        (Ok(_), Err(error)) => Err(error).context("标点模型已安装，但临时下载目录未能清理"),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("临时下载目录清理失败：{cleanup}")))
+        }
+    }
 }
 
 /// Use only one model thread and invoke it at a limited rate on the ASR worker.
@@ -119,8 +181,17 @@ pub(crate) struct Punctuator {
     language: TranscriptionLanguage,
 }
 impl Punctuator {
+    #[cfg(test)]
     pub fn new(root: &Path, enabled: bool, language: TranscriptionLanguage) -> Self {
-        let model = if enabled && punctuation_ready(root) {
+        Self::with_model_policy(root, enabled, language, true)
+    }
+    pub(crate) fn with_model_policy(
+        root: &Path,
+        enabled: bool,
+        language: TranscriptionLanguage,
+        allow_model: bool,
+    ) -> Self {
+        let model = if enabled && allow_model && punctuation_ready(root) {
             let mut config = OfflinePunctuationConfig::default();
             config.model.ct_transformer = Some(
                 root.join(DIR)

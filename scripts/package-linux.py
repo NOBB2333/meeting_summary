@@ -86,6 +86,9 @@ def package(build_dir, output):
         if not source.is_file():
             raise RuntimeError(f"Missing executable: {source}; run scripts/dev.sh build --release")
         bundle(source, bin_dir / name)
+    for name in ("opencap", "opencap-bench", "opencap-transcribe"):
+        if run(bin_dir / name, "--build-identity") != "OpenCap":
+            raise RuntimeError(f"Refusing to package non-production executable: {name}")
     for name in ("ffmpeg", "pactl"):
         source = shutil.which(name)
         if not source:
@@ -169,7 +172,7 @@ Categories=AudioVideo;Recorder;
     shutil.copy2(stage / "OpenCap.desktop", desktop / "OpenCap.desktop")
     control = deb / "DEBIAN"
     control.mkdir()
-    (control / "control").write_text(f"Package: opencap\nVersion: {package_version}\nArchitecture: {arch[1]}\nMaintainer: OpenCap contributors\nDepends: libc6 (>= 2.28), libvulkan1, xdg-utils\nSection: video\nPriority: optional\nDescription: Native screen recording and meeting notes\n")
+    (control / "control").write_text(f"Package: opencap\nVersion: {package_version}\nArchitecture: {arch[1]}\nMaintainer: OpenCap contributors\nDepends: libc6 (>= 2.28), libvulkan1, libasound2, libasound2-plugins, xdg-utils\nSection: video\nPriority: optional\nDescription: Native screen recording and meeting notes\n")
     subprocess.run(["dpkg-deb", "--build", "--root-owner-group", str(deb), str(output / f"OpenCap-linux-{arch[0]}.deb")], check=True)
     shutil.rmtree(deb)
     destination = output / f"OpenCap-linux-{arch[0]}"

@@ -161,6 +161,12 @@ async fn shot(hwnd: isize, path: PathBuf) -> Result<()> {
     .await
 }
 async fn shot_target(target: CaptureTarget, path: PathBuf) -> Result<()> {
+    if std::env::args().any(|arg| arg == "--ui-skip-capture") {
+        // Screen recording permission is bound to the signed binary; a rebuilt
+        // dev binary may need a fresh system grant. Backend/UI assertions can
+        // still run without producing snapshot videos.
+        return Ok(());
+    }
     let (tx, rx) = crossbeam_channel::bounded(1);
     std::thread::spawn(move || {
         let result = (|| -> Result<()> {
@@ -324,6 +330,16 @@ pub fn run(
                 anyhow::ensure!(state!=RecordingState::Failed && stop.elapsed()<Duration::from_secs(15),"UI stop failed");
                 futures_timer::Delay::new(Duration::from_millis(100)).await;
             }
+            // The post-stop scan is asynchronous. Wait for it instead of
+            // snapshotting a momentarily empty meeting list.
+            futures_timer::Delay::new(Duration::from_millis(300)).await;
+            let scan_wait=std::time::Instant::now();
+            loop {
+                let ready=recorder.read_with(cx,|r,_|r.meeting_scan.is_none() && !r.meetings.is_empty());
+                if ready {break;}
+                anyhow::ensure!(scan_wait.elapsed()<Duration::from_secs(5),"Meeting list did not list the finished recording");
+                futures_timer::Delay::new(Duration::from_millis(100)).await;
+            }
             shot(hwnd,path.join("05-finished")).await?;
             recorder.update(cx,|r,cx| { r.audio_picker=Some(AudioKind::System); r.page_scroll.set_offset(point(px(0.),px(-190.))); cx.notify(); });
             futures_timer::Delay::new(Duration::from_millis(300)).await;
@@ -335,8 +351,107 @@ pub fn run(
             let region = opencap_platform::window_region(float_hwnd)?;
             if let CaptureTarget::Region { rect, .. } = region { anyhow::ensure!(rect.width > rect.height * 5 && rect.height <= 250,"Toolbar has incorrect size: {rect:?}"); }
             shot_target(region,path.join("07-floating-controls")).await?;
+            // Optional preloaded real meeting: exercise the library, transcript,
+            // internal player seek and search against an actual recording.
+            let real = recorder.read_with(cx,|r,_| r.meetings.iter()
+                .find(|m| m.reviewable())
+                .map(|m| m.base.clone()));
+            if let Some(base)=real {
+                // The two-pane review layout needs a wide window; the narrow
+                // layout uses tabs and would hide the media pane.
+                main.update(cx,|_,w,_| w.resize(size(px(1400.),px(900.))))?;
+                futures_timer::Delay::new(Duration::from_millis(400)).await;
+                recorder.update(cx,|r,cx| r.open_library_meeting_for_review(&base,cx));
+                let open_start=std::time::Instant::now();
+                loop {
+                    let ready=recorder.read_with(cx,|r,_| r.transcript_output.as_ref()==Some(&base)
+                        && r.player_snapshot.as_ref().is_some_and(|s| s.source_verified && s.duration_ms.is_some()));
+                    if ready {break;}
+                    if open_start.elapsed()>Duration::from_secs(25) {
+                        let debug=recorder.read_with(cx,|r,_| serde_json::json!({
+                            "transcript_output":r.transcript_output,
+                            "source":r.transcript.source,
+                            "message":r.message,
+                            "status":r.transcription_status,
+                            "player":r.player_snapshot.as_ref().map(|s| serde_json::json!({
+                                "state":format!("{:?}",s.state), "verified":s.source_verified, "duration":s.duration_ms,
+                                "error":s.error, "video_error":s.video_error
+                            })),
+                            "meetings":r.meetings.len(),
+                        }));
+                        let _=std::fs::write(path.join("ui-smoke-debug.json"),serde_json::to_vec_pretty(&debug)?);
+                    }
+                    anyhow::ensure!(open_start.elapsed()<Duration::from_secs(30),"Real meeting/player did not open");
+                    futures_timer::Delay::new(Duration::from_millis(100)).await;
+                }
+                let duration=recorder.read_with(cx,|r,_| r.player_snapshot.as_ref().and_then(|s| s.duration_ms)).unwrap_or(0);
+                anyhow::ensure!(duration>60_000,"Player duration not read from real media");
+                // Waveform generation decodes the whole real media in the
+                // background; wait for it instead of snapshotting a placeholder.
+                let wave_start=std::time::Instant::now();
+                loop {
+                    if recorder.read_with(cx,|r,_| r.player_waveform.is_some()) {break;}
+                    anyhow::ensure!(wave_start.elapsed()<Duration::from_secs(60),"Waveform did not finish for real media");
+                    futures_timer::Delay::new(Duration::from_millis(200)).await;
+                }
+                recorder.update(cx,|r,_| { r.send_player(opencap_media::PlaybackCommand::SetVolume(0.0)); r.send_player(opencap_media::PlaybackCommand::Play); });
+                futures_timer::Delay::new(Duration::from_millis(1500)).await;
+                let position=recorder.read_with(cx,|r,_| r.player_snapshot.as_ref().map(|s| s.position_ms)).unwrap_or(0);
+                anyhow::ensure!(position>300,"Player position did not advance: {position}");
+                let target=duration.saturating_mul(2)/3;
+                recorder.update(cx,|r,cx| r.seek_player_from_segment(target,cx));
+                futures_timer::Delay::new(Duration::from_millis(1200)).await;
+                let after=recorder.read_with(cx,|r,_| r.player_snapshot.as_ref().map(|s| s.position_ms)).unwrap_or(0);
+                anyhow::ensure!(after.abs_diff(target)<5_000,"Seek did not reach target: target={target} actual={after}");
+                // Rapid successive seeks exercise decoder/generation flushing on
+                // real media; only the last target may remain.
+                recorder.update(cx,|r,cx| {
+                    r.seek_player_from_segment(120_000,cx);
+                    r.seek_player_from_segment(30_000,cx);
+                    r.seek_player_from_segment(target,cx);
+                });
+                futures_timer::Delay::new(Duration::from_millis(2000)).await;
+                let rapid=recorder.read_with(cx,|r,_| r.player_snapshot.as_ref().map(|s| s.position_ms)).unwrap_or(0);
+                anyhow::ensure!(rapid.abs_diff(target)<8_000,"Rapid seeks left a stale position: target={target} actual={rapid}");
+                // A-B loop: after starting just before the range end, playback
+                // must wrap to the start instead of advancing past the range.
+                let start=recorder.read_with(cx,|r,_| r.player_snapshot.as_ref().and_then(|s| s.duration_ms)).unwrap_or(0)/5;
+                let range=opencap_media::PlaybackRange::new(start,start+2_000,true).unwrap();
+                recorder.update(cx,|r,_| {
+                    r.send_player(opencap_media::PlaybackCommand::PlayRange(range));
+                });
+                futures_timer::Delay::new(Duration::from_millis(2500)).await;
+                let looped=recorder.read_with(cx,|r,_| r.player_snapshot.as_ref().map(|s| s.position_ms)).unwrap_or(0);
+                anyhow::ensure!((start..start+2_000).contains(&looped),
+                    "A-B loop did not wrap: start={start} actual={looped}");
+                recorder.update(cx,|r,_| r.send_player(opencap_media::PlaybackCommand::SetRange(None)));
+                shot(hwnd,path.join("08-player-seek")).await?;
+                recorder.update(cx,|r,_| { r.send_player(opencap_media::PlaybackCommand::Pause); });
+                // Search the real transcript with a short Chinese word so the
+                // instr fallback (not just trigram FTS) is exercised.
+                recorder.update(cx,|r,_| r.start_meeting_search("对账".into()));
+                let search_start=std::time::Instant::now();
+                loop {
+                    let ready=recorder.read_with(cx,|r,_| r.meeting_search_task.is_none() && r.meeting_search_result.is_some());
+                    if ready {break;}
+                    anyhow::ensure!(search_start.elapsed()<Duration::from_secs(20),"Real meeting search did not finish");
+                    futures_timer::Delay::new(Duration::from_millis(100)).await;
+                }
+                let total=recorder.read_with(cx,|r,_| r.meeting_search_result.as_ref().map(|r| r.total)).unwrap_or(0);
+                anyhow::ensure!(total>0,"Short Chinese search found no hits in real transcript");
+                // Show the results in the library instead of leaving the
+                // transcript page in front of them.
+                recorder.update(cx,|r,cx| {
+                    r.meeting_page=workspace::MeetingPage::Library;
+                    r.transcription_tab=true;
+                    r.settings=false;
+                    cx.notify();
+                });
+                futures_timer::Delay::new(Duration::from_millis(400)).await;
+                shot(hwnd,path.join("09-search")).await?;
+            }
             let stats=recorder.read_with(cx,|r,_|r.stats.clone());
-            std::fs::write(path.join("ui-smoke.json"),serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"stats":stats,"microphone_exercised":exercise_microphone,"maximized_columns":wide_columns,"scenarios":["23 real native-window previews","responsive expanded grid and last target","compact scrolling","small-window settings","live encoder preview","minimized target hides border","timed and disabled borders","UI start/pause/resume/stop","live audio and device switch"]}))?)?;
+            std::fs::write(path.join("ui-smoke.json"),serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"stats":stats,"microphone_exercised":exercise_microphone,"maximized_columns":wide_columns,"real_meeting_exercised":recorder.read_with(cx,|r,_|r.transcript_output.is_some()),"scenarios":["23 real native-window previews","responsive expanded grid and last target","compact scrolling","small-window settings","live encoder preview","minimized target hides border","timed and disabled borders","UI start/pause/resume/stop","live audio and device switch","real meeting open, player seek, short-word search"]}))?)?;
             Ok(())
         }.await;
         if let Err(e)=result { let _=std::fs::write(path.join("ui-smoke-error.txt"),format!("{e:#}")); }

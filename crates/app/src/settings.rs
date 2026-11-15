@@ -81,6 +81,17 @@ impl Recorder {
         ui::card()
             .child(ui::section_title("界面与提示", "录制过程中显示什么"))
             .child(ui::setting_row(
+                "减少界面动画",
+                "减少弹层及其他界面动效，不影响录制和回放",
+                button("reduce-motion", if self.config.reduce_motion { "开启" } else { "关闭" }, self.config.reduce_motion)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.reduce_motion = !this.config.reduce_motion;
+                        cx.set_reduce_motion(this.config.reduce_motion);
+                        this.save();
+                        cx.notify();
+                    })),
+            ))
+            .child(ui::setting_row(
                 "悬浮控制条",
                 "录制时在桌面显示暂停与停止按钮",
                 button(
@@ -108,8 +119,10 @@ impl Recorder {
                 "录屏中隐藏应用",
                 if cfg!(target_os = "linux") {
                     "X11 不支持排除应用，可选择要录制的目标窗口"
+                } else if cfg!(target_os = "macos") {
+                    "本应用的显示器采集可过滤自身；窗口采集和其他录屏软件的行为可能不同，此设置不排除声音"
                 } else {
-                    "从录制画面中排除 OpenCap 窗口"
+                    "请求系统排除 OpenCap 自身窗口；其他捕获方式可能不遵循，此设置不排除声音"
                 },
                 button(
                     "capture-exclusion",
@@ -191,7 +204,9 @@ impl Recorder {
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.config.mic_denoise = !this.config.mic_denoise;
-                    if let Some(session) = &this.session {
+                    if this.stats.state == opencap_core::RecordingState::Stopping && this.active() {
+                        this.message = "录制正在停止，降噪设置将用于下一次录制。".into();
+                    } else if let Some(session) = &this.session {
                         session.command(RecordingCommand::SetMicDenoise(this.config.mic_denoise));
                     }
                     this.monitor = None;
@@ -210,7 +225,7 @@ impl Recorder {
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.config.monitor_levels = !this.config.monitor_levels;
                     this.monitor = None;
-                    this.monitor_peaks = (0.0, 0.0);
+                    this.monitor_levels = (AudioRouteLevels::default(), AudioRouteLevels::default());
                     this.save();
                     cx.notify();
                 })),))

@@ -1,5 +1,5 @@
 //! Explicit local enrollment and conservative matching of clean, non-overlapping speech.
-use crate::{SpeakerTurn, Transcript, atomic_write, speaker_models::EMBEDDING};
+use crate::{SpeakerTurn, Transcript, speaker_models::EMBEDDING};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
@@ -11,6 +11,8 @@ use std::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeakerName {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub name: String,
     #[serde(default)]
     pub matched: bool,
@@ -19,6 +21,8 @@ pub struct SpeakerName {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Voiceprint {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub model: String,
     pub vector: Vec<f32>,
     pub voiced_ms: u64,
@@ -28,25 +32,83 @@ pub struct VoiceProfile {
     pub id: String,
     pub name: String,
     samples: Vec<Voiceprint>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Memory {
     #[serde(default)]
     profiles: Vec<VoiceProfile>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 fn path(root: &Path) -> PathBuf {
     root.with_file_name("speaker-memory.json")
 }
-fn read(root: &Path) -> Result<Memory> {
-    let path = path(root);
-    if !path.exists() {
-        return Ok(Memory::default());
+fn memory_write_guard(root: &Path) -> Result<std::fs::File> {
+    let lock_path = root.with_file_name("speaker-memory.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    file.lock().context("无法锁定声纹记忆")?;
+    Ok(file)
+}
+fn read(root: &Path) -> Result<Memory> {
+    use std::io::Read;
+    const LIMIT: u64 = 8_000_000;
+    let path = path(root);
+    let before = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Memory::default()),
+        Err(error) => return Err(error.into()),
+    };
     anyhow::ensure!(
-        std::fs::metadata(&path)?.len() <= 8_000_000,
-        "声纹记忆文件过大"
+        before.is_file() && !before.file_type().is_symlink() && before.len() <= LIMIT,
+        "声纹记忆不是普通文件或超过大小限制"
     );
-    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    let file = opencap_core::open_regular_file_for_read(&path)?;
+    let identity = same_file::Handle::from_file(file.try_clone()?)?;
+    let opened = file.metadata()?;
+    anyhow::ensure!(
+        opened.len() == before.len()
+            && opened.modified()? == before.modified()?
+            && identity
+                == same_file::Handle::from_file(opencap_core::open_regular_file_for_read(&path)?)?,
+        "声纹记忆读取前发生变化"
+    );
+    let mut bytes = Vec::new();
+    (&file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    let current = std::fs::symlink_metadata(&path)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= LIMIT
+            && current.is_file()
+            && !current.file_type().is_symlink()
+            && opened.len() == bytes.len() as u64
+            && opened.len() == after.len()
+            && opened.modified()? == after.modified()?
+            && after.len() == current.len()
+            && after.modified()? == current.modified()?
+            && identity
+                == same_file::Handle::from_file(opencap_core::open_regular_file_for_read(&path)?)?,
+        "声纹记忆读取期间发生变化"
+    );
+    let memory: Memory = serde_json::from_slice(&bytes).context("声纹记忆格式无效")?;
+    let mut ids = std::collections::BTreeSet::new();
+    anyhow::ensure!(
+        memory
+            .profiles
+            .iter()
+            .all(|profile| !profile.id.is_empty() && ids.insert(&profile.id)),
+        "声纹档案身份为空或重复；原文件保留"
+    );
+    Ok(memory)
 }
 fn write(root: &Path, memory: &Memory) -> Result<()> {
     let path = path(root);
@@ -58,18 +120,38 @@ fn write(root: &Path, memory: &Memory) -> Result<()> {
         bytes.len() <= 8_000_000,
         "声纹记忆已满，请先忘记不再使用的声音"
     );
-    atomic_write(&path, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let parent = path.parent().context("声纹记忆目录无效")?;
+    let temporary = parent.join(format!(
+        ".opencap-voice-{}.tmp",
+        opencap_core::new_stable_id()
+    ));
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)?;
+        opencap_core::sync_parent_directory(&path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    Ok(())
+    result
 }
 pub fn voice_profiles(root: &Path) -> Result<Vec<VoiceProfile>> {
     Ok(read(root)?.profiles)
 }
 pub fn forget_voice(root: &Path, id: &str) -> Result<()> {
+    let _guard = memory_write_guard(root)?;
     let mut memory = read(root)?;
     memory.profiles.retain(|p| p.id != id);
     write(root, &memory)
@@ -119,9 +201,16 @@ fn candidates(print: &Voiceprint, memory: &Memory) -> Vec<(usize, f32)> {
     scores.sort_by(|a, b| b.1.total_cmp(&a.1));
     scores
 }
+#[cfg(test)]
 fn apply_matches(transcript: &mut Transcript, memory: &Memory) {
+    apply_matches_for_model(transcript, memory, None);
+}
+fn apply_matches_for_model(transcript: &mut Transcript, memory: &Memory, model: Option<&str>) {
     let mut proposed = Vec::new();
     for (&speaker, print) in &transcript.speaker_voiceprints {
+        if model.is_some_and(|expected| print.model != expected) {
+            continue;
+        }
         let scores = candidates(print, memory);
         if let Some(&(index, score)) = scores.first()
             && score >= 0.72
@@ -138,10 +227,19 @@ fn apply_matches(transcript: &mut Transcript, memory: &Memory) {
             continue;
         }
         let profile = &memory.profiles[index];
+        // An existing manual or previously preserved name may have no usable
+        // voiceprint in this pass. It still reserves its explicit profile;
+        // do not silently assign the same identity to a different group.
+        if transcript.speaker_names.iter().any(|(&other, name)| {
+            other != speaker && name.profile_id.as_deref() == Some(profile.id.as_str())
+        }) {
+            continue;
+        }
         transcript
             .speaker_names
             .entry(speaker)
             .or_insert_with(|| SpeakerName {
+                extra: Default::default(),
                 name: profile.name.clone(),
                 matched: true,
                 profile_id: Some(profile.id.clone()),
@@ -184,32 +282,43 @@ pub fn name_speaker(
             print.voiced_ms >= 3000 && normalize(&mut print.vector),
             "独立发言不足 3 秒，暂不能记住声音"
         );
+        let _guard = memory_write_guard(root)?;
         let mut memory = read(root)?;
         let existing = memory.profiles.iter().position(|p| p.name == name);
         let index = existing.unwrap_or_else(|| {
-            let id = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .to_string();
+            let id = opencap_core::new_stable_id();
             memory.profiles.push(VoiceProfile {
                 id,
                 name: name.into(),
                 samples: Vec::new(),
+                extra: BTreeMap::new(),
             });
             memory.profiles.len() - 1
         });
         let profile = &mut memory.profiles[index];
-        if profile.samples.len() >= 5 {
-            profile.samples.remove(0);
+        let duplicate = profile.samples.iter().any(|sample| {
+            sample.model == print.model
+                && sample.voiced_ms == print.voiced_ms
+                && sample.vector == print.vector
+        });
+        if !duplicate {
+            if profile.samples.len() >= 5 {
+                profile.samples.remove(0);
+            }
+            profile.samples.push(print);
         }
-        profile.samples.push(print);
         profile_id = Some(profile.id.clone());
         write(root, &memory)?;
     }
+    let extra = transcript
+        .speaker_names
+        .get(&speaker)
+        .map(|old| old.extra.clone())
+        .unwrap_or_default();
     transcript.speaker_names.insert(
         speaker,
         SpeakerName {
+            extra,
             name: name.into(),
             matched: false,
             profile_id,
@@ -252,7 +361,10 @@ pub(crate) fn extract_and_match(
     cancelled: &AtomicBool,
 ) -> Result<()> {
     let model = root.join("diarization").join(EMBEDDING);
-    let identity = format!("{EMBEDDING}:{}", std::fs::metadata(&model)?.len());
+    let fingerprint =
+        opencap_core::fingerprint_media(&model, Some(cancelled)).context("无法核对声纹模型")?;
+    let identity = format!("{EMBEDDING}:sha256:{}", fingerprint.sha256);
+    let mut extracted = BTreeMap::new();
     let extractor = SpeakerEmbeddingExtractor::create(&SpeakerEmbeddingExtractorConfig {
         model: Some(model.to_string_lossy().into()),
         num_threads: threads as i32,
@@ -294,9 +406,10 @@ pub(crate) fn extract_and_match(
         if let Some(mut vector) = extractor.compute(&stream)
             && normalize(&mut vector)
         {
-            transcript.speaker_voiceprints.insert(
+            extracted.insert(
                 speaker,
                 Voiceprint {
+                    extra: Default::default(),
                     model: identity.clone(),
                     vector,
                     voiced_ms: voice.len() as u64 / 16,
@@ -304,7 +417,13 @@ pub(crate) fn extract_and_match(
             );
         }
     }
-    apply_matches(transcript, &read(root)?);
+    anyhow::ensure!(
+        opencap_core::fingerprint_media(&model, Some(cancelled))? == fingerprint,
+        "声纹模型在分析期间发生变化，未应用声纹匹配"
+    );
+    let memory = read(root)?;
+    transcript.speaker_voiceprints.extend(extracted);
+    apply_matches_for_model(transcript, &memory, Some(&identity));
     Ok(())
 }
 #[cfg(test)]
@@ -312,6 +431,7 @@ mod tests {
     use super::*;
     fn print(v: &[f32]) -> Voiceprint {
         Voiceprint {
+            extra: Default::default(),
             model: "test-v1".into(),
             vector: v.into(),
             voiced_ms: 4000,
@@ -324,6 +444,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let mut t = Transcript {
             speaker_turns: vec![SpeakerTurn {
+                extra: Default::default(),
                 start_ms: 0,
                 end_ms: 4000,
                 speaker: 1,
@@ -347,6 +468,7 @@ mod tests {
         t.speaker_voiceprints.remove(&2);
         let mut ambiguous = Memory {
             profiles: memory.profiles.clone(),
+            extra: BTreeMap::new(),
         };
         let mut other = ambiguous.profiles[0].clone();
         other.id = "different".into();
@@ -369,6 +491,7 @@ mod tests {
     #[test]
     fn overlapping_regions_are_excluded_and_adjacent_turns_are_kept() {
         let turn = |start_ms, end_ms, speaker| SpeakerTurn {
+            extra: Default::default(),
             start_ms,
             end_ms,
             speaker,

@@ -55,6 +55,35 @@ impl AudioMixer {
             })
             .collect()
     }
+
+    /// Produce aligned source stems before the mixed signal's limiter. Missing
+    /// routes are silence; source identity is never a speaker identity.
+    #[allow(clippy::type_complexity)]
+    pub fn take_separated(
+        &mut self,
+        count: usize,
+    ) -> (Vec<[f32; 2]>, Vec<[f32; 2]>, Vec<[f32; 2]>) {
+        let mut mixed = Vec::with_capacity(count);
+        let mut system = Vec::with_capacity(count);
+        let mut microphone = Vec::with_capacity(count);
+        for _ in 0..count {
+            let slot = self.cursor as usize % self.samples.len();
+            let routes = if self.tags[slot] == self.cursor {
+                self.samples[slot]
+            } else {
+                [[0.0; 2]; 2]
+            };
+            self.tags[slot] = -1;
+            self.cursor += 1;
+            system.push(routes[0]);
+            microphone.push(routes[1]);
+            mixed.push([
+                soft_limit(routes[0][0] + routes[1][0]),
+                soft_limit(routes[0][1] + routes[1][1]),
+            ]);
+        }
+        (mixed, system, microphone)
+    }
 }
 
 /// Near-transparent soft limiter: sums below `THRESHOLD` pass unchanged, while
@@ -98,6 +127,7 @@ mod tests {
         let mut m = AudioMixer::new();
         for kind in [AudioKind::System, AudioKind::Microphone] {
             m.push(AudioChunk {
+                generation: 0,
                 kind,
                 pts_us: 0,
                 samples: vec![1.0; 4],
@@ -115,6 +145,7 @@ mod tests {
         let mut m = AudioMixer::new();
         for (kind, level) in [(AudioKind::System, 0.2), (AudioKind::Microphone, 0.6)] {
             m.push(AudioChunk {
+                generation: 0,
                 kind,
                 pts_us: 0,
                 samples: vec![level; 8],
@@ -131,6 +162,7 @@ mod tests {
         let mut m = AudioMixer::new();
         for kind in [AudioKind::System, AudioKind::Microphone] {
             m.push(AudioChunk {
+                generation: 0,
                 kind,
                 pts_us: 1000,
                 samples: vec![0.8; 4],
@@ -144,6 +176,7 @@ mod tests {
             result[48][0]
         );
         m.push(AudioChunk {
+            generation: 0,
             kind: AudioKind::System,
             pts_us: 0,
             samples: vec![1.0; 4],

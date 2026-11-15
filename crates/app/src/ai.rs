@@ -21,6 +21,21 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+fn read_minutes_draft(base: &std::path::Path) -> anyhow::Result<Option<String>> {
+    use std::io::Read;
+    const LIMIT: u64 = 2_000_000;
+    let file = match std::fs::File::open(base.with_extension("summary.draft.md")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(file.metadata()?.is_file(), "纪要草稿不是普通文件");
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= LIMIT, "纪要草稿超过 2 MB");
+    Ok(Some(String::from_utf8(bytes)?))
+}
+
 pub(super) struct AiWorkspace {
     #[cfg(feature = "ui-smoke")]
     send_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
@@ -36,8 +51,13 @@ pub(super) struct AiWorkspace {
     editing: bool,
     editor_base: Option<PathBuf>,
     draft_saved: String,
+    draft_exists: bool,
+    draft_recovery: Option<String>,
+    pub(super) draft_recovery_busy: bool,
     pub editor_sync: bool,
     pub document_task: Option<crossbeam_channel::Receiver<anyhow::Result<MinutesHistory>>>,
+    document_task_base: Option<PathBuf>,
+    pub(super) minutes_reload_busy: bool,
     credential_for: Option<String>,
     key_origin: Option<String>,
     credential_status: String,
@@ -80,6 +100,12 @@ fn format_path() -> PathBuf {
     config_path().with_file_name("minutes-format.json")
 }
 impl AiWorkspace {
+    pub(super) fn relocate_meeting(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        if self.editor_base.as_deref() == Some(old) {
+            self.editor_base = Some(new.to_path_buf());
+            self.file_preview = None;
+        }
+    }
     pub fn new(window: &mut Window, cx: &mut Context<Recorder>) -> Self {
         let (config, status) = if ai_path().exists() {
             match std::fs::read(ai_path())
@@ -172,8 +198,13 @@ impl AiWorkspace {
             editing: false,
             editor_base: None,
             draft_saved: String::new(),
+            draft_exists: false,
+            draft_recovery: None,
+            draft_recovery_busy: false,
             editor_sync: true,
             document_task: None,
+            document_task_base: None,
+            minutes_reload_busy: false,
             credential_for: None,
             key_origin: None,
             credential_status: "尚未检查密钥".into(),
@@ -206,6 +237,7 @@ impl Recorder {
             self.persist_minutes_draft(cx);
             self.ai.editing = false;
             self.ai.editor_base = self.transcript_output.clone();
+            self.ai.draft_recovery = None;
             self.ai.editor_sync = true;
         }
         if self.ai.editor_sync {
@@ -213,11 +245,21 @@ impl Recorder {
                 .ai
                 .editor_base
                 .as_ref()
-                .and_then(|p| std::fs::read_to_string(p.with_extension("summary.draft.md")).ok())
-                .filter(|s| !s.is_empty());
-            let text = draft.clone().unwrap_or_else(|| self.summary_text.clone());
+                .map(|base| read_minutes_draft(base));
+            let draft = match draft {
+                Some(Ok(value)) => value,
+                Some(Err(error)) => {
+                    self.ai.status = format!("无法读取纪要草稿；原文件保留：{error:#}");
+                    None
+                }
+                None => None,
+            };
+            self.ai.draft_exists = draft.is_some();
             self.ai.draft_saved = draft.clone().unwrap_or_default();
-            self.ai.editing = draft.is_some();
+            self.ai.editing = draft.as_ref().is_some_and(|text| !text.is_empty());
+            let text = draft
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| self.summary_text.clone());
             if self.ai.editing {
                 self.ai.status = "已恢复未保存草稿；保存正文与 Word 后可继续对话。".into();
                 self.ai.conversation_tab = false;
@@ -294,17 +336,124 @@ impl Recorder {
             return false;
         };
         let text = self.ai.editor.read(cx).value().to_string();
+        if self.ai.draft_recovery.as_deref() == Some(text.as_str()) {
+            return false;
+        }
         if text == self.ai.draft_saved {
             return false;
         }
-        match opencap_asr::atomic_write(&base.with_extension("summary.draft.md"), text.as_bytes()) {
-            Ok(()) => self.ai.draft_saved = text,
-            Err(_) => {
-                self.ai.status = "草稿暂未保存，请检查会议目录是否可写。".into();
+        let result = opencap_core::managed_meeting_activity(base).and_then(|_activity| {
+            let _guard = opencap_core::meeting_metadata_guard(base)?;
+            let expected = self.ai.draft_exists.then_some(self.ai.draft_saved.as_str());
+            let current = read_minutes_draft(base)?;
+            anyhow::ensure!(
+                current.as_deref() == expected,
+                "纪要草稿已被其他操作修改；当前输入仍在编辑框中"
+            );
+            opencap_asr::atomic_write(&base.with_extension("summary.draft.md"), text.as_bytes())
+        });
+        match result {
+            Ok(()) => {
+                self.ai.draft_saved = text;
+                self.ai.draft_exists = true;
+                self.ai.draft_recovery = None;
+            }
+            Err(error) => {
+                self.ai.status = format!("草稿暂未保存：{error:#}");
                 return true;
             }
         }
         false
+    }
+    fn remove_minutes_draft_if_unchanged(&mut self, base: &std::path::Path) -> anyhow::Result<()> {
+        let _activity = opencap_core::managed_meeting_activity(base)?;
+        let _guard = opencap_core::meeting_metadata_guard(base)?;
+        let current = read_minutes_draft(base)?;
+        let expected = self.ai.draft_exists.then_some(self.ai.draft_saved.as_str());
+        anyhow::ensure!(
+            current.as_deref() == expected,
+            "另一处的纪要草稿已变化，未删除"
+        );
+        if current.is_some() {
+            std::fs::remove_file(base.with_extension("summary.draft.md"))?;
+            self.ai.draft_saved.clear();
+            self.ai.draft_exists = false;
+            opencap_core::sync_parent_directory(&base.with_extension("summary.draft.md"))?;
+        }
+        self.ai.draft_saved.clear();
+        self.ai.draft_exists = false;
+        self.ai.draft_recovery = None;
+        Ok(())
+    }
+    fn save_minutes_draft_recovery(&mut self, cx: &mut Context<Self>) {
+        if !self.ai.editing || self.active() || self.minutes_task_busy() || self.quit_pending {
+            return;
+        }
+        let Some(base) = self.ai.editor_base.clone() else {
+            return;
+        };
+        let text = self.ai.editor.read(cx).value().to_string();
+        if text.len() > 2_000_000 {
+            self.ai.status = "当前编辑超过 2 MB，无法保存恢复副本。".into();
+            cx.notify();
+            return;
+        }
+        self.ai.draft_recovery_busy = true;
+        self.ai.status = "正在另存编辑恢复副本…".into();
+        cx.spawn(async move |entity, cx| {
+            let task_base = base.clone();
+            let task_text = text.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let _activity = opencap_core::managed_meeting_activity(&task_base)?;
+                    let path = task_base.with_extension(format!(
+                        "summary.recovery-{}.json",
+                        opencap_core::new_stable_id()
+                    ));
+                    let payload =
+                        serde_json::json!({"kind": "manual_minutes_draft", "text": task_text});
+                    opencap_core::atomic_create_bytes(
+                        &path,
+                        &serde_json::to_vec_pretty(&payload)?,
+                    )?;
+                    let warning = path.file_name().and_then(|name| {
+                        opencap_core::register_meeting_asset(
+                            &task_base,
+                            "minutes_recovery",
+                            opencap_core::AssetOwnership::Managed,
+                            std::path::Path::new(name),
+                        )
+                        .err()
+                        .map(|error| format!("资产登记失败：{error:#}"))
+                    });
+                    Ok::<_, anyhow::Error>((path, warning))
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.ai.draft_recovery_busy = false;
+                match result {
+                    Ok((path, warning)) => {
+                        if this.ai.editing
+                            && this.ai.editor_base.as_ref() == Some(&base)
+                            && this.ai.editor.read(cx).value().as_str() == text
+                        {
+                            this.ai.draft_recovery = Some(text);
+                        }
+                        let warning = warning
+                            .map(|value| format!("；{value}"))
+                            .unwrap_or_default();
+                        this.ai.status = format!("编辑已另存恢复副本：{}{warning}", path.display());
+                    }
+                    Err(error) => {
+                        this.ai.status = format!("恢复副本保存失败，编辑仍在窗口中：{error:#}")
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
     fn load_ai_key(&mut self, cx: &mut Context<Self>) {
         if self.ai.credentials_busy {
@@ -356,7 +505,7 @@ impl Recorder {
         .detach();
     }
     fn save_manual_minutes(&mut self, cx: &mut Context<Self>) {
-        if self.active() || self.transcription_busy() {
+        if self.active() || self.minutes_task_busy() || self.quit_pending {
             return;
         }
         let Some(base) = self.transcript_output.clone() else {
@@ -366,14 +515,143 @@ impl Recorder {
         let markdown = self.ai.editor.read(cx).value().to_string();
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.ai.document_task = Some(rx);
-        self.ai.status = "正在保存正文、Word 与修订版本…".into();
-        std::thread::spawn(move || {
-            let _ = tx.send(history.save_revision(&base, &markdown, "手动编辑正文"));
-        });
+        self.ai.document_task_base = Some(base.clone());
+        self.ai.status = "正在保存正文，再生成导出文件…".into();
+        if let Err(error) = std::thread::Builder::new()
+            .name("opencap-minutes-save".into())
+            .spawn(move || {
+                let _ = tx.send(history.save_revision(&base, &markdown, "手动编辑正文"));
+            })
+        {
+            self.ai.document_task = None;
+            self.ai.document_task_base = None;
+            self.ai.status = format!("无法启动保存任务，编辑内容保留，可重试：{error}");
+        }
+        cx.notify();
+    }
+    fn retry_minutes_exports(&mut self, cx: &mut Context<Self>) {
+        if self.active() || self.minutes_task_busy() || self.quit_pending || self.ai.editing {
+            return;
+        }
+        let Some(base) = self.transcript_output.clone() else {
+            return;
+        };
+        let history = self.ai.history.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.ai.document_task = Some(rx);
+        self.ai.document_task_base = Some(base.clone());
+        self.ai.status = "正在根据已保存正文重试导出…".into();
+        if let Err(error) = std::thread::Builder::new()
+            .name("opencap-minutes-export".into())
+            .spawn(move || {
+                let _ = tx.send(history.retry_exports(&base));
+            })
+        {
+            self.ai.document_task = None;
+            self.ai.document_task_base = None;
+            self.ai.status = format!("无法启动导出任务，已保存正文保留，可重试：{error}");
+        }
+        cx.notify();
+    }
+    fn backup_word_and_retry_exports(&mut self, cx: &mut Context<Self>) {
+        if self.active() || self.minutes_task_busy() || self.quit_pending || self.ai.editing {
+            return;
+        }
+        let Some(base) = self.transcript_output.clone() else {
+            return;
+        };
+        let history = self.ai.history.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.ai.document_task = Some(rx);
+        self.ai.document_task_base = Some(base.clone());
+        self.ai.status = "正在备份现有 Word，再重试导出已保存正文…".into();
+        if let Err(error) = std::thread::Builder::new()
+            .name("opencap-minutes-backup".into())
+            .spawn(move || {
+                let _ = tx.send(history.backup_word_and_retry(&base));
+            })
+        {
+            self.ai.document_task = None;
+            self.ai.document_task_base = None;
+            self.ai.status = format!("无法启动备份任务，现有文件保留，可重试：{error}");
+        }
+        cx.notify();
+    }
+    fn reload_minutes_history(&mut self, cx: &mut Context<Self>) {
+        if self.active() || self.minutes_task_busy() || self.quit_pending {
+            return;
+        }
+        let Some(base) = self.transcript_output.clone() else {
+            return;
+        };
+        if self.persist_minutes_draft(cx) {
+            self.ai.status = "当前编辑草稿尚未保存，未重新载入。".into();
+            cx.notify();
+            return;
+        }
+        let baseline = match serde_json::to_vec(&self.ai.history) {
+            Ok(value) => value,
+            Err(error) => {
+                self.ai.status = format!("无法核对当前纪要版本：{error}");
+                cx.notify();
+                return;
+            }
+        };
+        self.ai.minutes_reload_busy = true;
+        self.ai.status = "正在后台读取已保存的纪要历史…".into();
+        cx.spawn(async move |entity, cx| {
+            let task_base = base.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let _activity = opencap_core::managed_meeting_activity(&task_base)?;
+                    let _guard = opencap_core::meeting_metadata_guard(&task_base)?;
+                    MinutesHistory::load(&task_base)
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.ai.minutes_reload_busy = false;
+                if this.quit_pending
+                    || this.active()
+                    || this.minutes_task_busy()
+                    || this.transcript_output.as_ref() != Some(&base)
+                    || !serde_json::to_vec(&this.ai.history).is_ok_and(|value| value == baseline)
+                {
+                    this.ai.status = "会议或纪要状态已变化，未应用重新载入的历史。".into();
+                } else {
+                    match result {
+                        Ok(history) => {
+                            this.summary_text = history.latest().into();
+                            this.ai.history = history;
+                            this.ai.artifact_version = None;
+                            this.ai.file_preview = None;
+                            this.ai.chat_dirty = true;
+                            this.ai.chat_reset = true;
+                            if this.ai.editing {
+                                // Keep the active editor and its draft exactly as they are.
+                                this.ai.editor_sync = false;
+                                this.ai.status =
+                                    "已载入最新纪要历史；当前编辑和草稿保留，请核对后再保存。"
+                                        .into();
+                            } else {
+                                this.ai.editor_sync = true;
+                                this.ai.status =
+                                    "已重新载入纪要历史；若文件再次变化，保存时会重新检查。".into();
+                            }
+                        }
+                        Err(error) => {
+                            this.ai.status = format!("无法重新载入纪要，当前内容保留：{error:#}")
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
     fn import_minutes_file(&mut self, cx: &mut Context<Self>) {
-        if self.active() || self.transcription_busy() || self.ai.editing {
+        if self.active() || self.minutes_task_busy() || self.quit_pending || self.ai.editing {
             return;
         }
         let prompt = cx.prompt_for_paths(PathPromptOptions {
@@ -385,7 +663,6 @@ impl Recorder {
         let Some(base) = self.transcript_output.clone() else {
             return;
         };
-        let history = self.ai.history.clone();
         cx.spawn(async move |entity, cx| {
             let Ok(Ok(Some(paths))) = prompt.await else {
                 return;
@@ -395,21 +672,32 @@ impl Recorder {
             };
             let _ = entity.update(cx, |this, cx| {
                 if this.active()
-                    || this.transcription_busy()
+                    || this.minutes_task_busy()
+                    || this.quit_pending
                     || this.transcript_output.as_ref() != Some(&base)
                     || this.ai.editing
                 {
                     return;
                 }
+                let history = this.ai.history.clone();
                 let (tx, rx) = crossbeam_channel::bounded(1);
                 this.ai.document_task = Some(rx);
+                this.ai.document_task_base = Some(base.clone());
                 this.ai.status = "正在读取修改后的正文并保存版本…".into();
-                std::thread::spawn(move || {
-                    let result = opencap_asr::read_minutes_document(&path).and_then(|markdown| {
-                        history.save_revision(&base, &markdown, "同步外部文件修改")
-                    });
-                    let _ = tx.send(result);
-                });
+                if let Err(error) = std::thread::Builder::new()
+                    .name("opencap-minutes-import".into())
+                    .spawn(move || {
+                        let result =
+                            opencap_asr::read_minutes_document(&path).and_then(|markdown| {
+                                history.save_revision(&base, &markdown, "同步外部文件修改")
+                            });
+                        let _ = tx.send(result);
+                    })
+                {
+                    this.ai.document_task = None;
+                    this.ai.document_task_base = None;
+                    this.ai.status = format!("无法启动导入任务，已有正文保留，可重试：{error}");
+                }
                 cx.notify();
             });
         })
@@ -431,20 +719,49 @@ impl Recorder {
             return false;
         };
         self.ai.document_task = None;
+        let task_base = self.ai.document_task_base.take();
+        if task_base.as_ref() != self.transcript_output.as_ref() {
+            if result.is_ok()
+                && let Some(base) = task_base
+            {
+                self.meeting_scan_extra.insert(base);
+                self.notes_index_pending = Some(std::time::Instant::now());
+            }
+            self.ai.status = "先前会议的文档任务已结束；当前会议内容未更改。".into();
+            return true;
+        }
         match result {
             Ok(history) => {
+                let mut status = history.export_warning.clone().unwrap_or_else(|| {
+                    if history.exports_pending() {
+                        "正文已保存；派生文件可在文件与版本中重试导出。".into()
+                    } else {
+                        "正文和导出文件已保存；可继续对话修改。".into()
+                    }
+                });
+                if let Some(path) = self
+                    .transcript_output
+                    .as_deref()
+                    .and_then(|base| history.last_word_backup_path(base))
+                {
+                    status.push_str(&format!("；最近 Word 备份：{}", path.display()));
+                }
                 self.summary_text = history.latest().into();
                 self.ai.history = history;
-                if let Some(base) = &self.transcript_output {
-                    let _ = std::fs::remove_file(base.with_extension("summary.draft.md"));
-                }
-                self.ai.draft_saved.clear();
+                let cleanup_error = self
+                    .transcript_output
+                    .clone()
+                    .and_then(|base| self.remove_minutes_draft_if_unchanged(&base).err());
                 self.ai.editor_sync = true;
                 self.ai.editing = false;
                 self.ai.artifact_version = None;
                 self.ai.file_preview = None;
                 self.ai.chat_dirty = true;
-                self.ai.status = "正文、Word 与修订版本已同步；可继续对话修改。".into();
+                self.ai.status = if let Some(error) = cleanup_error {
+                    format!("{status}；草稿未清理：{error:#}")
+                } else {
+                    status
+                };
                 self.remember_meeting();
             }
             Err(e) => self.ai.status = format!("同步失败；编辑内容和已有版本保留：{e:#}"),
@@ -467,7 +784,7 @@ impl Recorder {
         opencap_asr::atomic_write(&format_path(), &serde_json::to_vec_pretty(&self.ai.format)?)
     }
     fn choose_format_references(&mut self, cx: &mut Context<Self>) {
-        if self.transcription_busy() {
+        if self.quit_pending {
             return;
         }
         let prompt = cx.prompt_for_paths(PathPromptOptions {
@@ -533,6 +850,12 @@ impl Recorder {
         if let Some(output) = &self.transcript_output {
             match MinutesHistory::load(output) {
                 Ok(h) => {
+                    if h.exports_pending() {
+                        self.ai.status = h
+                            .export_warning
+                            .clone()
+                            .unwrap_or_else(|| "纪要正文已载入；可在文件与版本中重试导出。".into());
+                    }
                     self.summary_text = h.latest().to_string();
                     self.ai.history = h;
                     self.ai.editor_sync = true;
@@ -584,6 +907,195 @@ impl Recorder {
         };
         config.validate()?;
         Ok(config)
+    }
+    pub(super) fn enable_live_notes(&mut self, cx: &mut Context<Self>) {
+        if self.live_notes.is_some()
+            || self.live_notes_credentials_busy
+            || self.live_notes_preparing
+        {
+            return;
+        }
+        let Some(base) = self.transcript_output.clone() else {
+            self.live_notes_status = "会议保存位置尚未就绪。".into();
+            cx.notify();
+            return;
+        };
+        let Some(run_id) = self.transcript.run.as_ref().map(|run| run.run_id.clone()) else {
+            self.live_notes_status = "转写运行身份尚未就绪。".into();
+            cx.notify();
+            return;
+        };
+        let meeting_id = match opencap_core::meeting_manifest(&base) {
+            Ok(Some(manifest)) => manifest.meeting_id,
+            Ok(None) => {
+                self.live_notes_status = "此会议尚无身份清单，暂不能开启增量纪要。".into();
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.live_notes_status = format!("无法读取会议身份：{error:#}");
+                cx.notify();
+                return;
+            }
+        };
+        if self
+            .transcript
+            .run
+            .as_ref()
+            .and_then(|run| run.meeting_id.as_deref())
+            != Some(meeting_id.as_str())
+        {
+            self.live_notes_status =
+                "转写运行尚未绑定当前会议或会议身份不一致；请先核对运行信息。".into();
+            cx.notify();
+            return;
+        }
+        let config = match self.ai_config_from_inputs(cx) {
+            Ok(config) => config,
+            Err(error) => {
+                self.live_notes_status = format!("请先配置 AI 服务：{error:#}");
+                cx.notify();
+                return;
+            }
+        };
+        let key = self.ai.key.read(cx).value().trim().to_string();
+        if !key.is_empty() || config.is_local() {
+            self.activate_live_notes(base, meeting_id, run_id, config, key, cx);
+            cx.notify();
+            return;
+        }
+        self.live_notes_credentials_busy = true;
+        self.live_notes_status = "正在读取所选服务的系统凭据…".into();
+        let task = cx.read_credentials(&config.credential_id());
+        cx.spawn(async move |entity, cx| {
+            let result = task.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.live_notes_credentials_busy = false;
+                if !this.ai_config_from_inputs(cx).is_ok_and(|current| {
+                    current.credential_id() == config.credential_id()
+                        && current.model == config.model
+                        && current.provider == config.provider
+                        && current.base_url == config.base_url
+                        && current.background == config.background
+                        && current.deep_reasoning == config.deep_reasoning
+                }) {
+                    this.live_notes_status = "AI 服务设置已变化，本轮未开始发送。".into();
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(Some((_, bytes))) => match String::from_utf8(bytes) {
+                        Ok(key) if !key.trim().is_empty() => {
+                            this.activate_live_notes(base, meeting_id, run_id, config, key, cx)
+                        }
+                        _ => this.live_notes_status = "所选 AI 密钥无效，请重新保存。".into(),
+                    },
+                    Ok(None) => this.live_notes_status = "所选 AI 服务没有保存密钥。".into(),
+                    Err(_) => this.live_notes_status = "无法读取系统凭据，请检查 AI 设置。".into(),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn activate_live_notes(
+        &mut self,
+        base: PathBuf,
+        meeting_id: String,
+        run_id: String,
+        config: AiConfig,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.live_notes.is_some()
+            || self.live_notes_preparing
+            || self.quit_pending
+            || self.transcript_output.as_ref() != Some(&base)
+            || self.transcript.run.as_ref().map(|run| run.run_id.as_str()) != Some(run_id.as_str())
+            || self
+                .transcript
+                .run
+                .as_ref()
+                .and_then(|run| run.meeting_id.as_deref())
+                != Some(meeting_id.as_str())
+            || !opencap_core::meeting_manifest(&base).is_ok_and(|manifest| {
+                manifest.is_some_and(|manifest| manifest.meeting_id == meeting_id.as_str())
+            })
+            || self.asr.as_ref().is_none_or(|asr| asr.finished())
+        {
+            self.live_notes_status = "转写状态已变化，未开始发送；请重新选择。".into();
+            return;
+        }
+        self.live_notes_preparing = true;
+        self.live_notes_prepare_cancel =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = self.live_notes_prepare_cancel.clone();
+        self.live_notes_status = "正在后台准备增量纪要…".into();
+        let transcript = self.transcript.clone();
+        let expected_config = config.clone();
+        cx.spawn(async move |entity, cx| {
+            let task_base = base.clone();
+            let task_meeting = meeting_id.clone();
+            let task_run = run_id.clone();
+            let task_cancelled = cancelled.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::live_notes::Controller::new(
+                            task_base,
+                            task_meeting,
+                            task_run,
+                            config,
+                            key,
+                            &transcript,
+                            &task_cancelled,
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("增量纪要准备线程异常退出")))
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.live_notes_preparing = false;
+                // Preparing may have archived the previous current document,
+                // even if the user has since switched to another view.
+                this.meeting_scan_extra.insert(base.clone());
+                this.notes_index_pending = Some(std::time::Instant::now());
+                let current = !cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    && !this.quit_pending
+                    && this.live_notes.is_none()
+                    && this.transcript_output.as_ref() == Some(&base)
+                    && this.transcript.run.as_ref().is_some_and(|run| {
+                        run.run_id == run_id
+                            && run.meeting_id.as_deref() == Some(meeting_id.as_str())
+                    })
+                    && this.ai_config_from_inputs(cx).is_ok_and(|config| {
+                        config.credential_id() == expected_config.credential_id()
+                            && config.model == expected_config.model
+                            && config.provider == expected_config.provider
+                            && config.base_url == expected_config.base_url
+                            && config.background == expected_config.background
+                            && config.deep_reasoning == expected_config.deep_reasoning
+                    });
+                match result {
+                    Ok(controller) if current => {
+                        this.live_notes = Some(controller);
+                        this.live_notes_status.clear();
+                    }
+                    Ok(_) => {
+                        this.live_notes_status =
+                            "纪要准备期间会议或服务已变化；未发送请求，已保存的归档保留。".into()
+                    }
+                    Err(error) => {
+                        this.live_notes_status =
+                            format!("无法开启增量纪要，已有文件保留：{error:#}")
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn set_ai_preset(&mut self, config: AiConfig, window: &mut Window, cx: &mut Context<Self>) {
         self.ai
@@ -671,9 +1183,10 @@ impl Recorder {
         if self.active()
             || self.summary_task.is_some()
             || self.ai.credentials_busy
-            || self.transcription_busy()
+            || self.transcript_write_busy()
             || self.ai.document_task.is_some()
-            || !self.transcript.complete
+            || self.transcript.primary_save_pending
+            || !self.transcript.is_complete()
         {
             self.ai.status = "当前任务尚未完成或转录未就绪，输入内容保留，请稍后发送。".into();
             cx.notify();
@@ -720,6 +1233,23 @@ impl Recorder {
             cx.notify();
             return;
         }
+        let base = self.transcript_output.clone();
+        let baseline = match serde_json::to_vec(&self.transcript) {
+            Ok(value) => value,
+            Err(error) => {
+                self.ai.status = format!("无法核对当前逐字稿：{error}");
+                cx.notify();
+                return;
+            }
+        };
+        let history = match serde_json::to_vec(&self.ai.history) {
+            Ok(value) => value,
+            Err(error) => {
+                self.ai.status = format!("无法核对当前纪要版本：{error}");
+                cx.notify();
+                return;
+            }
+        };
         self.ai.credentials_busy = true;
         self.ai.status = "正在读取系统凭据…".into();
         let task = cx.read_credentials(&config.credential_id());
@@ -727,6 +1257,31 @@ impl Recorder {
             let result = task.await;
             let _ = entity.update(cx, |this, cx| {
                 this.ai.credentials_busy = false;
+                let unchanged = !this.quit_pending
+                    && !this.active()
+                    && !this.transcript_write_busy()
+                    && !this.minutes_task_busy()
+                    && !this.ai.editing
+                    && !this.transcript.primary_save_pending
+                    && this.transcript_output == base
+                    && super::transcription::transcript_matches_snapshot(
+                        &this.transcript,
+                        &baseline,
+                    )
+                    && serde_json::to_vec(&this.ai.history).is_ok_and(|value| value == history)
+                    && this.ai_config_from_inputs(cx).is_ok_and(|current| {
+                        current.credential_id() == config.credential_id()
+                            && current.model == config.model
+                            && current.background == config.background
+                            && current.deep_reasoning == config.deep_reasoning
+                    });
+                if !unchanged {
+                    this.ai.status =
+                        "读取凭据期间会议、稿件、纪要或服务设置已变化；输入内容保留，请重新发送。"
+                            .into();
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok(Some((_, bytes))) => match String::from_utf8(bytes) {
                         Ok(key) => this.start_minutes(config, key, action, instruction),
@@ -756,15 +1311,30 @@ impl Recorder {
         action: MinutesAction,
         instruction: String,
     ) {
+        if self.quit_pending
+            || self.active()
+            || self.transcript_write_busy()
+            || self.ai.editing
+            || self.summary_task.is_some()
+            || self.ai.document_task.is_some()
+            || self.transcript.primary_save_pending
+            || !self.transcript.is_complete()
+        {
+            self.ai.status = "当前任务尚未结束或逐字稿尚未保存；输入内容保留，请稍后发送。".into();
+            return;
+        }
         let Some(output) = self.transcript_output.clone() else {
             self.ai.status = "会议保存位置不可用，未发送；输入内容保留".into();
             return;
         };
         let pending = serde_json::json!({"request":instruction,"artifact":action != MinutesAction::Ask,"draft":self.ai.submitted_composer});
-        if let Err(e) = opencap_asr::atomic_write(
-            &output.with_extension("summary.request.json"),
-            pending.to_string().as_bytes(),
-        ) {
+        let request_save = opencap_core::managed_meeting_activity(&output).and_then(|_activity| {
+            opencap_asr::atomic_write(
+                &output.with_extension("summary.request.json"),
+                pending.to_string().as_bytes(),
+            )
+        });
+        if let Err(e) = request_save {
             self.ai.status = format!("无法保存本轮请求，尚未发送：{e}");
             return;
         }
@@ -790,22 +1360,48 @@ impl Recorder {
         self.ai.chat_dirty = true;
         self.ai_clock.start();
         self.summary_task = Some(rx);
+        self.summary_task_base = Some(output.clone());
         self.ai.status = format!("{} 正在处理；已有版本保留…", config.provider.label());
-        std::thread::spawn(move || {
-            let _ = tx.send(opencap_asr::edit_minutes_with_events(
-                &transcript,
-                &config,
-                &key,
-                history,
-                action,
-                &instruction,
-                &format,
-                &output,
-                &cancelled,
-                |s| {
-                    let _ = progress_tx.send(s);
-                },
-            ));
-        });
+        if let Err(error) = std::thread::Builder::new()
+            .name("opencap-minutes-request".into())
+            .spawn(move || {
+                let _ = tx.send(opencap_asr::edit_minutes_with_events(
+                    &transcript,
+                    &config,
+                    &key,
+                    history,
+                    action,
+                    &instruction,
+                    &format,
+                    &output,
+                    &cancelled,
+                    |s| {
+                        let mut pending = s;
+                        loop {
+                            if cancelled.load(Ordering::Acquire) {
+                                break;
+                            }
+                            match progress_tx
+                                .send_timeout(pending, std::time::Duration::from_millis(100))
+                            {
+                                Ok(())
+                                | Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                    break;
+                                }
+                                Err(crossbeam_channel::SendTimeoutError::Timeout(event)) => {
+                                    pending = event
+                                }
+                            }
+                        }
+                    },
+                ));
+            })
+        {
+            self.summary_task = None;
+            self.summary_task_base = None;
+            self.ai.events = None;
+            self.ai.clear_composer = false;
+            self.ai.status = format!("无法启动纪要任务，请重试；输入和已保存请求保留：{error}");
+        }
     }
 }

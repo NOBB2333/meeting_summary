@@ -201,7 +201,11 @@ pub fn set_app_icon(id: isize, recording: bool) {
             id as u32,
             AtomEnum::WM_CLASS,
             AtomEnum::STRING,
-            b"opencap\0OpenCap\0",
+            if opencap_core::is_dev_profile() {
+                &b"opencap-dev\0OpenCapDev\0"[..]
+            } else {
+                &b"opencap\0OpenCap\0"[..]
+            },
         )?
         .check()?;
         c.flush()?;

@@ -302,7 +302,8 @@ impl GraphicsCaptureApiHandler for Handler {
         _control: InternalCaptureControl,
     ) -> std::result::Result<(), Self::Error> {
         self.flags.metrics.callbacks.fetch_add(1, Ordering::Relaxed);
-        if self.flags.clock.is_paused() {
+        let (now_us, paused, generation) = self.flags.clock.snapshot();
+        if paused {
             return Ok(());
         }
         if self.last.is_some_and(|t| t.elapsed() < self.flags.interval) {
@@ -316,7 +317,7 @@ impl GraphicsCaptureApiHandler for Handler {
         let latency = super::qpc_us()
             .saturating_sub(frame.timestamp()?.Duration / 10)
             .max(0);
-        let pts_us = (self.flags.clock.now_us() - latency).max(0);
+        let pts_us = (now_us - latency).max(0);
         let (width, height) = (frame.width(), frame.height());
         if width < 2 || height < 2 {
             return Ok(());
@@ -338,6 +339,10 @@ impl GraphicsCaptureApiHandler for Handler {
         // Reuse one CPU staging texture for the session, and preserve its row
         // stride without waking the dependency's parallel de-padding pool.
         let (stride, data) = self.read_frame(frame, self.flags.crop)?;
+        let (_, paused, current_generation) = self.flags.clock.snapshot();
+        if paused || current_generation != generation {
+            return Ok(());
+        }
         let video = VideoFrame {
             width,
             height,

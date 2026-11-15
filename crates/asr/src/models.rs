@@ -6,9 +6,14 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub const DEFAULT_HOTWORDS: &str = "录屏,语音转录,会议纪要,实时字幕";
+const MAX_LEGACY_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_LEGACY_WEIGHT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_TOKENS_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_VAD_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(crate) struct RemoteFile {
     pub name: &'static str,
@@ -143,6 +148,231 @@ pub(crate) fn copy_verified(
     Ok(bytes)
 }
 
+pub(crate) struct CancellableReader<'a, R> {
+    pub reader: R,
+    pub cancelled: &'a AtomicBool,
+}
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("下载已取消"));
+        }
+        self.reader.read(buffer)
+    }
+}
+pub(crate) fn ensure_download_active(cancelled: &AtomicBool) -> Result<()> {
+    anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "下载已取消");
+    Ok(())
+}
+
+/// Serialize the short publication step across cooperating application
+/// processes; downloads themselves remain independent and cancellable.
+pub(crate) fn model_install_guard(root: &Path) -> Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(".opencap-model-install.lock"))?;
+    lock.try_lock()
+        .map_err(|error| anyhow::anyhow!("另一个模型安装正在提交，请稍后重试：{error}"))?;
+    Ok(lock)
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct InstallJournal {
+    destination: String,
+    backup: String,
+}
+
+fn install_journal_path(root: &Path, name: &str) -> PathBuf {
+    root.join(format!(".opencap-install-{name}.json"))
+}
+pub(crate) fn model_path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Called with the model-install lock. Preserve the old directory if a
+/// process stopped between the two publication renames.
+pub(crate) fn recover_model_install(root: &Path, name: &str) -> Result<()> {
+    let journal = install_journal_path(root, name);
+    let file = match fs::File::open(&journal) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= 4096,
+        "模型安装恢复日志过大：{}",
+        journal.display()
+    );
+    let record: InstallJournal =
+        serde_json::from_slice(&bytes).context("模型安装恢复日志损坏，原文件保留")?;
+    let prefix = format!(".incomplete-{name}-");
+    anyhow::ensure!(
+        record.destination == name
+            && record.backup.strip_prefix(&prefix).is_some_and(
+                |suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+            ),
+        "模型安装恢复日志身份不匹配，原文件保留"
+    );
+    let dest = root.join(name);
+    let backup = root.join(&record.backup);
+    let dest_exists = model_path_exists(&dest)?;
+    let backup_exists = model_path_exists(&backup)?;
+    if !dest_exists && backup_exists {
+        let metadata = fs::symlink_metadata(&backup)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "模型备份不是普通目录：{}",
+            backup.display()
+        );
+        opencap_core::rename_no_replace(&backup, &dest).context("无法恢复模型原目录")?;
+        opencap_core::sync_parent_directory(&dest)?;
+    } else {
+        anyhow::ensure!(
+            dest_exists,
+            "模型原目录及备份均不存在；恢复日志保留：{}",
+            journal.display()
+        );
+    }
+    fs::remove_file(&journal)?;
+    opencap_core::sync_parent_directory(&journal)?;
+    Ok(())
+}
+
+pub(crate) fn journal_model_replace(root: &Path, name: &str, nonce: u128) -> Result<PathBuf> {
+    let backup_name = format!(".incomplete-{name}-{nonce}");
+    match fs::symlink_metadata(root.join(&backup_name)) {
+        Ok(_) => anyhow::bail!("模型备份位置已存在，未覆盖"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let journal = install_journal_path(root, name);
+    let record = InstallJournal {
+        destination: name.to_owned(),
+        backup: backup_name.clone(),
+    };
+    opencap_core::atomic_create_bytes(&journal, &serde_json::to_vec(&record)?)?;
+    Ok(root.join(backup_name))
+}
+
+pub(crate) fn finish_model_replace(root: &Path, name: &str) -> Result<()> {
+    let journal = install_journal_path(root, name);
+    fs::remove_file(&journal)?;
+    opencap_core::sync_parent_directory(&journal)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ModelFileFingerprint {
+    pub bytes: u64,
+    pub sha256: String,
+}
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ModelFingerprint {
+    /// SHA-256 of a deterministic list of filenames, lengths and byte hashes.
+    pub manifest_sha256: String,
+    pub files: std::collections::BTreeMap<String, ModelFileFingerprint>,
+    pub cache_key: &'static str,
+}
+
+/// Compare only files with pinned hashes; auxiliary VAD is not covered.
+pub(crate) fn known_weights_match(kind: ModelKind, actual: &ModelFingerprint) -> Option<bool> {
+    remote_model(kind).map(|remote| {
+        remote.files.iter().all(|expected| {
+            actual
+                .files
+                .get(expected.name)
+                .is_some_and(|file| file.bytes == expected.size && file.sha256 == expected.sha256)
+        })
+    })
+}
+
+/// Hash the bytes actually present, caching by file length and modification
+/// time during this process. This is provenance, not a signature or proof of
+/// model quality; files changed while hashing are rejected.
+pub(crate) fn fingerprint_model(
+    kind: ModelKind,
+    root: &Path,
+    cancelled: &AtomicBool,
+    use_cache: bool,
+) -> Result<ModelFingerprint> {
+    type Cached = (u64, std::time::SystemTime, String);
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Cached>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut files = std::collections::BTreeMap::new();
+    let mut cache_hits = 0usize;
+    for name in kind.files() {
+        ensure_download_active(cancelled)?;
+        let path = kind.path(root).join(name);
+        let before =
+            fs::metadata(&path).with_context(|| format!("无法读取模型文件 {}", path.display()))?;
+        anyhow::ensure!(before.is_file(), "模型路径不是普通文件：{}", path.display());
+        let modified = before.modified()?;
+        let cached = use_cache
+            .then(|| {
+                cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&path)
+                    .filter(|(len, mtime, _)| *len == before.len() && *mtime == modified)
+                    .map(|(_, _, hash)| hash.clone())
+            })
+            .flatten();
+        let hash = if let Some(hash) = cached {
+            cache_hits += 1;
+            hash
+        } else {
+            // The shared helper also compares the opened file identity with
+            // the path after reading, including on Windows.
+            let observed = opencap_core::fingerprint_media(&path, Some(cancelled))
+                .with_context(|| format!("无法核对模型文件 {}", path.display()))?;
+            let after = fs::metadata(&path)?;
+            anyhow::ensure!(
+                observed.size_bytes == before.len()
+                    && after.len() == before.len()
+                    && after.modified()? == modified,
+                "计算指纹时模型文件发生变化：{}",
+                path.display()
+            );
+            let hash = observed.sha256;
+            cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(path, (observed.size_bytes, modified, hash.clone()));
+            hash
+        };
+        files.insert(
+            (*name).to_owned(),
+            ModelFileFingerprint {
+                bytes: before.len(),
+                sha256: hash,
+            },
+        );
+    }
+    let canonical = serde_json::to_vec(&files)?;
+    let cache_key = if cache_hits == 0 {
+        "fresh_file_reads"
+    } else if cache_hits == files.len() {
+        "process_cache_length_and_mtime"
+    } else {
+        "mixed_fresh_and_process_cache_length_and_mtime"
+    };
+    Ok(ModelFingerprint {
+        manifest_sha256: format!("{:x}", Sha256::digest(canonical)),
+        files,
+        cache_key,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum ModelKind {
     Streaming,
@@ -151,6 +381,38 @@ pub enum ModelKind {
     Offline,
     ParaformerSmall,
     ParaformerLarge,
+}
+
+/// Describes the integration implemented here, not an unmeasured model claim.
+#[derive(Debug, Clone, Copy)]
+pub struct BackendCapabilities {
+    pub streaming: &'static str,
+    pub languages: &'static str,
+    pub punctuation: &'static str,
+    pub text_normalization: &'static str,
+    pub hotwords: &'static str,
+    pub timing: &'static str,
+    pub speakers: &'static str,
+    pub required: &'static str,
+    pub optional: &'static str,
+    pub providers: &'static str,
+}
+impl BackendCapabilities {
+    pub fn description(&self) -> String {
+        format!(
+            "{} · {}\n标点：{}；文本规范化：{}；热词：{}\n时间：{}；说话人：{}\n必需：{}；可选：{}；执行设备：{}",
+            self.streaming,
+            self.languages,
+            self.punctuation,
+            self.text_normalization,
+            self.hotwords,
+            self.timing,
+            self.speakers,
+            self.required,
+            self.optional,
+            self.providers
+        )
+    }
 }
 impl ModelKind {
     pub const ALL: [Self; 6] = [
@@ -181,6 +443,48 @@ impl ModelKind {
             self,
             Self::Streaming | Self::StreamingStandard | Self::StreamingEnhanced
         )
+    }
+    pub fn capabilities(self) -> BackendCapabilities {
+        if self.is_streaming() {
+            BackendCapabilities {
+                streaming: "原生流式",
+                languages: "以中文为主；其他语言效果未验收",
+                punctuation: "可选 CT 模型；缺失时仅补句末",
+                text_normalization: "未确认",
+                hotwords: "按词表过滤后请求，不保证一定识别",
+                timing: "句段及可用的原始 token 起点；未逐词对齐",
+                speakers: "不原生提供",
+                required: "流式模型与词表",
+                optional: "CT 标点、文件模型句末复核",
+                providers: "当前集成 CPU",
+            }
+        } else if self == Self::Offline {
+            BackendCapabilities {
+                streaming: "VAD 逐句，非原生流式",
+                languages: "可请求中文、英文或自动；自动模式的日韩粤效果未验收",
+                punctuation: "模型原生输出",
+                text_normalization: "当前路径请求 ITN；准确率未验收",
+                hotwords: "当前文件模型路径不支持",
+                timing: "VAD 句段及可用的原始 token 起点；未逐词对齐",
+                speakers: "不原生提供",
+                required: "模型、词表和 Silero VAD",
+                optional: "会后说话人分析",
+                providers: "当前集成 CPU",
+            }
+        } else {
+            BackendCapabilities {
+                streaming: "VAD 逐句，非原生流式",
+                languages: "中文及部分英文；样本效果未验收",
+                punctuation: "可选 CT 模型；缺失时仅补句末",
+                text_normalization: "未确认",
+                hotwords: "当前文件模型路径不支持",
+                timing: "VAD 句段及可用的原始 token 起点；未逐词对齐",
+                speakers: "不原生提供",
+                required: "模型、词表和 Silero VAD",
+                optional: "CT 标点、会后说话人分析",
+                providers: "当前集成 CPU",
+            }
+        }
     }
     pub fn label(self) -> &'static str {
         match self {
@@ -324,32 +628,54 @@ impl LiveModelPlan {
     }
 }
 pub fn model_root() -> PathBuf {
-    std::env::var_os("OPENCAP_MODEL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            opencap_core::config_path()
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("models")
-        })
+    // A developer shell may already export the production override. Never let
+    // it redirect a Dev build's downloads or voice memory into production.
+    let override_dir = if opencap_core::is_dev_profile() {
+        None
+    } else {
+        std::env::var_os("OPENCAP_MODEL_DIR")
+    };
+    override_dir.map(PathBuf::from).unwrap_or_else(|| {
+        opencap_core::config_path()
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("models")
+    })
 }
 /// Models are local after the first explicit download. Installation is atomic.
 pub fn prepare(
     kind: ModelKind,
     root: &Path,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf> {
+    prepare_cancellable(kind, root, &AtomicBool::new(false), progress)
+}
+
+pub fn prepare_cancellable(
+    kind: ModelKind,
+    root: &Path,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf> {
-    if kind.ready(root) {
-        return Ok(kind.path(root));
-    }
+    ensure_download_active(cancelled)?;
     fs::create_dir_all(root)?;
+    {
+        let _guard = model_install_guard(root)?;
+        recover_model_install(root, kind.directory())?;
+        if kind.ready(root) {
+            return Ok(kind.path(root));
+        }
+    }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let staging = root.join(format!(".download-{}-{nonce}", std::process::id()));
     fs::create_dir(&staging)?;
     let result = (|| {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(1800))
+            // Blocking reqwest applies this to each read operation, not the
+            // entire streaming download. Bound stalled reads so cancellation
+            // can be observed without limiting a steadily progressing model.
+            .timeout(Duration::from_secs(60))
             .build()?;
         let extracted = staging.join(kind.directory());
         fs::create_dir(&extracted)?;
@@ -358,12 +684,17 @@ pub fn prepare(
             let mut completed = 0;
             progress(0, Some(total));
             for item in remote.files {
+                ensure_download_active(cancelled)?;
                 let url = format!(
                     "https://huggingface.co/{}/resolve/{}/{}",
                     remote.repo, remote.revision, item.name
                 );
-                let mut response =
-                    download(&client, &url).with_context(|| format!("下载 {} 失败", item.name))?;
+                let response = download(&client, &url, cancelled)
+                    .with_context(|| format!("下载 {} 失败", item.name))?;
+                let mut response = CancellableReader {
+                    reader: response,
+                    cancelled,
+                };
                 let mut output = fs::File::create(extracted.join(item.name))?;
                 let mut tick = Instant::now();
                 let bytes = copy_verified(&mut response, &mut output, item, |bytes| {
@@ -381,8 +712,16 @@ pub fn prepare(
                 "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{}.tar.bz2",
                 kind.directory()
             );
-            let mut response = download(&client, &url)?;
+            let response = download(&client, &url, cancelled)?;
             let total = response.content_length();
+            anyhow::ensure!(
+                total.is_none_or(|size| size <= MAX_LEGACY_ARCHIVE_BYTES),
+                "模型压缩包超过允许大小"
+            );
+            let mut response = CancellableReader {
+                reader: response,
+                cancelled,
+            };
             let archive_path = staging.join("model.tar.bz2");
             let mut file = fs::File::create(&archive_path)?;
             let mut buf = [0u8; 64 * 1024];
@@ -394,20 +733,28 @@ pub fn prepare(
                 if n == 0 {
                     break;
                 }
-                file.write_all(&buf[..n])?;
                 bytes += n as u64;
+                anyhow::ensure!(bytes <= MAX_LEGACY_ARCHIVE_BYTES, "模型压缩包超过允许大小");
+                file.write_all(&buf[..n])?;
                 if last.elapsed() >= Duration::from_millis(300) {
                     progress(bytes, total);
                     last = Instant::now();
                 }
             }
+            anyhow::ensure!(
+                total.is_none_or(|size| size == bytes),
+                "模型压缩包下载不完整"
+            );
             file.sync_all()?;
+            drop(file);
             progress(bytes, total);
             let mut archive =
                 tar::Archive::new(bzip2::read::BzDecoder::new(fs::File::open(archive_path)?));
+            let mut installed = std::collections::BTreeSet::new();
             // Only install known regular model files; skip archive links and metadata.
             for entry in archive.entries()? {
-                let mut entry = entry?;
+                ensure_download_active(cancelled)?;
+                let entry = entry?;
                 if !entry.header().entry_type().is_file() {
                     continue;
                 }
@@ -419,11 +766,39 @@ pub fn prepare(
                     continue;
                 };
                 if kind.files().contains(&name) {
-                    entry.unpack(extracted.join(name))?;
+                    anyhow::ensure!(
+                        installed.insert(name.to_owned()),
+                        "模型压缩包含重复文件：{name}"
+                    );
+                    let max_bytes = if name == "tokens.txt" {
+                        MAX_TOKENS_BYTES
+                    } else {
+                        MAX_LEGACY_WEIGHT_BYTES
+                    };
+                    let expected = entry.size();
+                    anyhow::ensure!(
+                        expected > 0 && expected <= max_bytes,
+                        "模型文件大小异常：{name}"
+                    );
+                    let mut output = fs::File::create(extracted.join(name))?;
+                    let copied = std::io::copy(
+                        &mut CancellableReader {
+                            reader: entry,
+                            cancelled,
+                        }
+                        .take(max_bytes + 1),
+                        &mut output,
+                    )?;
+                    anyhow::ensure!(
+                        copied == expected && copied <= max_bytes,
+                        "模型文件不完整或过大：{name}"
+                    );
+                    output.sync_all()?;
                 }
             }
         }
         if !kind.is_streaming() {
+            ensure_download_active(cancelled)?;
             let existing = [
                 ModelKind::Offline,
                 ModelKind::ParaformerSmall,
@@ -431,55 +806,111 @@ pub fn prepare(
             ]
             .into_iter()
             .map(|model| model.path(root).join("silero_vad.onnx"))
-            .find(|path| path.metadata().is_ok_and(|m| m.is_file() && m.len() > 0));
+            .find(|path| {
+                path.metadata()
+                    .is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() <= MAX_VAD_BYTES)
+            });
             if let Some(existing) = existing {
-                fs::copy(existing, extracted.join("silero_vad.onnx"))?;
+                let mut source = CancellableReader {
+                    reader: fs::File::open(existing)?,
+                    cancelled,
+                };
+                let mut output = fs::File::create(extracted.join("silero_vad.onnx"))?;
+                let bytes = std::io::copy(&mut (&mut source).take(MAX_VAD_BYTES + 1), &mut output)?;
+                anyhow::ensure!(
+                    bytes > 0 && bytes <= MAX_VAD_BYTES,
+                    "已有 VAD 模型为空或超过允许大小"
+                );
+                output.sync_all()?;
             } else {
-                let mut vad = download(
+                let vad = download(
                     &client,
                     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+                    cancelled,
                 )?;
                 let mut file = fs::File::create(extracted.join("silero_vad.onnx"))?;
-                std::io::copy(&mut vad, &mut file)?;
+                let bytes = std::io::copy(
+                    &mut CancellableReader {
+                        reader: vad,
+                        cancelled,
+                    }
+                    .take(MAX_VAD_BYTES + 1),
+                    &mut file,
+                )?;
+                anyhow::ensure!(
+                    bytes > 0 && bytes <= MAX_VAD_BYTES,
+                    "VAD 模型文件为空或超过允许大小"
+                );
                 file.sync_all()?;
             }
         }
+        ensure_download_active(cancelled)?;
         anyhow::ensure!(kind.ready(&staging), "下载包缺少模型文件");
+        let _install_guard = model_install_guard(root)?;
+        ensure_download_active(cancelled)?;
+        recover_model_install(root, kind.directory())?;
         let dest = kind.path(root);
         if kind.ready(root) {
             return Ok(dest);
         }
-        if dest.exists() {
-            let backup = root.join(format!(".incomplete-{}-{nonce}", kind.directory()));
-            fs::rename(&dest, &backup).context("无法保留原有不完整模型目录")?;
-            if let Err(error) = fs::rename(&extracted, &dest) {
-                let _ = fs::rename(&backup, &dest);
-                return Err(error).context("无法保存模型");
+        if model_path_exists(&dest)? {
+            let backup = journal_model_replace(root, kind.directory(), nonce)?;
+            opencap_core::rename_no_replace(&dest, &backup)
+                .context("无法保留原有不完整模型目录")?;
+            if let Err(error) = opencap_core::rename_no_replace(&extracted, &dest) {
+                return match opencap_core::rename_no_replace(&backup, &dest) {
+                    Ok(()) => Err(error).context("无法保存模型，原目录已恢复"),
+                    Err(restore) => Err(error).context(format!(
+                        "无法保存模型；原目录保留在 {}，恢复失败：{restore}",
+                        backup.display()
+                    )),
+                };
             }
+            opencap_core::sync_parent_directory(&dest)
+                .context("模型已安装，但目录持久化确认失败")?;
+            finish_model_replace(root, kind.directory())
+                .context("模型已安装，但恢复日志清理失败")?;
             return Ok(dest);
         }
-        fs::rename(extracted, &dest)?;
+        opencap_core::rename_no_replace(&extracted, &dest)?;
+        opencap_core::sync_parent_directory(&dest).context("模型已安装，但目录持久化确认失败")?;
         Ok(dest)
     })();
-    let _ = fs::remove_dir_all(staging);
-    result
+    let cleanup = fs::remove_dir_all(&staging);
+    match (result, cleanup) {
+        (Ok(path), Ok(())) => Ok(path),
+        (Ok(_), Err(error)) => Err(error).context("模型已安装，但临时下载目录未能清理"),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("临时下载目录清理失败：{cleanup}")))
+        }
+    }
 }
 pub(crate) fn download(
     client: &reqwest::blocking::Client,
     url: &str,
+    cancelled: &AtomicBool,
 ) -> Result<reqwest::blocking::Response> {
     let mut error = None;
     for attempt in 0..3 {
+        ensure_download_active(cancelled)?;
         match client
             .get(url)
             .send()
             .and_then(|response| response.error_for_status())
         {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                ensure_download_active(cancelled)?;
+                return Ok(response);
+            }
             Err(e) => error = Some(e),
         }
         if attempt < 2 {
-            std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+            let until = Instant::now() + Duration::from_millis(500 * (attempt + 1));
+            while Instant::now() < until {
+                ensure_download_active(cancelled)?;
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
     Err(error.unwrap().into())

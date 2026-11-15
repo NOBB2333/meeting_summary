@@ -75,7 +75,48 @@ pub struct MediaWriter {
     pending: Option<ff::Packet>,
     pub frames: u64,
     pub last_video_us: i64,
-    audio_observer: Option<crossbeam_channel::Sender<PcmAudio>>,
+    audio_observers: Vec<AudioObserver>,
+    audio_generation: u64,
+    video_mux_time: crate::timing::TimingHistogram,
+}
+
+struct AudioObserver {
+    sender: crossbeam_channel::Sender<PcmAudio>,
+    source: AudioSource,
+    dropped_packets: u64,
+    consumer: &'static str,
+    disconnected: bool,
+    full_packets: u64,
+    disconnected_packets: u64,
+    dropped_audio_frames: u64,
+    dropped_boundaries: u64,
+}
+impl AudioObserver {
+    fn send(&mut self, audio: PcmAudio) {
+        let error = match self.sender.try_send(audio) {
+            Ok(()) => return,
+            Err(error) => error,
+        };
+        let packet = match error {
+            crossbeam_channel::TrySendError::Full(packet) => {
+                self.full_packets = self.full_packets.saturating_add(1);
+                packet
+            }
+            crossbeam_channel::TrySendError::Disconnected(packet) => {
+                self.disconnected = true;
+                self.disconnected_packets = self.disconnected_packets.saturating_add(1);
+                packet
+            }
+        };
+        self.dropped_packets = self.dropped_packets.saturating_add(1);
+        if packet.samples.is_empty() {
+            self.dropped_boundaries = self.dropped_boundaries.saturating_add(1);
+        } else {
+            self.dropped_audio_frames = self.dropped_audio_frames.saturating_add(
+                (packet.samples.len() / usize::from(packet.channels.max(1))) as u64,
+            );
+        }
+    }
 }
 impl MediaWriter {
     pub fn new(path: &Path, width: u32, height: u32, config: &RecordingConfig) -> Result<Self> {
@@ -200,7 +241,9 @@ impl MediaWriter {
             pending: None,
             frames: 0,
             last_video_us: 0,
-            audio_observer: None,
+            audio_observers: Vec::new(),
+            audio_generation: 0,
+            video_mux_time: Default::default(),
         })
     }
     fn write_video_packet(&mut self, mut packet: ff::Packet) -> Result<()> {
@@ -223,12 +266,18 @@ impl MediaWriter {
             .video
             .as_mut()
             .context("Audio-only output cannot accept video frames")?;
-        for p in encoder.encode(frame)? {
+        let packets = encoder.encode(frame)?;
+        let mux_started = std::time::Instant::now();
+        for p in packets {
             self.write_video_packet(p)?;
         }
+        self.video_mux_time.record(mux_started.elapsed());
         self.frames += 1;
         self.last_video_us = frame.pts_us;
         Ok(())
+    }
+    pub(crate) fn take_video_stage_timings(&mut self) -> serde_json::Value {
+        serde_json::json!({"encoder":self.video.as_mut().map(FfmpegVideoEncoder::take_stage_timings), "mux":self.video_mux_time.take()})
     }
     pub fn audio(&mut self, chunk: AudioChunk) {
         if self.audio.is_some() {
@@ -236,16 +285,60 @@ impl MediaWriter {
         }
     }
     pub fn observe_audio(&mut self, observer: crossbeam_channel::Sender<PcmAudio>) {
-        self.audio_observer = Some(observer);
+        self.audio_observers.push(AudioObserver {
+            sender: observer,
+            source: AudioSource::MixedRecording,
+            dropped_packets: 0,
+            consumer: "other",
+            disconnected: false,
+            full_packets: 0,
+            disconnected_packets: 0,
+            dropped_audio_frames: 0,
+            dropped_boundaries: 0,
+        });
     }
-    pub fn audio_boundary(&self) {
-        if let Some(observer) = &self.audio_observer {
-            let _ = observer.try_send(PcmAudio {
+    pub fn observe_audio_source(
+        &mut self,
+        observer: crossbeam_channel::Sender<PcmAudio>,
+        source: AudioSource,
+    ) -> Result<()> {
+        self.observe_audio_source_for(observer, source, "other")
+    }
+    pub(crate) fn observe_audio_source_for(
+        &mut self,
+        observer: crossbeam_channel::Sender<PcmAudio>,
+        source: AudioSource,
+        consumer: &'static str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            source != AudioSource::ImportedMedia,
+            "录制不能输出导入媒体来源"
+        );
+        self.audio_observers.push(AudioObserver {
+            sender: observer,
+            source,
+            dropped_packets: 0,
+            consumer,
+            disconnected: false,
+            full_packets: 0,
+            disconnected_packets: 0,
+            dropped_audio_frames: 0,
+            dropped_boundaries: 0,
+        });
+        Ok(())
+    }
+    pub fn audio_boundary(&mut self) {
+        self.audio_generation = self.audio_generation.saturating_add(1);
+        for observer in &mut self.audio_observers {
+            let audio = PcmAudio {
                 pts_us: self.mixer.cursor * 1000 / 48,
                 sample_rate: 48000,
                 channels: 1,
-                samples: Vec::new(),
-            });
+                source: observer.source,
+                generation: self.audio_generation,
+                samples: Vec::new().into(),
+            };
+            observer.send(audio);
         }
     }
     pub fn clear_audio_route(&mut self, kind: AudioKind) {
@@ -267,15 +360,67 @@ impl MediaWriter {
                 frame_size
             };
             let pts = self.mixer.cursor;
-            let samples = self.mixer.take(count);
-            if let Some(observer) = &self.audio_observer {
-                // Independent bounded ASR queue. Full/closed queues never delay saving.
-                let _ = observer.try_send(PcmAudio {
-                    pts_us: pts * 1000 / 48,
-                    sample_rate: 48000,
-                    channels: 1,
-                    samples: samples.iter().map(|s| (s[0] + s[1]) * 0.5).collect(),
-                });
+            let want_separate = self
+                .audio_observers
+                .iter()
+                .any(|observer| observer.source != AudioSource::MixedRecording);
+            let (samples, system, microphone) = if want_separate {
+                let (mixed, system, microphone) = self.mixer.take_separated(count);
+                (mixed, Some(system), Some(microphone))
+            } else {
+                (self.mixer.take(count), None, None)
+            };
+            if !self.audio_observers.is_empty() {
+                // Allocate at most once per requested source; independent bounded
+                // queues share the same Arc and never delay the recorder.
+                let mono = |values: &[[f32; 2]]| -> std::sync::Arc<[f32]> {
+                    values
+                        .iter()
+                        .map(|sample| (sample[0] + sample[1]) * 0.5)
+                        .collect::<Vec<_>>()
+                        .into()
+                };
+                let mixed = self
+                    .audio_observers
+                    .iter()
+                    .any(|observer| observer.source == AudioSource::MixedRecording)
+                    .then(|| mono(&samples));
+                let system = system
+                    .as_ref()
+                    .filter(|_| {
+                        self.audio_observers
+                            .iter()
+                            .any(|observer| observer.source == AudioSource::System)
+                    })
+                    .map(|values| mono(values));
+                let microphone = microphone
+                    .as_ref()
+                    .filter(|_| {
+                        self.audio_observers
+                            .iter()
+                            .any(|observer| observer.source == AudioSource::Microphone)
+                    })
+                    .map(|values| mono(values));
+                for observer in &mut self.audio_observers {
+                    let shared = match observer.source {
+                        AudioSource::MixedRecording => mixed.as_ref(),
+                        AudioSource::System => system.as_ref(),
+                        AudioSource::Microphone => microphone.as_ref(),
+                        AudioSource::ImportedMedia => None,
+                    };
+                    let Some(shared) = shared else {
+                        continue;
+                    };
+                    let audio = PcmAudio {
+                        pts_us: pts * 1000 / 48,
+                        sample_rate: 48000,
+                        channels: 1,
+                        source: observer.source,
+                        generation: self.audio_generation,
+                        samples: shared.clone(),
+                    };
+                    observer.send(audio);
+                }
             }
             let mut frame = ff::frame::Audio::new(audio.format(), count, audio.channel_layout());
             frame.set_rate(48000);
@@ -296,7 +441,13 @@ impl MediaWriter {
         }
         Ok(())
     }
-    pub fn finish(mut self, stop_us: i64) -> Result<()> {
+    pub fn finish(self, stop_us: i64) -> Result<()> {
+        self.finish_with_observer_status(stop_us).map(|_| ())
+    }
+    pub(crate) fn finish_with_observer_status(
+        mut self,
+        stop_us: i64,
+    ) -> Result<Vec<serde_json::Value>> {
         self.audio_until(stop_us, true)?;
         if let Some(video) = self.video.as_mut() {
             for packet in video.flush()? {
@@ -313,10 +464,39 @@ impl MediaWriter {
             drain_audio(audio, &mut self.output, self.audio_tb, self.audio_stream)?;
         }
         self.output.write_trailer()?;
-        Ok(())
+        Ok(self.audio_observer_status())
     }
     pub fn asr_pending_packets(&self) -> Option<usize> {
-        self.audio_observer.as_ref().map(|tx| tx.len())
+        self.audio_observers
+            .iter()
+            .find(|observer| observer.consumer == "asr")
+            .map(|observer| observer.sender.len())
+    }
+    pub fn audio_observer_drops(&self) -> Vec<u64> {
+        self.audio_observers
+            .iter()
+            .map(|observer| observer.dropped_packets)
+            .collect()
+    }
+    pub fn audio_observer_status(&self) -> Vec<serde_json::Value> {
+        self.audio_observers
+            .iter()
+            .map(|observer| {
+                serde_json::json!({
+                    "source": observer.source,
+                    "consumer": observer.consumer,
+                    "queued_packets": observer.sender.len(),
+                    "capacity_packets": observer.sender.capacity(),
+                    "dropped_packets": observer.dropped_packets,
+                    "queue_full_packets": observer.full_packets,
+                    "receiver_disconnected_packets": observer.disconnected_packets,
+                    "dropped_audio_frames": observer.dropped_audio_frames,
+                    "dropped_boundary_events": observer.dropped_boundaries,
+                    "audio_sample_rate_hz": 48000,
+                    "receiver_disconnected": observer.disconnected,
+                })
+            })
+            .collect()
     }
     pub fn audio_cursor_us(&self) -> Option<i64> {
         self.audio.as_ref().map(|_| self.mixer.cursor * 1000 / 48)
@@ -372,8 +552,46 @@ fn drain_audio(
 pub fn recover_file(input: &Path, output: &Path) -> Result<()> {
     anyhow::ensure!(!output.exists(), "Recovery output already exists");
     super::initialize()?;
+    let filename = output
+        .file_name()
+        .context("Recovery output has no filename")?
+        .to_string_lossy();
+    let temporary = output.with_file_name(format!(
+        ".{filename}.recovery-{}.partial",
+        opencap_core::new_stable_id()
+    ));
+    let temporary_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    recover_into_temporary(input, output, &temporary, &temporary_file).with_context(|| {
+        format!(
+            "恢复未完全结束；原文件保留，暂存文件位置：{}；目标若已发布请先检查：{}",
+            temporary.display(),
+            output.display()
+        )
+    })
+}
+
+fn recover_into_temporary(
+    input: &Path,
+    output: &Path,
+    temporary: &Path,
+    temporary_file: &std::fs::File,
+) -> Result<()> {
+    let temporary_identity = same_file::Handle::from_file(temporary_file.try_clone()?)?;
+    let source_file = opencap_core::open_regular_file_for_read(input)?;
+    let source_identity = same_file::Handle::from_file(source_file.try_clone()?)?;
+    let source_before = source_file.metadata()?;
+    anyhow::ensure!(
+        source_identity
+            == same_file::Handle::from_file(opencap_core::open_regular_file_for_read(input)?)?,
+        "恢复前源文件已被替换"
+    );
     let mut source = ff::format::input(input)?;
-    let mut dest = ff::format::output_as(output, "mp4")?;
+    verify_temporary_path(temporary, &temporary_identity)?;
+    let mut dest = ff::format::output_as(&temporary, "mp4")?;
     let mut time_bases = Vec::new();
     let mut video_timings = Vec::new();
     for stream in source.streams() {
@@ -443,7 +661,8 @@ pub fn recover_file(input: &Path, output: &Path) -> Result<()> {
     dest.write_trailer()?;
     drop(dest);
     // Verify an actual decoded frame, including recordings with no video stream.
-    let mut check = ff::format::input(output)?;
+    verify_temporary_path(temporary, &temporary_identity)?;
+    let mut check = ff::format::input(&temporary)?;
     if check.streams().best(ff::media::Type::Video).is_some() {
         let stream = check
             .streams()
@@ -504,6 +723,30 @@ pub fn recover_file(input: &Path, output: &Path) -> Result<()> {
         }
         anyhow::ensure!(decoded, "Recovered audio could not be decoded");
     }
+    drop(check);
+    drop(source);
+    let source_after = source_file.metadata()?;
+    anyhow::ensure!(
+        source_before.len() == source_after.len()
+            && source_before.modified()? == source_after.modified()?
+            && source_identity
+                == same_file::Handle::from_file(opencap_core::open_regular_file_for_read(input)?)?,
+        "恢复期间源文件已变化；未发布恢复结果"
+    );
+    verify_temporary_path(temporary, &temporary_identity)?;
+    temporary_file.sync_all()?;
+    std::fs::hard_link(temporary, output)
+        .context("Recovery output could not be published without overwriting an existing file")?;
+    verify_temporary_path(output, &temporary_identity)
+        .context("恢复目标已发布，但无法确认其文件身份")?;
+    opencap_core::sync_parent_directory(output)?;
+    std::fs::remove_file(temporary).with_context(|| {
+        format!(
+            "Recovered output published at {}, but temporary file could not be removed: {}",
+            output.display(),
+            temporary.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -523,8 +766,60 @@ pub fn inspect_output(path: &Path) -> Result<serde_json::Value> {
 /// Copy the mixed AAC track without a second encode or another audio capture session.
 /// Write to a temporary file first; never overwrite an existing recording.
 pub fn export_audio(input: &Path, output: &Path) -> Result<()> {
+    export_audio_cancellable(input, output, None)
+}
+
+pub fn export_audio_cancellable(
+    input: &Path,
+    output: &Path,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)),
+        "音频导出已取消"
+    );
     super::initialize()?;
     anyhow::ensure!(!output.exists(), "Audio output already exists");
+    let filename = output
+        .file_name()
+        .context("Audio output has no filename")?
+        .to_string_lossy();
+    let temporary = output.with_file_name(format!(
+        ".{filename}.export-{}.partial",
+        opencap_core::new_stable_id()
+    ));
+    let temporary_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    export_audio_into_temporary(input, output, &temporary, &temporary_file, cancelled).with_context(
+        || {
+            format!(
+                "音频导出未完全结束；暂存文件位置：{}；目标若已发布请先检查：{}",
+                temporary.display(),
+                output.display()
+            )
+        },
+    )
+}
+
+fn export_audio_into_temporary(
+    input: &Path,
+    output: &Path,
+    temporary: &Path,
+    temporary_file: &std::fs::File,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let temporary_identity = same_file::Handle::from_file(temporary_file.try_clone()?)?;
+    let source_file = opencap_core::open_regular_file_for_read(input)?;
+    let source_identity = same_file::Handle::from_file(source_file.try_clone()?)?;
+    let source_before = source_file.metadata()?;
+    anyhow::ensure!(
+        source_identity
+            == same_file::Handle::from_file(opencap_core::open_regular_file_for_read(input)?)?,
+        "导出前源媒体已被替换"
+    );
     let mut source = ff::format::input(input)?;
     let stream = source
         .streams()
@@ -532,11 +827,7 @@ pub fn export_audio(input: &Path, output: &Path) -> Result<()> {
         .context("Recording has no audio track")?;
     let index = stream.index();
     let source_tb = stream.time_base();
-    let temporary = output.with_extension("partial.m4a");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    verify_temporary_path(temporary, &temporary_identity)?;
     let mut dest = ff::format::output_as(&temporary, "mp4")?;
     let mut target = dest.add_stream(ff::encoder::find(stream.parameters().id()))?;
     target.set_parameters(stream.parameters());
@@ -547,6 +838,10 @@ pub fn export_audio(input: &Path, output: &Path) -> Result<()> {
     let dest_tb = dest.stream(0).unwrap().time_base();
     let mut packets = 0;
     for (stream, mut packet) in source.packets() {
+        anyhow::ensure!(
+            !cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)),
+            "音频导出已取消"
+        );
         if stream.index() != index {
             continue;
         }
@@ -559,9 +854,77 @@ pub fn export_audio(input: &Path, output: &Path) -> Result<()> {
     anyhow::ensure!(packets > 0, "No audio packets");
     dest.write_trailer()?;
     drop(dest);
+    drop(source);
+    verify_temporary_path(temporary, &temporary_identity)?;
+    let mut check = ff::format::input(temporary)?;
+    let stream = check
+        .streams()
+        .best(ff::media::Type::Audio)
+        .context("导出的文件没有音轨")?;
+    let index = stream.index();
+    let mut decoder = ff::codec::context::Context::from_parameters(stream.parameters())?
+        .decoder()
+        .audio()?;
+    let mut decoded = false;
+    for (stream, packet) in check.packets() {
+        anyhow::ensure!(
+            !cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)),
+            "音频导出已取消"
+        );
+        if stream.index() == index {
+            decoder.send_packet(&packet)?;
+            if decoder
+                .receive_frame(&mut ff::frame::Audio::empty())
+                .is_ok()
+            {
+                decoded = true;
+                break;
+            }
+        }
+    }
+    if !decoded {
+        decoder.send_eof()?;
+        decoded = decoder
+            .receive_frame(&mut ff::frame::Audio::empty())
+            .is_ok();
+    }
+    anyhow::ensure!(decoded, "导出的音频无法解码");
+    drop(check);
+    let source_after = source_file.metadata()?;
+    anyhow::ensure!(
+        source_before.len() == source_after.len()
+            && source_before.modified()? == source_after.modified()?
+            && source_identity
+                == same_file::Handle::from_file(opencap_core::open_regular_file_for_read(input)?)?,
+        "导出期间源媒体已变化；未发布音频文件"
+    );
+    verify_temporary_path(temporary, &temporary_identity)?;
+    temporary_file.sync_all()?;
+    anyhow::ensure!(
+        !cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)),
+        "音频导出已取消；暂存文件保留"
+    );
     // Hard-link publishes atomically and refuses to replace any existing output.
-    std::fs::hard_link(&temporary, output)?;
+    std::fs::hard_link(temporary, output)?;
+    verify_temporary_path(output, &temporary_identity)
+        .context("音频目标已发布，但无法确认其文件身份")?;
+    opencap_core::sync_parent_directory(output)?;
     std::fs::remove_file(temporary)?;
+    Ok(())
+}
+
+fn verify_temporary_path(path: &Path, identity: &same_file::Handle) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "暂存或发布路径不是普通文件：{}",
+        path.display()
+    );
+    anyhow::ensure!(
+        *identity == same_file::Handle::from_file(opencap_core::open_regular_file_for_read(path)?)?,
+        "暂存或发布文件身份已变化：{}",
+        path.display()
+    );
     Ok(())
 }
 

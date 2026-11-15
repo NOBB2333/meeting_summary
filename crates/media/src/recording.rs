@@ -28,6 +28,32 @@ pub struct RecordingSession {
     worker: Option<JoinHandle<()>>,
     preview: Arc<crate::preview::PreviewSlot>,
 }
+
+/// A subscriber receives exactly one aligned source, with independent
+/// backpressure and explicit source identity on every packet.
+pub struct AudioSubscription {
+    pub source: AudioSource,
+    pub sender: Sender<PcmAudio>,
+    /// Diagnostic role only; never used to infer a speaker identity.
+    pub consumer: AudioConsumer,
+}
+
+#[derive(Clone, Copy)]
+pub enum AudioConsumer {
+    Asr,
+    OnlineSpeaker,
+    Other,
+}
+impl AudioConsumer {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Asr => "asr",
+            Self::OnlineSpeaker => "online_speaker",
+            Self::Other => "other",
+        }
+    }
+}
+
 impl RecordingSession {
     pub fn start(config: RecordingConfig) -> Result<Self> {
         Self::start_observed(config, None)
@@ -35,6 +61,48 @@ impl RecordingSession {
     pub fn start_observed(
         config: RecordingConfig,
         audio_observer: Option<Sender<PcmAudio>>,
+    ) -> Result<Self> {
+        Self::start_observed_many(config, audio_observer.into_iter().collect())
+    }
+    /// Each consumer owns a bounded queue; one slow consumer cannot stall the
+    /// recording or any other consumer.
+    pub fn start_observed_many(
+        config: RecordingConfig,
+        audio_observers: Vec<Sender<PcmAudio>>,
+    ) -> Result<Self> {
+        Self::start_observed_inner(
+            config,
+            audio_observers
+                .into_iter()
+                .map(|sender| AudioSubscription {
+                    source: AudioSource::MixedRecording,
+                    sender,
+                    consumer: AudioConsumer::Other,
+                })
+                .collect(),
+        )
+    }
+    pub fn start_observed_sources(
+        config: RecordingConfig,
+        audio_observers: Vec<AudioSubscription>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            audio_observers
+                .iter()
+                .all(|observer| observer.source != AudioSource::ImportedMedia),
+            "录制不能分发导入媒体来源"
+        );
+        anyhow::ensure!(
+            audio_observers
+                .iter()
+                .all(|observer| observer.sender.capacity().is_some()),
+            "音频订阅必须使用有界队列"
+        );
+        Self::start_observed_inner(config, audio_observers)
+    }
+    fn start_observed_inner(
+        config: RecordingConfig,
+        audio_observers: Vec<AudioSubscription>,
     ) -> Result<Self> {
         config.validate()?;
         anyhow::ensure!(
@@ -57,7 +125,7 @@ impl RecordingSession {
             .name("opencap-recording".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(config, rx, shared.clone(), worker_preview, audio_observer)
+                    run(config, rx, shared.clone(), worker_preview, audio_observers)
                 }));
                 let error = match result {
                     Ok(Ok(())) => None,
@@ -82,6 +150,31 @@ impl RecordingSession {
     }
     pub fn stats(&self) -> RecordingStats {
         self.stats.lock().clone()
+    }
+    pub fn audio_levels(&self) -> (AudioRouteLevels, AudioRouteLevels) {
+        let stats = self.stats.lock();
+        (
+            AudioRouteLevels {
+                input: AudioLevel {
+                    rms: stats.system_input_rms,
+                    peak: stats.system_input_peak,
+                },
+                processed: AudioLevel {
+                    rms: stats.system_rms,
+                    peak: stats.system_peak,
+                },
+            },
+            AudioRouteLevels {
+                input: AudioLevel {
+                    rms: stats.microphone_input_rms,
+                    peak: stats.microphone_input_peak,
+                },
+                processed: AudioLevel {
+                    rms: stats.microphone_rms,
+                    peak: stats.microphone_peak,
+                },
+            },
+        )
     }
     pub fn enable_preview(&self, enabled: bool) {
         self.preview.enable(enabled);
@@ -111,7 +204,7 @@ impl Drop for RecordingSession {
 }
 fn unique_output(dir: &Path, audio_only: bool) -> Result<(PathBuf, PathBuf)> {
     let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let base = create_meeting_base(dir, &format!("OpenCap_{stamp}"))?;
+    let base = create_meeting_base(dir, &stamp.to_string())?;
     let extension = if audio_only { "m4a" } else { "mp4" };
     let output = base.with_extension(extension);
     let partial = base.with_extension(format!("partial.{extension}"));
@@ -119,6 +212,23 @@ fn unique_output(dir: &Path, audio_only: bool) -> Result<(PathBuf, PathBuf)> {
         .write(true)
         .create_new(true)
         .open(&partial)?;
+    register_meeting_asset(
+        &base,
+        if audio_only {
+            "recording_audio"
+        } else {
+            "recording_video"
+        },
+        AssetOwnership::Managed,
+        Path::new(output.file_name().context("录制文件名无效")?),
+    )?;
+    let report = base.with_extension("recording.json");
+    register_meeting_asset(
+        &base,
+        "recording_report",
+        AssetOwnership::Managed,
+        Path::new(report.file_name().context("录制报告文件名无效")?),
+    )?;
     Ok((output, partial))
 }
 
@@ -154,6 +264,7 @@ struct MicChain {
     enabled: bool,
     denoiser: MicDenoiser,
     last_end_us: Option<i64>,
+    last_generation: u64,
 }
 impl MicChain {
     fn new(config: &RecordingConfig) -> Self {
@@ -161,11 +272,13 @@ impl MicChain {
             enabled: config.mic_denoise,
             denoiser: MicDenoiser::new(48_000),
             last_end_us: None,
+            last_generation: 0,
         }
     }
     fn apply(&mut self, chunk: &mut AudioChunk) {
         if self.enabled && chunk.kind == AudioKind::Microphone {
             self.last_end_us = Some(chunk.pts_us + chunk.samples.len() as i64 / 2 * 1000 / 48);
+            self.last_generation = chunk.generation;
             self.denoiser.process(&mut chunk.samples);
             chunk.pts_us -= MicDenoiser::LATENCY_FRAMES as i64 * 1000 / 48;
         }
@@ -175,6 +288,7 @@ impl MicChain {
         let mut samples = vec![0.0; MicDenoiser::LATENCY_FRAMES * 2];
         self.denoiser.process(&mut samples);
         Some(AudioChunk {
+            generation: self.last_generation,
             kind: AudioKind::Microphone,
             pts_us: end - MicDenoiser::LATENCY_FRAMES as i64 * 1000 / 48,
             samples,
@@ -190,7 +304,7 @@ fn run(
     commands: Receiver<RecordingCommand>,
     stats: Arc<Mutex<RecordingStats>>,
     preview: Arc<crate::preview::PreviewSlot>,
-    audio_observer: Option<Sender<PcmAudio>>,
+    audio_observers: Vec<AudioSubscription>,
 ) -> Result<()> {
     let clock = RecordingClock::new();
     let (video_tx, video_rx) = bounded(2);
@@ -236,22 +350,49 @@ fn run(
         None
     };
     let (output, partial) = unique_output(&config.output_dir, config.audio_only)?;
+    // Keep the identity pinned until the recording, report and exports finish.
+    let _meeting_activity = managed_meeting_activity(&output)?;
+    let recording_meeting_id = meeting_manifest(&output)?
+        .context("录制会议清单不可用")?
+        .meeting_id;
+    if !config.audio_only && config.separate_audio {
+        let audio = output.with_extension("m4a");
+        register_meeting_asset(
+            &output,
+            "recording_audio",
+            AssetOwnership::Managed,
+            Path::new(audio.file_name().context("录音文件名无效")?),
+        )?;
+    }
     stats.lock().output = Some(partial.clone());
     let mut writer = if let Some(first) = &first {
         MediaWriter::new(&partial, first.width, first.height, &config)?
     } else {
         MediaWriter::new_audio(&partial, &config)?
     };
-    if let Some(observer) = audio_observer {
-        writer.observe_audio(observer);
+    for observer in audio_observers {
+        writer.observe_audio_source_for(
+            observer.sender,
+            observer.source,
+            observer.consumer.label(),
+        )?;
     }
     // Encoder probing can take seconds; start the recording timeline only once ready.
     let video_epoch = clock.now_us();
+    // Wall-clock observation at the media timeline origin, kept separate
+    // from the monotonic clock used for synchronization and duration.
+    let recording_started_unix_ms = chrono::Utc::now().timestamp_millis();
     let mut audio = opencap_platform::start_audio(&config, clock.clone(), audio_tx, warn_tx);
     let mut routing = config.audio_routing();
     let mut mic = MicChain::new(&config);
     let mut audio_changes = Vec::new();
+    let mut boundary_discarded_audio_chunks = 0u64;
+    let mut boundary_discarded_audio_frames = 0u64;
+    let mut prior_route_states = Vec::<AudioRouteStatus>::new();
     let mut peaks = [0.0f32; 2];
+    let mut meters = [AudioMeter::default(), AudioMeter::default()];
+    let mut inputs = [AudioMeter::default(), AudioMeter::default()];
+    let mut meter_tick = Instant::now();
     let mut latest = first;
     let mut preview_tick = None;
     let mut policy = FramePolicy::default();
@@ -283,9 +424,13 @@ fn run(
     let mut encode_max_ms = 0.0f64;
     let mut preview_max_ms = 0.0f64;
     let mut audio_write_max_ms = 0.0f64;
+    let mut preview_timing = crate::timing::TimingHistogram::default();
+    let mut audio_timing = crate::timing::TimingHistogram::default();
     // Bounded history in the existing report: no new telemetry files or services.
     let mut performance_samples = std::collections::VecDeque::new();
+    let mut performance_samples_discarded = 0u64;
     let mut tick = Instant::now();
+    let mut audio_retry_tick = Instant::now();
     let mut last_frames = 0;
     let mut capture_received = 0u64;
     let mut last_captured = 0u64;
@@ -311,10 +456,20 @@ fn run(
             };
             match cmd {
                 RecordingCommand::Pause => {
+                    if clock.is_paused() {
+                        continue;
+                    }
                     clock.pause();
                     // Preserve the last captured syllable before resetting the
                     // delayed microphone filter on resume.
                     for mut chunk in audio_rx.try_iter() {
+                        if chunk.generation != clock.snapshot().2 {
+                            boundary_discarded_audio_chunks =
+                                boundary_discarded_audio_chunks.saturating_add(1);
+                            boundary_discarded_audio_frames = boundary_discarded_audio_frames
+                                .saturating_add((chunk.samples.len() / 2) as u64);
+                            continue;
+                        }
                         mic.apply(&mut chunk);
                         rebase_audio(&mut chunk, video_epoch);
                         writer.audio(chunk);
@@ -329,12 +484,40 @@ fn run(
                     stats.lock().state = RecordingState::Paused;
                 }
                 RecordingCommand::Resume => {
+                    if !clock.is_paused() {
+                        continue;
+                    }
+                    // Callbacks that began just before pause can arrive after
+                    // the pause drain. They belong to the closed audio epoch.
+                    for chunk in audio_rx.try_iter() {
+                        boundary_discarded_audio_chunks =
+                            boundary_discarded_audio_chunks.saturating_add(1);
+                        boundary_discarded_audio_frames = boundary_discarded_audio_frames
+                            .saturating_add((chunk.samples.len() / 2) as u64);
+                    }
+                    // Discard queued frames from the pause boundary; the
+                    // last displayed frame remains until a fresh capture.
+                    for _ in video_rx.try_iter() {}
                     mic.reset();
+                    audio.clear_sample_times();
                     clock.resume();
+                    for route in &mut stats.lock().audio_routes {
+                        route.last_sample_at_us = None;
+                    }
+                    last_capture = Instant::now();
+                    idle_warned = false;
+                    silent_audio_since = [Instant::now(); 2];
+                    silent_audio_warned = [false; 2];
                     stats.lock().state = RecordingState::Recording;
                 }
-                RecordingCommand::Stop => stop = true,
+                RecordingCommand::Stop => {
+                    stop = true;
+                    break;
+                }
                 RecordingCommand::SetMicDenoise(enabled) => {
+                    if mic.enabled == enabled {
+                        continue;
+                    }
                     if let Some(mut tail) = mic.flush() {
                         rebase_audio(&mut tail, video_epoch);
                         writer.audio(tail);
@@ -361,27 +544,73 @@ fn run(
                     // Changed workers have stopped. Discard their queued data and clear
                     // their unencoded samples without discarding the other audio route.
                     for mut chunk in audio_rx.try_iter() {
-                        if !changed.contains(&chunk.kind) {
+                        if !changed.contains(&chunk.kind)
+                            && chunk.generation == clock.snapshot().2
+                            && !clock.is_paused()
+                        {
                             mic.apply(&mut chunk);
                             rebase_audio(&mut chunk, video_epoch);
                             writer.audio(chunk);
                         }
                     }
-                    for kind in changed {
+                    for &kind in &changed {
                         writer.clear_audio_route(kind);
                         if kind == AudioKind::Microphone {
                             mic.reset();
                         }
                         let index = usize::from(kind == AudioKind::Microphone);
                         peaks[index] = 0.0;
+                        meters[index].reset();
+                        inputs[index].reset();
                         silent_audio_since[index] = Instant::now();
                         silent_audio_warned[index] = false;
                     }
                     routing = next;
+                    let mut changed_status = audio.route_status();
+                    changed_status.retain(|route| {
+                        changed.contains(&route.kind) && routing.enabled(route.kind)
+                    });
+                    for kind in changed
+                        .iter()
+                        .copied()
+                        .filter(|kind| routing.enabled(*kind))
+                    {
+                        if !changed_status.iter().any(|route| route.kind == kind) {
+                            let requested = routing.device(kind).clone();
+                            changed_status.push(AudioRouteStatus {
+                                kind,
+                                follow_default: requested.is_none(),
+                                requested_device_id: requested,
+                                resolved_device_id: None,
+                                resolved_device_name: None,
+                                health: AudioRouteHealth::Waiting,
+                                last_sample_at_us: None,
+                                reason: Some("采集线程未启动，正在重试".into()),
+                            });
+                        }
+                    }
+                    for route in &mut changed_status {
+                        route.last_sample_at_us = route
+                            .last_sample_at_us
+                            .map(|time| (time - video_epoch).max(0));
+                    }
                     let mut s = stats.lock();
                     s.audio_routing = routing.clone();
-                    s.system_peak = 0.0;
-                    s.microphone_peak = 0.0;
+                    s.audio_routes
+                        .retain(|route| !changed.contains(&route.kind));
+                    s.audio_routes.extend(changed_status);
+                    if changed.contains(&AudioKind::System) {
+                        s.system_peak = 0.0;
+                        s.system_rms = 0.0;
+                        s.system_input_rms = 0.0;
+                        s.system_input_peak = 0.0;
+                    }
+                    if changed.contains(&AudioKind::Microphone) {
+                        s.microphone_peak = 0.0;
+                        s.microphone_rms = 0.0;
+                        s.microphone_input_rms = 0.0;
+                        s.microphone_input_peak = 0.0;
+                    }
                     audio_changes.push(serde_json::json!({"at_us": (clock.now_us() - video_epoch).max(0), "routing": routing}));
                 }
             }
@@ -402,8 +631,17 @@ fn run(
         }
         let now = (clock.now_us() - video_epoch).max(0);
         while let Ok(mut chunk) = audio_rx.try_recv() {
-            mic.apply(&mut chunk);
+            let (_, paused, generation) = clock.snapshot();
+            if paused || chunk.generation != generation {
+                boundary_discarded_audio_chunks = boundary_discarded_audio_chunks.saturating_add(1);
+                boundary_discarded_audio_frames = boundary_discarded_audio_frames
+                    .saturating_add((chunk.samples.len() / 2) as u64);
+                continue;
+            }
             let index = usize::from(chunk.kind == AudioKind::Microphone);
+            inputs[index].update(&chunk.samples, Instant::now());
+            mic.apply(&mut chunk);
+            meters[index].update(&chunk.samples, Instant::now());
             peaks[index] = chunk
                 .samples
                 .iter()
@@ -430,15 +668,50 @@ fn run(
                     encode_max_ms = encode_max_ms.max(measured.elapsed().as_secs_f64() * 1000.);
                     let measured = Instant::now();
                     preview.publish(&frame, &mut preview_tick);
-                    preview_max_ms = preview_max_ms.max(measured.elapsed().as_secs_f64() * 1000.);
+                    let elapsed = measured.elapsed();
+                    preview_timing.record(elapsed);
+                    preview_max_ms = preview_max_ms.max(elapsed.as_secs_f64() * 1000.);
                 }
             }
             let measured = Instant::now();
             writer.audio_until((now - 150_000).max(0), false)?;
-            audio_write_max_ms = audio_write_max_ms.max(measured.elapsed().as_secs_f64() * 1000.);
+            let elapsed = measured.elapsed();
+            audio_timing.record(elapsed);
+            audio_write_max_ms = audio_write_max_ms.max(elapsed.as_secs_f64() * 1000.);
         }
         loop_max_ms = loop_max_ms.max(loop_started.elapsed().as_secs_f64() * 1000.);
+        if meter_tick.elapsed() >= Duration::from_millis(40) {
+            let now = Instant::now();
+            let mut s = stats.lock();
+            let levels = if clock.is_paused() {
+                for meter in &mut meters {
+                    meter.reset();
+                }
+                for meter in &mut inputs {
+                    meter.reset();
+                }
+                [AudioLevel::default(), AudioLevel::default()]
+            } else {
+                [meters[0].level(now), meters[1].level(now)]
+            };
+            s.system_rms = levels[0].rms;
+            s.system_peak = levels[0].peak;
+            s.microphone_rms = levels[1].rms;
+            s.microphone_peak = levels[1].peak;
+            let input_levels = [inputs[0].level(now), inputs[1].level(now)];
+            s.system_input_rms = input_levels[0].rms;
+            s.system_input_peak = input_levels[0].peak;
+            s.microphone_input_rms = input_levels[1].rms;
+            s.microphone_input_peak = input_levels[1].peak;
+            meter_tick = now;
+        }
         if tick.elapsed() >= Duration::from_secs(1) {
+            if audio_retry_tick.elapsed() >= Duration::from_secs(5) {
+                // Healthy routes are retained. Missing or unexpectedly ended
+                // supervisors are restarted without waiting for a UI edit.
+                audio.reconfigure(&routing);
+                audio_retry_tick = Instant::now();
+            }
             writer.flush_io()?;
             // PulseAudio-only Linux sessions do not require an X11/Wayland
             // connection. Absence of DISPLAY is not a lock-screen event.
@@ -450,7 +723,38 @@ fn run(
             let bytes = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
             let elapsed = tick.elapsed().as_secs_f64();
             let (cpu, memory) = meter.sample();
+            let mut route_states = audio.route_status();
+            for kind in [AudioKind::System, AudioKind::Microphone] {
+                if routing.enabled(kind) && !route_states.iter().any(|route| route.kind == kind) {
+                    let requested = routing.device(kind).clone();
+                    route_states.push(AudioRouteStatus {
+                        kind,
+                        follow_default: requested.is_none(),
+                        requested_device_id: requested,
+                        resolved_device_id: None,
+                        resolved_device_name: None,
+                        health: AudioRouteHealth::Waiting,
+                        last_sample_at_us: None,
+                        reason: Some("采集线程未启动，正在重试".into()),
+                    });
+                }
+            }
+            for route in &mut route_states {
+                route.last_sample_at_us = route
+                    .last_sample_at_us
+                    .map(|time| (time - video_epoch).max(0));
+            }
+            let mut state_keys = route_states.clone();
+            for route in &mut state_keys {
+                route.last_sample_at_us = None;
+            }
+            if state_keys != prior_route_states {
+                audio_changes
+                    .push(serde_json::json!({"at_us": now, "resolved_routes": route_states}));
+                prior_route_states = state_keys;
+            }
             let mut s = stats.lock();
+            s.audio_routes = route_states;
             s.duration_seconds = now as f64 / 1_000_000.0;
             s.fps = (writer.frames - last_frames) as f64 / elapsed;
             s.encoded_frames = writer.frames;
@@ -469,17 +773,24 @@ fn run(
             s.peak_memory_bytes = memory;
             if performance_samples.len() == 1800 {
                 performance_samples.pop_front();
+                performance_samples_discarded = performance_samples_discarded.saturating_add(1);
             }
             performance_samples.push_back(serde_json::json!({
                 "wall_seconds": began.elapsed().as_secs_f64(), "media_seconds": s.duration_seconds,
                 "cpu_percent": cpu, "peak_memory_bytes": memory, "fps": s.fps,
                 "capture_fps": capture_fps, "captured_frames": captured,
                 "dropped_frames": s.dropped_frames, "video_queue": video_rx.len(), "audio_queue": audio_rx.len(),
+                "boundary_discarded_audio_chunks": boundary_discarded_audio_chunks,
+                "boundary_discarded_audio_frames": boundary_discarded_audio_frames,
                 "capture_metrics": capture_metrics.snapshot(),
-                "asr_pending_packets": writer.asr_pending_packets(), "loop_max_ms": loop_max_ms,
+                "asr_pending_packets": writer.asr_pending_packets(),
+                "audio_observer_dropped_packets": writer.audio_observer_drops(),
+                "audio_observers": writer.audio_observer_status(), "loop_max_ms": loop_max_ms,
                 "loop_iterations": loop_iterations,
                 "encode_max_ms": encode_max_ms, "preview_max_ms": preview_max_ms,
-                "audio_write_max_ms": audio_write_max_ms, "paused": clock.is_paused()
+                "audio_write_max_ms": audio_write_max_ms, "paused": clock.is_paused(),
+                "video_stages": writer.take_video_stage_timings(),
+                "preview_stage": preview_timing.take(), "audio_mix_encode_mux_stage": audio_timing.take()
             }));
             loop_max_ms = 0.;
             loop_iterations = 0;
@@ -507,8 +818,6 @@ fn run(
                     silent_audio_warned[i] = true;
                 }
             }
-            s.system_peak = peaks[0];
-            s.microphone_peak = peaks[1];
             peaks = [0.0; 2];
             if !config.audio_only
                 && !idle_warned
@@ -528,6 +837,7 @@ fn run(
         let paused = clock.is_paused();
         let now_us = (clock.now_us() - video_epoch).max(0);
         let mut timeout = Duration::from_secs(1).saturating_sub(tick.elapsed());
+        timeout = timeout.min(Duration::from_millis(40).saturating_sub(meter_tick.elapsed()));
         if !paused {
             if latest.is_some()
                 && let Some(next) = until_media_deadline(now_us, policy.next_due_us(&config))
@@ -549,6 +859,7 @@ fn run(
         );
     }
     stats.lock().state = RecordingState::Stopping;
+    let (_, was_paused, stop_generation) = clock.snapshot();
     clock.pause();
     let stop_us = (clock.now_us() - video_epoch).max(1);
     if let Some(capture) = capture.as_mut()
@@ -562,7 +873,7 @@ fn run(
     // An asynchronous backend may publish its final completed capture while
     // stopping. Keep it only when its media timestamp can follow the last frame.
     let mut tail = None;
-    for mut frame in video_rx.try_iter() {
+    for mut frame in video_rx.try_iter().filter(|_| !was_paused) {
         frame.pts_us = (frame.pts_us - video_epoch).clamp(0, stop_us.saturating_sub(1));
         if frame.pts_us * 90 / 1000 > writer.last_video_us * 90 / 1000 {
             tail = Some(frame);
@@ -579,6 +890,12 @@ fn run(
     }
     stats.lock().warnings.extend(warn_rx.try_iter());
     for mut chunk in audio_rx.try_iter() {
+        if was_paused || chunk.generation != stop_generation {
+            boundary_discarded_audio_chunks = boundary_discarded_audio_chunks.saturating_add(1);
+            boundary_discarded_audio_frames =
+                boundary_discarded_audio_frames.saturating_add((chunk.samples.len() / 2) as u64);
+            continue;
+        }
         mic.apply(&mut chunk);
         rebase_audio(&mut chunk, video_epoch);
         writer.audio(chunk);
@@ -595,10 +912,15 @@ fn run(
     let encoder_details = writer.video.as_ref().map(|v| v.details());
     let frames = writer.frames;
     let has_audio = writer.audio_cursor_us().is_some();
-    writer.finish(stop_us)?;
+    let final_audio_observers = writer.finish_with_observer_status(stop_us)?;
     crate::recover_file(&partial, &output)
         .context("Recording saved as partial media; finalization/recovery failed")?;
-    std::fs::remove_file(&partial)?;
+    if let Err(error) = std::fs::remove_file(&partial) {
+        stats.lock().warnings.push(format!(
+            "录制已保存，但临时录制文件无法清理：{}：{error}",
+            partial.display()
+        ));
+    }
     if config.audio_only {
         stats.lock().audio_output = Some(output.clone());
     } else if config.separate_audio && has_audio {
@@ -612,15 +934,33 @@ fn run(
         }
     }
     let final_bytes = std::fs::metadata(&output)?.len();
+    let output_media = match crate::inspect_output(&output) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            stats
+                .lock()
+                .warnings
+                .push(format!("录制媒体已保存，但无法读取媒体详情：{error:#}"));
+            None
+        }
+    };
     let snapshot = {
         let mut s = stats.lock();
         s.state = RecordingState::Finished;
         s.duration_seconds = stop_us as f64 / 1_000_000.0;
         s.encoded_frames = frames;
         s.dropped_frames = dropped.load(Ordering::Relaxed);
-        s.fps = frames as f64 / s.duration_seconds;
+        s.fps = if s.duration_seconds > 0. {
+            frames as f64 / s.duration_seconds
+        } else {
+            0.
+        };
         s.bytes = final_bytes;
-        s.bitrate_kbps = final_bytes as f64 * 8.0 / 1000.0 / s.duration_seconds;
+        s.bitrate_kbps = if s.duration_seconds > 0. {
+            final_bytes as f64 * 8.0 / 1000.0 / s.duration_seconds
+        } else {
+            0.
+        };
         s.av_offset_ms = if has_audio && !config.audio_only {
             container_av_offset(&output).ok()
         } else {
@@ -632,13 +972,63 @@ fn run(
         }
         s.clone()
     };
-    let report = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "config": config, "stats": snapshot, "encoder_options": encoder_options, "encoder_details": encoder_details, "output_media":crate::inspect_output(&output)?,
+    let report = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "meeting_id": recording_meeting_id, "recording_started_unix_ms": recording_started_unix_ms, "recording_start_basis": "wall clock observed at media timeline origin", "frame_rate_valid": !config.audio_only && snapshot.duration_seconds > 0.0, "bitrate_valid": snapshot.duration_seconds > 0.0, "config": config, "stats": snapshot, "encoder_options": encoder_options, "encoder_details": encoder_details, "output_media":output_media,
         "pixel_format": if config.audio_only { None } else { Some("8-bit 4:2:0 BT.709 SDR") }, "time_base": if config.audio_only { "1/48000" } else { "1/90000" }, "rate_control": if config.audio_only { "AAC bitrate" } else if snapshot.encoder.ends_with("_qsv") { "ICQ (no hard VBV cap)" } else { "quality with encoder-specific rate control" },
-        "audio_changes": audio_changes, "capture_metrics": capture_metrics.snapshot(), "performance_samples": performance_samples, "performance_sample_note": "last 1800 one-second samples; capture counters and maxima are cumulative; copy_submit is CPU submission time, not GPU completion; loop_max_ms excludes waits; timings do not measure UI/cursor latency", "gpu_usage": "unavailable", "capture_path": capture_path, "av_offset_definition": "audio stream end minus video stream end; does not measure perceptual synchronization" });
-    std::fs::write(
-        output.with_extension("recording.json"),
-        serde_json::to_vec_pretty(&report)?,
-    )?;
+        "audio_changes": audio_changes, "capture_metrics": capture_metrics.snapshot(), "performance_samples": performance_samples,
+        "boundary_discarded_audio_chunks": boundary_discarded_audio_chunks,
+        "boundary_discarded_audio_frames": boundary_discarded_audio_frames,
+        "boundary_discard_note": "recorder queue only; excludes capture-side drops and route reconfiguration discards; frames are stereo sample frames at 48 kHz",
+        "performance_samples_discarded": performance_samples_discarded, "audio_observers_final": final_audio_observers,
+        "performance_sample_note": "last 1800 one-second samples; capture and observer counters are cumulative; final observer snapshot includes final audio dispatch and queue occupancy at writer close, not proof of consumer completion; observer drops are not recorded-media drops; stage p95 is a histogram bucket upper bound; encoder submit does not measure hardware completion; copy_submit is CPU submission time, not GPU completion; loop_max_ms excludes waits; timings do not measure UI/cursor latency", "gpu_usage": "unavailable", "capture_path": capture_path, "av_offset_definition": "audio stream end minus video stream end; does not measure perceptual synchronization" });
+    let report_path = output.with_extension("recording.json");
+    let report_bytes = serde_json::to_vec_pretty(&report)?;
+    if let Err(error) = atomic_create_bytes(&report_path, &report_bytes) {
+        // A directory sync can fail after publication. Confirm the exact
+        // file before attempting that sync again; never adopt another report.
+        let identical = (|| -> Result<bool> {
+            use std::io::Read;
+            let before = std::fs::symlink_metadata(&report_path)?;
+            anyhow::ensure!(
+                before.is_file()
+                    && !before.file_type().is_symlink()
+                    && before.len() == report_bytes.len() as u64,
+                "已有报告不是匹配的普通文件"
+            );
+            let mut file = open_regular_file_for_read(&report_path)?;
+            let identity = same_file::Handle::from_file(file.try_clone()?)?;
+            let opened = file.metadata()?;
+            anyhow::ensure!(
+                opened.len() == before.len() && opened.modified()? == before.modified()?,
+                "报告打开前发生变化"
+            );
+            let mut existing = Vec::new();
+            (&mut file)
+                .take(report_bytes.len() as u64 + 1)
+                .read_to_end(&mut existing)?;
+            let read_after = file.metadata()?;
+            let after = std::fs::symlink_metadata(&report_path)?;
+            anyhow::ensure!(
+                after.is_file()
+                    && !after.file_type().is_symlink()
+                    && before.len() == after.len()
+                    && before.modified()? == after.modified()?
+                    && opened.len() == read_after.len()
+                    && opened.modified()? == read_after.modified()?
+                    && identity
+                        == same_file::Handle::from_file(open_regular_file_for_read(&report_path)?)?,
+                "报告在核对期间发生变化"
+            );
+            Ok(existing == report_bytes)
+        })()
+        .unwrap_or(false);
+        if !identical {
+            return Err(error.context(
+                "录制媒体已保存，但录制报告发布或持久化未确认；请检查会议目录，现有报告不会被覆盖",
+            ));
+        }
+        sync_parent_directory(&report_path)
+            .context("录制媒体和报告已写入，但报告目录同步未确认")?;
+    }
     Ok(())
 }
 fn container_av_offset(path: &Path) -> Result<f64> {

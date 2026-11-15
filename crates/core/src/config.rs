@@ -6,6 +6,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Compile-time identity: the development application never reads production
+/// settings merely because it was launched from Finder or a different shell.
+pub const fn app_name() -> &'static str {
+    if cfg!(feature = "dev-profile") {
+        "OpenCap Dev"
+    } else {
+        "OpenCap"
+    }
+}
+
+pub const fn is_dev_profile() -> bool {
+    cfg!(feature = "dev-profile")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TranscriptionLanguage {
     #[default]
@@ -144,6 +158,17 @@ pub struct RecordingConfig {
     pub transcription_punctuation: bool,
     pub live_asr_model: LiveAsrModel,
     pub offline_asr_model: OfflineAsrModel,
+    /// Explicit opt-in; a trusted local NeMo library is never downloaded or
+    /// loaded automatically. Model bytes are verified before initialization.
+    pub online_speakers: bool,
+    pub online_speaker_library: Option<PathBuf>,
+    pub online_speaker_model: Option<PathBuf>,
+    pub semantic_embedding_model: Option<String>,
+    /// User-selected visual density in the meeting library.
+    pub meeting_list_compact: bool,
+    pub meeting_media_on_right: bool,
+    /// Explicitly reduce interface animation, independent of capture settings.
+    pub reduce_motion: bool,
     pub show_floating_controls: bool,
     pub show_capture_border: bool,
     pub border_mode: BorderMode,
@@ -170,8 +195,14 @@ pub struct RecordingConfig {
 impl Default for RecordingConfig {
     fn default() -> Self {
         let output_dir = directories::UserDirs::new()
-            .and_then(|d| d.video_dir().map(|p| p.join("OpenCap")))
-            .unwrap_or_else(|| PathBuf::from("recordings"));
+            .and_then(|d| d.video_dir().map(|p| p.join(app_name())))
+            .unwrap_or_else(|| {
+                PathBuf::from(if is_dev_profile() {
+                    "recordings-dev"
+                } else {
+                    "recordings"
+                })
+            });
         Self {
             target: CaptureTarget::Monitor(0),
             audio_only: false,
@@ -190,10 +221,20 @@ impl Default for RecordingConfig {
             realtime_transcription: true,
             transcription_hotwords: "录屏,语音转录,会议纪要,实时字幕".into(),
             transcription_language: TranscriptionLanguage::default(),
-            transcription_context_revision: false,
+            // Live text stays responsive; the selected file model reviews each
+            // finished sentence and replaces it. Missing review model simply
+            // leaves the streaming text unchanged.
+            transcription_context_revision: true,
             transcription_punctuation: true,
             live_asr_model: LiveAsrModel::Auto,
             offline_asr_model: OfflineAsrModel::SenseVoice,
+            online_speakers: false,
+            online_speaker_library: None,
+            online_speaker_model: None,
+            semantic_embedding_model: None,
+            meeting_list_compact: false,
+            meeting_media_on_right: false,
+            reduce_motion: false,
             show_floating_controls: false,
             show_capture_border: !cfg!(target_os = "linux"),
             border_mode: BorderMode::OnStart,
@@ -224,8 +265,6 @@ impl RecordingConfig {
         self.adaptive = true;
         self.fast_software_encoding = true;
         self.prefer_h264 = true;
-        self.show_recording_preview = false;
-        self.realtime_transcription = false;
         self.preset = Preset::Custom;
     }
 
@@ -319,15 +358,20 @@ impl RecordingConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(tmp, path).context("Saving configuration")
+        crate::meeting_rename::atomic_bytes(path, &serde_json::to_vec_pretty(self)?)
+            .context("Saving configuration")
     }
 }
 pub fn config_path() -> PathBuf {
-    directories::ProjectDirs::from("org", "OpenCap", "OpenCap")
+    directories::ProjectDirs::from("org", "OpenCap", app_name())
         .map(|d| d.config_local_dir().join("settings.json"))
-        .unwrap_or_else(|| PathBuf::from("settings.json"))
+        .unwrap_or_else(|| {
+            PathBuf::from(if is_dev_profile() {
+                "opencap-dev/settings.json"
+            } else {
+                "settings.json"
+            })
+        })
 }
 
 #[cfg(test)]
@@ -361,8 +405,8 @@ mod border_tests {
         assert!(config.adaptive);
         assert!(config.fast_software_encoding);
         assert!(config.prefer_h264);
-        assert!(!config.show_recording_preview);
-        assert!(!config.realtime_transcription);
+        assert!(config.show_recording_preview);
+        assert!(config.realtime_transcription);
         assert_eq!(
             (config.quality, config.codec, config.microphone),
             (20, Codec::Hevc, true)
@@ -371,7 +415,7 @@ mod border_tests {
         let loaded: RecordingConfig =
             serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
         assert_eq!(loaded.max_fps, 10);
-        assert!(!loaded.realtime_transcription);
+        assert!(loaded.realtime_transcription);
         config.max_fps = 5;
         config.reduce_recording_load();
         assert_eq!(config.max_fps, 5);
@@ -383,6 +427,7 @@ mod border_tests {
         assert!(!old.prefer_h264);
         assert!(!old.experimental_async_wgc);
         assert_eq!(old.live_asr_model, LiveAsrModel::Auto);
+        assert!(old.transcription_context_revision);
         assert_eq!(old.offline_asr_model, OfflineAsrModel::SenseVoice);
         assert_eq!(old.transcription_language, TranscriptionLanguage::Chinese);
         for language in TranscriptionLanguage::ALL {

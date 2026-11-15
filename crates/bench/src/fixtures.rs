@@ -208,6 +208,7 @@ pub fn run(
             })
             .collect();
         writer.audio(AudioChunk {
+            generation: 0,
             kind: AudioKind::System,
             pts_us,
             samples,

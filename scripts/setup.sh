@@ -10,7 +10,7 @@ for tool in cargo pkg-config clang; do
   fi
 done
 
-if ! pkg-config --exists libavcodec libavformat libavutil libswscale libswresample 2>/dev/null; then
+if ! pkg-config --exists libavcodec libavformat libavfilter libavutil libswscale libswresample 2>/dev/null; then
   echo "Missing FFmpeg development libraries visible through pkg-config." >&2
   case "$platform" in
     Darwin) echo "Install with: brew install ffmpeg pkgconf" >&2 ;;
@@ -32,6 +32,10 @@ case "$platform" in
     echo "macOS backend: ScreenCaptureKit + CoreAudio + VideoToolbox (macOS 13+)."
     ;;
   Linux)
+    if ! pkg-config --exists alsa 2>/dev/null; then
+      echo "Missing ALSA development library (install libasound2-dev)." >&2
+      missing=1
+    fi
     echo "Linux backend: X11 + PulseAudio / PipeWire-Pulse. Wayland: audio and documents only."
     echo "For UOS-compatible builds use scripts/linux/Dockerfile (glibc 2.28); see docs/build-and-linux.md."
     ;;

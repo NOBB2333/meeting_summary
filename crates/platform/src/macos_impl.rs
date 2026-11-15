@@ -1,3 +1,4 @@
+use crate::audio_state::RouteTelemetry;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use opencap_core::*;
@@ -19,6 +20,7 @@ unsafe extern "C" {
     fn oc_free(pointer: *mut c_void);
     fn oc_sources() -> *mut c_char;
     fn oc_devices() -> *mut c_char;
+    fn oc_default_microphone() -> *mut c_char;
     fn oc_microphone_authorized() -> bool;
     fn oc_start(
         input: *const c_char,
@@ -27,6 +29,8 @@ unsafe extern "C" {
         error: *mut *mut c_char,
     ) -> *mut c_void;
     fn oc_stop(handle: *mut c_void, microphone: bool);
+    fn oc_mic_running(handle: *mut c_void) -> bool;
+    fn oc_mic_device(handle: *mut c_void) -> *mut c_char;
     fn oc_window(view: isize, action: i32, value: bool) -> bool;
     fn oc_window_id(view: isize) -> isize;
     fn oc_window_region(view: isize) -> *mut c_char;
@@ -157,10 +161,19 @@ struct CaptureContext {
     clock: RecordingClock,
     video: Option<VideoCaptureChannel>,
     audio: Option<Sender<AudioChunk>>,
+    /// When present, suppress audio until the route's actual device has been verified.
+    audio_allowed: Option<Arc<AtomicBool>>,
     error: Sender<String>,
     failed: Arc<AtomicBool>,
     dropped_audio: Arc<AtomicU64>,
     timeline: Mutex<AudioTimeline>,
+    telemetry: Option<Arc<RouteTelemetry>>,
+}
+struct AudioGate(Arc<AtomicBool>);
+impl Drop for AudioGate {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 unsafe extern "C" fn capture_callback(
     user: *mut c_void,
@@ -185,10 +198,11 @@ unsafe extern "C" fn capture_callback(
         }
         return;
     }
-    if data.is_null() || state.clock.is_paused() {
+    let (now_us, paused, callback_generation) = state.clock.snapshot();
+    if data.is_null() || paused {
         return;
     }
-    let pts_us = (state.clock.now_us() - latency.clamp(0, 2_000_000)).max(0);
+    let pts_us = (now_us - latency.clamp(0, 2_000_000)).max(0);
     if kind == 0 {
         let Some((tx, rx, dropped, metrics)) = &state.video else {
             return;
@@ -212,20 +226,40 @@ unsafe extern "C" fn capture_callback(
             }),
         };
         metrics.record_readback(count, started.elapsed());
+        let (_, paused, current_generation) = state.clock.snapshot();
+        if paused || current_generation != callback_generation {
+            return;
+        }
         if let Err(crossbeam_channel::TrySendError::Full(frame)) = tx.try_send(frame) {
             let _ = rx.try_recv();
             dropped.fetch_add(1, Ordering::Relaxed);
             let _ = tx.try_send(frame);
         }
     } else if let Some(tx) = &state.audio {
-        let Some(pts_us) = state
-            .timeline
-            .lock()
-            .timestamp(&state.clock, latency, count / 2)
+        if state.failed.load(Ordering::Acquire)
+            || state
+                .audio_allowed
+                .as_ref()
+                .is_some_and(|allowed| !allowed.load(Ordering::Acquire))
+        {
+            return;
+        }
+        let Some((pts_us, generation)) =
+            state
+                .timeline
+                .lock()
+                .timestamp_with_generation(&state.clock, latency, count / 2)
         else {
             return;
         };
+        if generation != callback_generation {
+            return;
+        }
+        if let Some(telemetry) = &state.telemetry {
+            telemetry.sample(pts_us, generation);
+        }
         let chunk = AudioChunk {
+            generation,
             kind: if kind == 1 {
                 AudioKind::System
             } else {
@@ -330,10 +364,12 @@ pub fn start_capture(
             clock,
             video: Some((tx, rx, dropped, metrics)),
             audio: None,
+            audio_allowed: None,
             error: errors,
             failed: failed.clone(),
             dropped_audio: Arc::new(AtomicU64::new(0)),
             timeline: Mutex::new(AudioTimeline::default()),
+            telemetry: None,
         },
     )?;
     Ok(MacCapture {
@@ -346,6 +382,7 @@ pub fn start_capture(
 struct AudioRoute {
     kind: AudioKind,
     device: Option<String>,
+    telemetry: Arc<RouteTelemetry>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -364,15 +401,43 @@ pub struct MacAudio {
     warnings: Sender<String>,
 }
 impl MacAudio {
-    pub fn reconfigure(&mut self, routing: &AudioRouting) {
+    pub fn clear_sample_times(&self) {
+        for route in &self.routes {
+            route.telemetry.clear_sample();
+        }
+    }
+    pub fn route_status(&self) -> Vec<AudioRouteStatus> {
+        let generation = self.clock.snapshot().2;
         self.routes
-            .retain(|r| routing.enabled(r.kind) && routing.device(r.kind) == &r.device);
+            .iter()
+            .map(|route| {
+                if route
+                    .worker
+                    .as_ref()
+                    .is_none_or(|worker| worker.is_finished())
+                {
+                    route.telemetry.stopped_snapshot(generation)
+                } else {
+                    route.telemetry.snapshot(generation)
+                }
+            })
+            .collect()
+    }
+    pub fn reconfigure(&mut self, routing: &AudioRouting) {
+        self.routes.retain(|r| {
+            routing.enabled(r.kind)
+                && routing.device(r.kind) == &r.device
+                && r.worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
+        });
         for kind in [AudioKind::System, AudioKind::Microphone] {
             if !routing.enabled(kind) || self.routes.iter().any(|r| r.kind == kind) {
                 continue;
             }
             let device = routing.device(kind).clone();
             let stop = Arc::new(AtomicBool::new(false));
+            let telemetry = Arc::new(RouteTelemetry::new(kind, device.clone()));
             let (worker_stop, worker_device, clock, tx, warnings) = (
                 stop.clone(),
                 device.clone(),
@@ -380,43 +445,143 @@ impl MacAudio {
                 self.tx.clone(),
                 self.warnings.clone(),
             );
-            let worker = thread::spawn(move || {
+            let worker_telemetry = telemetry.clone();
+            let worker = thread::Builder::new().name("opencap-macos-audio-supervisor".into()).spawn(move || {
                 let name = if kind == AudioKind::System {
                     "系统声音"
                 } else {
                     "麦克风"
                 };
-                let options = json!({"audio_only": kind == AudioKind::System, "microphone": kind == AudioKind::Microphone, "device": worker_device});
-                let failed = Arc::new(AtomicBool::new(false));
-                match NativeCapture::start(
-                    options,
-                    CaptureContext {
-                        clock,
-                        video: None,
-                        audio: Some(tx),
-                        error: warnings.clone(),
-                        failed: failed.clone(),
-                        dropped_audio: Arc::new(AtomicU64::new(0)),
-                        timeline: Mutex::new(AudioTimeline::default()),
-                    },
-                ) {
-                    Ok(_native) => {
+                let mut last_error = String::new();
+                while !worker_stop.load(Ordering::Acquire) {
+                    worker_telemetry.starting();
+                    let began = Instant::now();
+                    let result = (|| -> Result<()> {
+                        anyhow::ensure!(kind != AudioKind::System
+                            || worker_device.as_deref().is_none_or(|id| id == "system"),
+                            "macOS 系统声音仅支持采集所有输出设备，请重新选择来源");
+                        // Resolve the current default explicitly so the actual
+                        // microphone is known and a later default change is detectable.
+                        let target = if kind == AudioKind::Microphone && worker_device.is_none() {
+                            let info = native_json(unsafe { oc_default_microphone() })?;
+                            Some(
+                                info["id"]
+                                    .as_str()
+                                    .context("默认麦克风缺少设备标识")?
+                                    .to_owned(),
+                            )
+                        } else {
+                            worker_device.clone()
+                        };
+                        let options = json!({"audio_only": kind == AudioKind::System, "microphone": kind == AudioKind::Microphone, "device": target});
+                        let failed = Arc::new(AtomicBool::new(false));
+                        let audio_allowed = Arc::new(AtomicBool::new(false));
+                        let native = NativeCapture::start(
+                            options,
+                            CaptureContext {
+                                clock: clock.clone(),
+                                video: None,
+                                audio: Some(tx.clone()),
+                                audio_allowed: Some(audio_allowed.clone()),
+                                error: warnings.clone(),
+                                failed: failed.clone(),
+                                dropped_audio: Arc::new(AtomicU64::new(0)),
+                                timeline: Mutex::new(AudioTimeline::default()),
+                                telemetry: Some(worker_telemetry.clone()),
+                            },
+                        )?;
+                        // Drop the gate before stopping the native capture so
+                        // callbacks during teardown cannot enter the mixer.
+                        let _gate = AudioGate(audio_allowed.clone());
+                        let resolved = if kind == AudioKind::Microphone {
+                            let info = native_json(unsafe { oc_mic_device(native.handle) })?;
+                            let id = info["id"]
+                                .as_str()
+                                .context("实际麦克风缺少标识")?
+                                .to_owned();
+                            anyhow::ensure!(
+                                target.as_deref() == Some(id.as_str()),
+                                "实际麦克风与请求的设备不一致"
+                            );
+                            let name = info["name"].as_str().unwrap_or(&id).to_owned();
+                            (id, name)
+                        } else {
+                            (
+                                "system:all-outputs".into(),
+                                "系统声音（所有输出设备）".into(),
+                            )
+                        };
+                        worker_telemetry.opened(resolved.0.clone(), resolved.1);
+                        audio_allowed.store(true, Ordering::Release);
+                        let mut check = Instant::now();
                         while !worker_stop.load(Ordering::Acquire)
                             && !failed.load(Ordering::Acquire)
                         {
-                            thread::sleep(Duration::from_millis(10));
+                            if kind == AudioKind::Microphone
+                                && check.elapsed() >= Duration::from_secs(2)
+                            {
+                                check = Instant::now();
+                                anyhow::ensure!(
+                                    unsafe { oc_mic_running(native.handle) },
+                                    "麦克风采集已停止"
+                                );
+                                if worker_device.is_none() {
+                                    let info = native_json(unsafe { oc_default_microphone() })?;
+                                    anyhow::ensure!(
+                                        info["id"].as_str() == Some(resolved.0.as_str()),
+                                        "系统默认麦克风已更换"
+                                    );
+                                } else {
+                                    anyhow::ensure!(
+                                        audio_devices()?
+                                            .iter()
+                                            .any(|device| device.kind == kind
+                                                && device.id == resolved.0),
+                                        "所选麦克风已断开"
+                                    );
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(50));
                         }
+                        if failed.load(Ordering::Acquire) {
+                            anyhow::bail!("采集流报告失败");
+                        }
+                        Ok(())
+                    })();
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
                     }
-                    Err(e) => {
-                        let _ = warnings.try_send(format!(
-                            "{name}不可用，该路补静音；请检查权限或重新开启：{e:#}"
-                        ));
+                    let error = result
+                        .err()
+                        .map(|e| format!("{e:#}"))
+                        .unwrap_or_else(|| "采集流意外结束".into());
+                    worker_telemetry.waiting(error.clone());
+                    if error != last_error || began.elapsed() >= Duration::from_secs(30) {
+                        let _ = warnings
+                            .try_send(format!("{name}暂不可用，该路补静音并自动重试：{error}"));
+                        last_error = error;
+                    }
+                    for _ in 0..20 {
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
             });
+            let worker = match worker {
+                Ok(worker) => worker,
+                Err(error) => {
+                    let _ = self
+                        .warnings
+                        .try_send(format!("无法启动声音采集线程，将重试：{error}"));
+                    continue;
+                }
+            };
             self.routes.push(AudioRoute {
                 kind,
                 device,
+                telemetry,
                 stop,
                 worker: Some(worker),
             });
@@ -453,28 +618,39 @@ pub struct AudioMonitor {
     audio: MacAudio,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    state: Arc<Mutex<[(f32, Instant); 2]>>,
+    state: Arc<Mutex<[(AudioMeter, AudioMeter); 2]>>,
     denoise: Arc<AtomicBool>,
     warnings: Receiver<String>,
 }
 impl AudioMonitor {
+    /// Returns false if the shared meter consumer exited and must be rebuilt.
+    pub fn maintain(&mut self, routing: &AudioRouting, _denoise: bool) -> bool {
+        if self
+            .worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+        {
+            return false;
+        }
+        self.audio.reconfigure(routing);
+        true
+    }
     pub fn set_routing(&mut self, routing: &AudioRouting, denoise: bool) {
         self.denoise.store(denoise, Ordering::Release);
         self.audio.reconfigure(routing);
-        let mut state = self.state.lock();
-        for (i, kind) in [AudioKind::System, AudioKind::Microphone]
-            .into_iter()
-            .enumerate()
-        {
-            if !routing.enabled(kind) {
-                state[i].0 = 0.0;
-            }
-        }
+        *self.state.lock() = [
+            (AudioMeter::default(), AudioMeter::default()),
+            (AudioMeter::default(), AudioMeter::default()),
+        ];
     }
-    pub fn peaks(&self) -> (f32, f32) {
+    pub fn levels(&self) -> (AudioRouteLevels, AudioRouteLevels) {
         let s = self.state.lock();
-        let peak = |i: usize| s[i].0 * (-s[i].1.elapsed().as_secs_f32() / 0.35).exp();
-        (peak(0), peak(1))
+        let now = Instant::now();
+        let route = |i: usize| AudioRouteLevels {
+            input: s[i].0.level(now),
+            processed: s[i].1.level(now),
+        };
+        (route(0), route(1))
     }
     pub fn take_warning(&self) -> Option<String> {
         self.warnings.try_recv().ok()
@@ -496,37 +672,38 @@ pub fn start_audio_monitor(routing: &AudioRouting, denoise: bool) -> Result<Audi
     );
     let (tx, rx) = bounded::<AudioChunk>(256);
     let (warnings, warning_rx) = bounded(16);
-    let state = Arc::new(Mutex::new([(0.0, Instant::now()); 2]));
+    let state = Arc::new(Mutex::new([
+        (AudioMeter::default(), AudioMeter::default()),
+        (AudioMeter::default(), AudioMeter::default()),
+    ]));
     let stop = Arc::new(AtomicBool::new(false));
     let (shared, stopping) = (state.clone(), stop.clone());
     let denoise = Arc::new(AtomicBool::new(denoise));
     let worker_denoise = denoise.clone();
-    let worker = thread::spawn(move || {
-        let mut mic = MicDenoiser::new(48_000);
-        let mut enabled = worker_denoise.load(Ordering::Acquire);
-        while !stopping.load(Ordering::Acquire) {
-            if let Ok(mut chunk) = rx.recv_timeout(Duration::from_millis(50)) {
-                let next = worker_denoise.load(Ordering::Acquire);
-                if next != enabled {
-                    enabled = next;
-                    mic = MicDenoiser::new(48_000);
+    let worker = thread::Builder::new()
+        .name("opencap-macos-meter".into())
+        .spawn(move || {
+            let mut mic = MicDenoiser::new(48_000);
+            let mut enabled = worker_denoise.load(Ordering::Acquire);
+            while !stopping.load(Ordering::Acquire) {
+                if let Ok(mut chunk) = rx.recv_timeout(Duration::from_millis(50)) {
+                    let input = AudioLevel::measure(&chunk.samples);
+                    let next = worker_denoise.load(Ordering::Acquire);
+                    if next != enabled {
+                        enabled = next;
+                        mic = MicDenoiser::new(48_000);
+                    }
+                    if enabled && chunk.kind == AudioKind::Microphone {
+                        mic.process(&mut chunk.samples);
+                    }
+                    let index = usize::from(chunk.kind == AudioKind::Microphone);
+                    let mut s = shared.lock();
+                    let now = Instant::now();
+                    s[index].0.observe(input, now);
+                    s[index].1.update(&chunk.samples, now);
                 }
-                if enabled && chunk.kind == AudioKind::Microphone {
-                    mic.process(&mut chunk.samples);
-                }
-                let index = usize::from(chunk.kind == AudioKind::Microphone);
-                let peak = chunk
-                    .samples
-                    .iter()
-                    .filter(|v| v.is_finite())
-                    .fold(0.0f32, |p, v| p.max(v.abs().min(1.0)));
-                let mut s = shared.lock();
-                s[index].0 =
-                    peak.max(s[index].0 * (-s[index].1.elapsed().as_secs_f32() / 0.35).exp());
-                s[index].1 = Instant::now();
             }
-        }
-    });
+        })?;
     let config = RecordingConfig {
         system_audio: routing.system_audio,
         microphone: routing.microphone,
@@ -545,27 +722,76 @@ pub fn start_audio_monitor(routing: &AudioRouting, denoise: bool) -> Result<Audi
     })
 }
 fn audio_probe(kind: AudioKind, device: Option<String>, seconds: u64) -> Result<String> {
-    let (tx, rx) = unbounded();
+    anyhow::ensure!(
+        kind != AudioKind::System || device.as_deref().is_none_or(|id| id == "system"),
+        "macOS 系统声音仅支持采集所有输出设备，请重新选择来源"
+    );
+    let follows_default = kind == AudioKind::Microphone && device.is_none();
+    let target = if follows_default {
+        let info = native_json(unsafe { oc_default_microphone() })?;
+        Some(
+            info["id"]
+                .as_str()
+                .context("默认麦克风缺少设备标识")?
+                .to_owned(),
+        )
+    } else {
+        device
+    };
+    let (tx, rx) = bounded(256);
     let (warnings, errors) = unbounded();
     let failed = Arc::new(AtomicBool::new(false));
-    let _native = NativeCapture::start(
-        json!({"audio_only": kind == AudioKind::System, "microphone": kind == AudioKind::Microphone, "device": device}),
+    let audio_allowed = Arc::new(AtomicBool::new(false));
+    let native = NativeCapture::start(
+        json!({"audio_only": kind == AudioKind::System, "microphone": kind == AudioKind::Microphone, "device": target}),
         CaptureContext {
             clock: RecordingClock::new(),
             video: None,
             audio: Some(tx),
+            audio_allowed: Some(audio_allowed.clone()),
             error: warnings,
-            failed,
+            failed: failed.clone(),
             dropped_audio: Arc::new(AtomicU64::new(0)),
             timeline: Mutex::new(AudioTimeline::default()),
+            telemetry: None,
         },
     )?;
+    let _gate = AudioGate(audio_allowed.clone());
+    if kind == AudioKind::Microphone {
+        let info = native_json(unsafe { oc_mic_device(native.handle) })?;
+        anyhow::ensure!(
+            info["id"].as_str() == target.as_deref(),
+            "实际麦克风与请求的设备不一致"
+        );
+    }
+    audio_allowed.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut check = Instant::now();
     let (mut packets, mut frames, mut nonfinite, mut peak, mut sum) =
         (0u64, 0u64, 0u64, 0.0f32, 0.0f64);
     while Instant::now() < deadline {
         if let Ok(error) = errors.try_recv() {
             anyhow::bail!("{error}");
+        }
+        if failed.load(Ordering::Acquire) {
+            anyhow::bail!("采集流报告失败");
+        }
+        if kind == AudioKind::Microphone && check.elapsed() >= Duration::from_secs(2) {
+            check = Instant::now();
+            anyhow::ensure!(unsafe { oc_mic_running(native.handle) }, "麦克风采集已停止");
+            if follows_default {
+                let info = native_json(unsafe { oc_default_microphone() })?;
+                anyhow::ensure!(
+                    info["id"].as_str() == target.as_deref(),
+                    "系统默认麦克风已更换"
+                );
+            } else {
+                anyhow::ensure!(
+                    audio_devices()?.iter().any(|device| device.kind == kind
+                        && Some(device.id.as_str()) == target.as_deref()),
+                    "所选麦克风已断开"
+                );
+            }
         }
         if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(50)) {
             packets += 1;

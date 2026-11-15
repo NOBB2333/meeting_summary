@@ -26,6 +26,7 @@ class PackageMacosTests(unittest.TestCase):
         binary = self.root / "target/release/opencap"
         binary.parent.mkdir(parents=True)
         binary.write_text("new executable")
+        binary.chmod(0o755)
 
     def fake_bundle(self, root, binary, staging, identity):
         staging.mkdir()

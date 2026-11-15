@@ -135,25 +135,103 @@ impl Normalizer {
 /// libswresample retains filter history and emits its tail before EOF.
 pub fn decode_file(
     path: &Path,
-    mut accept: impl FnMut(PcmAudio, Option<f64>) -> Result<()>,
+    accept: impl FnMut(PcmAudio, Option<f64>) -> Result<()>,
 ) -> Result<()> {
+    decode_file_with_info(path, accept).map(|_| ())
+}
+
+/// Properties reported by the decoder selected for this file. They describe
+/// stream selection and normalization, not word-level timing accuracy.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct DecodedMediaInfo {
+    pub audio_stream_index: usize,
+    pub time_base_num: i32,
+    pub time_base_den: i32,
+    pub container_origin_us: i64,
+    /// False means the container omitted a start time and zero was assumed.
+    pub container_origin_known: bool,
+    pub decoded_sample_rate: u32,
+    pub decoded_channels: u16,
+    pub output_sample_rate: u32,
+    pub output_channels: u16,
+    pub time_mapping: &'static str,
+}
+
+pub(crate) fn decode_file_with_info(
+    path: &Path,
+    accept: impl FnMut(PcmAudio, Option<f64>) -> Result<()>,
+) -> Result<DecodedMediaInfo> {
+    decode_file_with_expected_stream(path, None, accept)
+}
+
+/// Resolve an explicit track or the current default to its concrete index.
+pub(crate) fn select_audio_stream_index(path: &Path, expected: Option<u64>) -> Result<usize> {
+    ff::init()?;
+    let input = ff::format::input(path).context("无法读取音频或视频文件")?;
+    if let Some(expected) = expected {
+        let expected = usize::try_from(expected).context("历史音轨编号超出平台范围")?;
+        anyhow::ensure!(
+            input.streams().any(|stream| stream.index() == expected
+                && stream.parameters().medium() == ff::media::Type::Audio),
+            "历史音轨不存在或不是音频"
+        );
+        Ok(expected)
+    } else {
+        Ok(input
+            .streams()
+            .best(ff::media::Type::Audio)
+            .context("文件中没有音轨")?
+            .index())
+    }
+}
+
+pub(crate) fn decode_file_with_expected_stream(
+    path: &Path,
+    expected_stream: Option<u64>,
+    mut accept: impl FnMut(PcmAudio, Option<f64>) -> Result<()>,
+) -> Result<DecodedMediaInfo> {
     ff::init()?;
     let mut input = ff::format::input(path).context("无法读取音频或视频文件")?;
-    let stream = input
-        .streams()
-        .best(ff::media::Type::Audio)
-        .context("文件中没有音轨")?;
+    let stream = if let Some(expected) = expected_stream {
+        let index = usize::try_from(expected).context("历史音轨编号超出平台范围")?;
+        input
+            .streams()
+            .find(|stream| {
+                stream.index() == index && stream.parameters().medium() == ff::media::Type::Audio
+            })
+            .context("历史音轨不存在或不是音频")?
+    } else {
+        input
+            .streams()
+            .best(ff::media::Type::Audio)
+            .context("文件中没有音轨")?
+    };
     let index = stream.index();
+    if let Some(expected) = expected_stream {
+        anyhow::ensure!(
+            u64::try_from(index).ok() == Some(expected),
+            "所选音轨与历史运行不一致，未开始解码"
+        );
+    }
     let tb = stream.time_base();
     let mut decoder = ff::codec::context::Context::from_parameters(stream.parameters())?
         .decoder()
         .audio()?;
     let duration = (input.duration() > 0).then_some(input.duration() as f64 / 1e6);
     let origin = unsafe { (*input.as_ptr()).start_time };
-    let origin = if origin == ff::ffi::AV_NOPTS_VALUE {
-        0
-    } else {
-        origin
+    let container_origin_known = origin != ff::ffi::AV_NOPTS_VALUE;
+    let origin = if !container_origin_known { 0 } else { origin };
+    let info = DecodedMediaInfo {
+        audio_stream_index: index,
+        time_base_num: tb.numerator(),
+        time_base_den: tb.denominator(),
+        container_origin_us: origin,
+        container_origin_known,
+        decoded_sample_rate: decoder.rate(),
+        decoded_channels: decoder.channels(),
+        output_sample_rate: 16_000,
+        output_channels: 1,
+        time_mapping: "container_start_resampled_discontinuities_v2",
     };
     let layout = if decoder.channel_layout().is_empty() {
         ff::ChannelLayout::default(decoder.channels() as i32)
@@ -170,6 +248,7 @@ pub fn decode_file(
     )?;
     let mut cursor = 0i64;
     let mut first = true;
+    let mut generation = 0u64;
     {
         let mut drain = |decoder: &mut ff::decoder::Audio| -> Result<()> {
             loop {
@@ -187,7 +266,46 @@ pub fn decode_file(
                 }
                 if let Some(pts) = decoded.timestamp() {
                     let pts = ff::Rescale::rescale(&pts, tb, (1, 16000)) - origin * 16 / 1000;
-                    if first || (pts - cursor).abs() > 1600 {
+                    if !first && pts.abs_diff(cursor) > 1600 {
+                        // Flush samples belonging to the old timeline before
+                        // moving the cursor. Otherwise filter history would
+                        // be mislabeled as audio after the discontinuity.
+                        loop {
+                            let mut tail = ff::frame::Audio::new(
+                                ff::format::Sample::F32(ff::format::sample::Type::Packed),
+                                4096,
+                                ff::ChannelLayout::MONO,
+                            );
+                            resampler.flush(&mut tail)?;
+                            if tail.samples() == 0 {
+                                break;
+                            }
+                            let samples = tail.plane::<f32>(0)[..tail.samples()].to_vec();
+                            let pts_us = cursor * 1000 / 16;
+                            cursor += samples.len() as i64;
+                            accept(
+                                PcmAudio {
+                                    pts_us,
+                                    sample_rate: 16000,
+                                    channels: 1,
+                                    source: opencap_core::AudioSource::ImportedMedia,
+                                    generation,
+                                    samples: samples.into(),
+                                },
+                                duration,
+                            )?;
+                        }
+                        resampler = ff::software::resampling::Context::get(
+                            decoder.format(),
+                            layout,
+                            decoder.rate(),
+                            ff::format::Sample::F32(ff::format::sample::Type::Packed),
+                            ff::ChannelLayout::MONO,
+                            16000,
+                        )?;
+                        generation = generation.saturating_add(1);
+                        cursor = pts.max(0);
+                    } else if first {
                         cursor = pts.max(0);
                     }
                 }
@@ -209,7 +327,9 @@ pub fn decode_file(
                             pts_us,
                             sample_rate: 16000,
                             channels: 1,
-                            samples,
+                            source: opencap_core::AudioSource::ImportedMedia,
+                            generation,
+                            samples: samples.into(),
                         },
                         duration,
                     )?;
@@ -242,13 +362,15 @@ pub fn decode_file(
                 pts_us: cursor * 1000 / 16,
                 sample_rate: 16000,
                 channels: 1,
-                samples: samples.clone(),
+                source: opencap_core::AudioSource::ImportedMedia,
+                generation,
+                samples: samples.clone().into(),
             },
             duration,
         )?;
         cursor += samples.len() as i64;
     }
-    Ok(())
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -301,7 +423,9 @@ mod tests {
                             pts_us: start as i64 * 1000 / 48,
                             sample_rate: 48000,
                             channels: 2,
-                            samples,
+                            source: opencap_core::AudioSource::ImportedMedia,
+                            generation: 0,
+                            samples: samples.into(),
                         })
                         .unwrap(),
                 );

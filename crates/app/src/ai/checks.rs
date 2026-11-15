@@ -45,7 +45,8 @@ pub(crate) fn chat_benchmark(
             }
             entity.update(cx, |r, cx| {
                 for i in 0..150 {
-                    r.ai.history.conversation.push(opencap_asr::MinutesTurn { request: format!("历史要求 {i}"), reply: format!("历史回复 {i}：完整正文仍然可以阅读，{}", "这是一段用于验证历史滚动的内容。".repeat(10)) });
+                    r.ai.history.conversation.push(opencap_asr::MinutesTurn {
+                        extra: Default::default(), request: format!("历史要求 {i}"), reply: format!("历史回复 {i}：完整正文仍然可以阅读，{}", "这是一段用于验证历史滚动的内容。".repeat(10)) });
                 }
                 r.ai.chat_dirty = true;
                 r.ai.chat_reset = true;

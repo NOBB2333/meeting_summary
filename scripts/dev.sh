@@ -11,11 +11,11 @@ fi
 
 case "$task" in
   build) command=(cargo build --workspace --locked) ;;
-  run) command=(cargo run -p opencap --locked) ;;
+  run) command=(cargo run -p opencap --features dev-profile --locked) ;;
   test) command=(cargo test --workspace --locked) ;;
   check) command=(cargo check --workspace --locked) ;;
   lint) command=(cargo clippy --workspace --all-targets --all-features --locked) ;;
-  bench) command=(cargo run -p opencap-bench --locked --) ;;
+  bench) command=(cargo run -p opencap-bench --features dev-profile --locked --) ;;
   *)
     echo "Usage: scripts/dev.sh {build|run|test|check|lint|bench} [arguments...]" >&2
     exit 2
@@ -27,6 +27,11 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+# Keep feature-selected developer binaries separate from release artifacts.
+if [[ "$task" == run || "$task" == bench ]]; then
+  export CARGO_TARGET_DIR="$root/target/opencap-dev"
+fi
+
 # A Windows FFmpeg SDK must never shadow Homebrew's native libraries.
 if [[ "$(uname -s)" == Darwin ]]; then
   # Rust 1.97's debuginfo stripping can produce a __LINKEDIT layout rejected by
@@ -35,7 +40,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
   if [[ -n "${FFMPEG_DIR:-}" && ! -f "$FFMPEG_DIR/lib/libavcodec.dylib" ]]; then
     unset FFMPEG_DIR
   fi
-  if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists libavcodec libavformat libavutil libswscale libswresample; then
+  if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists libavcodec libavformat libavfilter libavutil libswscale libswresample; then
     echo "Run scripts/setup.sh first (brew install ffmpeg pkgconf)." >&2
     exit 1
   fi
@@ -56,10 +61,10 @@ if [[ "$task" == run && "$(uname -s)" == Darwin ]]; then
       if [[ "$argument" == --release ]]; then run_profile=release; fi
     fi
   done
-  echo "OpenCap: building $run_profile and launching release/OpenCap.app (macOS permissions belong to the app bundle)."
-  cargo build -p opencap --locked "${build_arguments[@]}"
-  python3 "$root/scripts/package-macos.py" --profile "$run_profile" --no-build --output "$root/release/OpenCap.app"
-  exec open "$root/release/OpenCap.app" --args "${app_arguments[@]}"
+  echo "OpenCap Dev: building $run_profile and launching the isolated app bundle."
+  cargo build -p opencap --features dev-profile --locked "${build_arguments[@]}"
+  python3 "$root/scripts/package-macos.py" --dev --profile "$run_profile" --no-build --require-default
+  exec open "$root/release/OpenCap Dev.app" --args "${app_arguments[@]}"
 fi
 
 if [[ "$task" == run ]]; then

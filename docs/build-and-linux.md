@@ -28,6 +28,8 @@ flowchart LR
 
 用户确认目标是 Intel x86 / 统信 UOS，因此 Linux Actions 首先交付 x86_64 的 .deb 与便携 tar.gz。FFmpeg 固定 9.0.2 并校验 SHA256；ONNX Runtime 所需的较新 C++ ABI 使用私有的 conda-forge GCC 12.2 libstdc++（固定包与哈希），同样经 ELF 审计，不覆盖宿主运行库。Linux 当前优先保证软件 H.264 / AAC 路径，硬件编码和真实 UOS 设备性能仍需另行验证。
 
+内置播放使用 CPAL 的 Linux ALSA 输出；构建需要 `libasound2-dev`，使用 PulseAudio/PipeWire 默认路由的环境还需系统安装 `libasound2-plugins`。Debian 包声明运行依赖；便携包仍依赖宿主的 ALSA 配置及插件。该播放路径尚未完成 Linux 实机验收。
+
 云端验证另外发现：Rust 1.97 的去调试信息与旧 Apple 工具的 LINKEDIT 布局兼容问题，macOS Release 保留 Mach-O 布局且不预先移除签名，依赖改写后统一重签。Debian 10 NASM 太旧，构建固定 2.16.03 保留 SIMD；使用 Rust 自带 LLD 处理旧 binutils 不认识的属性。Windows 的 C++ 运行库原先借用了 runner 全局安装，现从 VS 可再发行目录捆绑两个 x64 DLL，并通过真实软件编码进程检查加载位置。
 
 图形验收与编译基线分离：Debian 10 容器验证 glibc 2.28 下的媒体、仅录音及暂停；配有 Mesa Vulkan / OpenGL 软件适配器的 Ubuntu 22 运行容器验证完整便携包、图形启动和实际绘制。验收截图必须出现应用内容，不能仅以进程存活或鼠标指针判断成功。实际发现软件 Vulkan 可以创建窗口却不显示内容，同环境 OpenGL 正常；项目内的 GPUI 渲染依赖补丁让 CPU 窗口渲染优先使用 OpenGL，硬件 GPU 与无窗口计算保留原排序，并用四项适配器选择测试约束范围。UOS 实机仍须有满足界面要求的 Vulkan / OpenGL 驱动。

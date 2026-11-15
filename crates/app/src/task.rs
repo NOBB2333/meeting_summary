@@ -25,19 +25,34 @@ impl TaskClock {
     pub fn has_run(&self) -> bool {
         self.started.is_some() || !self.elapsed.is_zero()
     }
+    pub fn clear_progress(&mut self) {
+        self.progress_base = None;
+        self.progress_latest = None;
+    }
     pub fn progress(&mut self, value: f64) {
         if !value.is_finite() {
             return;
         }
         let value = value.clamp(0., 1.);
         let now = Instant::now();
-        if let Some((previous, _)) = self.progress_latest {
+        if let Some((previous, previous_at)) = self.progress_latest {
             if value < previous {
                 // A new phase may restart at zero; don't carry its old speed over.
                 self.progress_base = None;
             } else if value == previous {
                 // Repeated progress events do not mean the task advanced.
                 return;
+            } else if now.duration_since(previous_at) > Duration::from_secs(15) {
+                // A resumed transfer needs new samples; a long stall must not
+                // be blended into an apparently precise remaining time.
+                self.progress_base = None;
+            } else if self
+                .progress_base
+                .is_some_and(|(_, began)| now.duration_since(began) >= Duration::from_secs(30))
+            {
+                // Bound the sampling horizon instead of carrying the initial
+                // network speed through a long download or recognition task.
+                self.progress_base = Some((previous, previous_at));
             }
         }
         if value > 0. && self.progress_base.is_none() {
@@ -60,9 +75,14 @@ impl TaskClock {
         if last >= 1. || last - first < 0.03 || seconds < 3. || self.stalled() {
             return None;
         }
-        Some(Duration::from_secs_f64(
-            (seconds * (1. - last) / (last - first)).min(86_400.),
-        ))
+        let predicted = seconds * (1. - last) / (last - first);
+        let remaining = predicted - updated.elapsed().as_secs_f64();
+        // Once an estimate has expired, wait for another advancement instead
+        // of showing zero while the task is still incomplete.
+        if !remaining.is_finite() || remaining <= 0. {
+            return None;
+        }
+        Some(Duration::from_secs_f64(remaining.min(86_400.)))
     }
 }
 
@@ -110,7 +130,8 @@ mod tests {
             progress_latest: Some((0.6, now)),
             elapsed: Duration::ZERO,
         };
-        assert_eq!(clock.remaining().unwrap().as_secs(), 8);
+        let remaining = clock.remaining().unwrap().as_secs_f64();
+        assert!(remaining > 7.9 && remaining <= 8.0);
     }
     #[test]
     fn repeated_values_do_not_hide_a_stall_and_new_phases_reset_the_estimate() {

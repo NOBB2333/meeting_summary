@@ -3,6 +3,8 @@
 import AppKit
 import ScreenCaptureKit
 import AVFoundation
+import AudioToolbox
+import CoreAudio
 import CoreMedia
 import CoreVideo
 import Carbon
@@ -113,6 +115,28 @@ func windowScale(_ w: SCWindow, _ c: SCShareableContent) -> Double {
 }
 @_cdecl("oc_microphone_authorized") public func ocMicrophoneAuthorized() -> Bool {
     AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+}
+
+private func audioDeviceInfo(_ id: AudioDeviceID) -> [String: String]? {
+    guard id != kAudioObjectUnknown else { return nil }
+    func property(_ selector: AudioObjectPropertySelector) -> String? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var value: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr else { return nil }
+        return value as String
+    }
+    guard let uid = property(kAudioDevicePropertyDeviceUID), !uid.isEmpty else { return nil }
+    return ["id": uid, "name": property(kAudioObjectPropertyName) ?? uid]
+}
+
+@_cdecl("oc_default_microphone") public func ocDefaultMicrophone() -> UnsafeMutablePointer<CChar>? {
+    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var id = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id) == noErr,
+          let info = audioDeviceInfo(id) else { return jsonString(["error": "无法解析系统默认麦克风"]) }
+    return jsonString(info)
 }
 
 final class StreamCapture: NSObject, SCStreamOutput, SCStreamDelegate {
@@ -330,6 +354,20 @@ final class MicrophoneCapture {
 @_cdecl("oc_stop") public func ocStop(_ handle: UnsafeMutableRawPointer, _ mic: Bool) {
     if mic { Unmanaged<MicrophoneCapture>.fromOpaque(handle).takeRetainedValue().stop() }
     else { Unmanaged<StreamCapture>.fromOpaque(handle).takeRetainedValue().stop() }
+}
+
+@_cdecl("oc_mic_running") public func ocMicRunning(_ handle: UnsafeMutableRawPointer) -> Bool {
+    Unmanaged<MicrophoneCapture>.fromOpaque(handle).takeUnretainedValue().engine.isRunning
+}
+
+@_cdecl("oc_mic_device") public func ocMicDevice(_ handle: UnsafeMutableRawPointer) -> UnsafeMutablePointer<CChar>? {
+    let capture = Unmanaged<MicrophoneCapture>.fromOpaque(handle).takeUnretainedValue()
+    guard let unit = capture.engine.inputNode.audioUnit else { return jsonString(["error": "无法读取实际麦克风"]) }
+    var id = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &id, &size) == noErr,
+          let info = audioDeviceInfo(id) else { return jsonString(["error": "无法确认实际麦克风"]) }
+    return jsonString(info)
 }
 
 // All window/status-menu operations below are called on the AppKit main thread.

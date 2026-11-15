@@ -84,6 +84,8 @@ enum Command {
     },
     /// Recover a fragmented recording without changing the original.
     Recover { input: PathBuf, output: PathBuf },
+    /// Export an audio track from an existing recording without overwriting files.
+    ExportAudio { input: PathBuf, output: PathBuf },
     /// Diagnostic: report what the system-audio loopback endpoint actually yields.
     AudioProbe {
         #[arg(long)]
@@ -162,6 +164,18 @@ impl Options {
     }
 }
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--is-production-build"))
+    {
+        std::process::exit(if opencap_core::is_dev_profile() {
+            43
+        } else {
+            42
+        });
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--build-identity")) {
+        println!("{}", opencap_core::app_name());
+        return Ok(());
+    }
     match Cli::parse().command {
         Command::Sources => {
             for source in opencap_platform::targets()? {
@@ -187,6 +201,7 @@ fn main() -> Result<()> {
         }
         Command::Config { output } => RecordingConfig::default().save(&output)?,
         Command::Recover { input, output } => opencap_media::recover_file(&input, &output)?,
+        Command::ExportAudio { input, output } => opencap_media::export_audio(&input, &output)?,
         Command::AudioProbe {
             seconds,
             device,

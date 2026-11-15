@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 build = "build.rs"
 [features]
+default = ["internal-player", "online-speaker"]
 ui-smoke = []
+dev-profile = ["opencap-core/dev-profile"]
+internal-player = ["opencap-media/internal-player"]
+online-speaker = ["opencap-asr/nemo-poc"]
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 opencap-core.workspace = true
 opencap-platform.workspace = true
@@ -19,6 +24,11 @@ raw-window-handle = "0.6"
 futures-timer = "3"
 image = { version = "0.25", default-features = false }
 log = "0.4"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sha2 = "0.10"
+same-file = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [build-dependencies]
 embed-resource = "=3.0.12"

@@ -1,5 +1,19 @@
 # 验收规范
 
+## 2026-11-15 升级工作区集中回归
+
+在 macOS arm64 / Apple M1 / 16 GiB / Rust 1.97.1 上执行。`cargo fmt --all -- --check` 通过；`cargo clippy --workspace --all-targets --all-features -- -D warnings` 通过；`cargo test --workspace` 149 项通过、0 失败、11 项按标注忽略（需要已安装模型和合成音频的实时集成测试）。`cargo check --workspace --all-targets`、`opencap-asr --features nemo-poc` 和 `opencap --features dev-profile,ui-smoke` 均通过。
+
+本轮新增的自动验证集中在真实风险：改名恢复（目录、媒体、逐字稿标题、清单、冲突、仅大小写、恢复幂等）、播放时间轴（呈现时钟、缺口、重叠、seek 代数、回退调度、连续选区）、在线说话人身份（槽位稳定、过期快照、容量、人工命名、合并拆分）、增量纪要（来源版本、迟到回包、单请求、人工锁定）、旧记录复制迁移（原件保留、外部候选引用、归档核验、取消/已有清单拒绝）和会议检索（两个汉字、中文和英文词内子串、摘要/笔记字段、30 场分页）。
+
+macOS UI 冒烟：23 个原生窗口预览、最大化五列目标选择、窄窗、设置、录制开始/暂停/恢复/停止和音频路由全部通过；录制约 3.8 秒、31 帧、0 丢帧、`av_offset` 约 -0.001 ms、无警告，生成 H.264 + 48 kHz 单声道 AAC。快照为隔离目录中的实际窗口 MP4，会议库行与详情可见（时间戳名称、无前缀、状态为“待转录”）。冒烟发现并修复了会议库嵌在滚动页内导致列表零高，以及“尚未转录”误写为“转写数据未能读取”两个问题。播放器、逐字稿联动、纪要详情和 101/1000 条文件库仍未覆盖。
+
+模型 POC：NeMo-Speech.cpp 固定提交与 SentencePiece 静态依赖在本机 CPU 构建；60 秒英文 AMI 的 diarizer DER 为 10.79%（250 ms collar、排除重叠）和 25.19%（无 collar、包含重叠），RTFx 7.74；Nemotron 3.5 ASR 在 11 秒英文样例上 RTFx 3.07、首个文本约 1.18 秒。没有授权中文会议样本，未报告中文准确率，也未更改默认模型。
+
+真实 20 分钟录音（用户授权 `output2.m4a`，1200 秒、48 kHz 双声道）在本机完成端到端验证：SenseVoice 离线识别 161 秒（约 7.5 倍实时），生成 118 句、SRT/TXT/Markdown/Word 和不可变运行快照；独立音频导出、状态检查、丢包诊断、真实音频播放/seek/快速 seek/A-B 循环、真实 H.264/AAC 视频解码与 seek 后帧 generation、19 MB 真实媒体改名后字节不变、20 分钟波形构建（3.5 秒，缓存复用）和 UI 内波形/四组说话人/两字检索均通过。会后说话人自动模式在该远场录音上出现 32 组过度切分，已知 4 人模式得到 4 组；没有人工标注，不能据此宣称身份准确。中文片段上 Nemotron 3.5 ASR 官方 CLI 比实时慢约 4.9 倍且文本质量低于 SenseVoice，未更改默认后端。DeepSeek Responses 真实调用已用合成文本、3 分钟摘录和完整 118 段转实验证（成功生成 258/440/1248 字纪要、Markdown/Word/历史及实时纪要 JSON）；修复了正常响应 `"error": null` 被误判失败的缺陷。未上传完整会议或音频。实时模型对照显示轻量流式 + SenseVoice 逐句复核的最终文本明显优于单用轻量模型，新配置默认开启断句校正，已有设置保留。超长文分段和故障路径仍未验收。
+
+macOS arm64 Release 编译通过（`CARGO_PROFILE_RELEASE_STRIP=none cargo build --workspace --release --locked`），未执行签名、安装包和发布流程。未验证：真实音视频回放和音画同步、设备热插拔、长会议、Windows/Linux 构建与 UI、真实 AI 服务和录音样本、大库性能、打包安装。以上不能作为正式 Release 验收。
+
 ## 2026-10-17 会议列表与纪要对话
 
 `cargo test --workspace --all-features`：70 项通过、1 项依赖已安装模型的测试按条件忽略。`cargo clippy --workspace --all-targets --all-features -- -D warnings` 通过。

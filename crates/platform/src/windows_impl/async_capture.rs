@@ -137,6 +137,7 @@ struct Pending {
     width: u32,
     height: u32,
     pts_us: i64,
+    generation: u64,
     submitted: Instant,
     flushed: bool,
 }
@@ -169,6 +170,7 @@ impl Readback {
         desc: D3D11_TEXTURE2D_DESC,
         crop: Option<Rect>,
         pts_us: i64,
+        generation: u64,
         metrics: &CaptureMetrics,
     ) -> Result<()> {
         let (width, height) = crop.map_or((desc.Width, desc.Height), |r| (r.width, r.height));
@@ -238,6 +240,7 @@ impl Readback {
             width,
             height,
             pts_us,
+            generation,
             submitted,
             flushed: false,
         });
@@ -245,7 +248,7 @@ impl Readback {
         Ok(())
     }
 
-    fn poll(&mut self, args: &AsyncArgs) -> Result<()> {
+    fn poll(&mut self, args: &AsyncArgs, allow_paused: bool) -> Result<()> {
         while let Some(index) = self.order.front() {
             let slot = &mut self.slots[index];
             let pending = slot.pending.as_mut().expect("pending slot");
@@ -289,6 +292,13 @@ impl Readback {
                 }
             }
             let mapping = Mapping(&self.context, slot.texture.texture());
+            let (_, paused, generation) = args.clock.snapshot();
+            if (paused && !allow_paused) || pending.generation != generation {
+                drop(mapping);
+                slot.pending = None;
+                self.order.completed();
+                continue;
+            }
             let stride = mapped.RowPitch as usize;
             let len = stride
                 .checked_mul(pending.height as usize)
@@ -397,7 +407,7 @@ fn run(
                 recv(wakeup) -> _ => frame_ready = true,
                 default(timeout) => {},
             }
-            readback.poll(&args)?;
+            readback.poll(&args, false)?;
             if !frame_ready {
                 continue;
             }
@@ -412,7 +422,7 @@ fn run(
                     // frames first; never reuse a surface still being copied.
                     let deadline = Instant::now() + DRAIN_TIMEOUT;
                     while !readback.order.is_empty() && Instant::now() < deadline {
-                        readback.poll(&args)?;
+                        readback.poll(&args, false)?;
                         if !readback.order.is_empty() {
                             thread::sleep(POLL_INTERVAL);
                         }
@@ -426,7 +436,8 @@ fn run(
                 }
                 continue;
             }
-            if args.clock.is_paused() {
+            let (now_us, paused, generation) = args.clock.snapshot();
+            if paused {
                 continue;
             }
             if last.is_some_and(|t| t.elapsed() < args.interval) {
@@ -437,13 +448,21 @@ fn run(
             let latency = super::qpc_us()
                 .saturating_sub(frame.SystemRelativeTime()?.Duration / 10)
                 .max(0);
-            let pts_us = (args.clock.now_us() - latency).max(0);
+            let pts_us = (now_us - latency).max(0);
             let access = frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?;
             let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             unsafe { texture.GetDesc(&mut desc) };
             if desc.Width >= 2 && desc.Height >= 2 {
-                readback.submit(frame, &texture, desc, args.crop, pts_us, &args.metrics)?;
+                readback.submit(
+                    frame,
+                    &texture,
+                    desc,
+                    args.crop,
+                    pts_us,
+                    generation,
+                    &args.metrics,
+                )?;
             }
         }
         Ok(())
@@ -452,7 +471,7 @@ fn run(
     // final frame when the desktop stopped generating updates.
     let deadline = Instant::now() + DRAIN_TIMEOUT;
     while !readback.order.is_empty() && Instant::now() < deadline {
-        if readback.poll(&args).is_err() {
+        if readback.poll(&args, true).is_err() {
             break;
         }
         if !readback.order.is_empty() {

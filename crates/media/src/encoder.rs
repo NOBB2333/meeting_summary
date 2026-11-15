@@ -15,6 +15,9 @@ pub struct FfmpegVideoEncoder {
     canvas_layout: Option<(u32, u32)>,
     next_keyframe: i64,
     gop_us: i64,
+    convert_time: crate::timing::TimingHistogram,
+    submit_time: crate::timing::TimingHistogram,
+    drain_time: crate::timing::TimingHistogram,
 }
 impl FfmpegVideoEncoder {
     pub fn new(name: &str, width: u32, height: u32, config: &RecordingConfig) -> Result<Self> {
@@ -149,6 +152,9 @@ impl FfmpegVideoEncoder {
             canvas_layout: None,
             next_keyframe: 0,
             gop_us: config.gop_seconds as i64 * 1_000_000,
+            convert_time: Default::default(),
+            submit_time: Default::default(),
+            drain_time: Default::default(),
         })
     }
     pub fn parameters(&self) -> ff::codec::Parameters {
@@ -175,6 +181,9 @@ impl FfmpegVideoEncoder {
             "rate_control":if self.name.ends_with("_qsv"){"ICQ; no hard bitrate cap"}else if self.name=="libsvtav1"{"low-delay CQP; no hard bitrate cap"}else{"encoder-specific quality with VBV"},
             "gop_seconds":self.gop_us as f64/1e6,"time_base":"1/90000","ffmpeg_version":unsafe{std::ffi::CStr::from_ptr(ff::ffi::av_version_info()).to_string_lossy()}})
     }
+    pub(crate) fn take_stage_timings(&mut self) -> serde_json::Value {
+        serde_json::json!({"convert":self.convert_time.take(), "encoder_submit":self.submit_time.take(), "encoder_drain":self.drain_time.take()})
+    }
     fn drain(&mut self) -> Result<Vec<ff::Packet>> {
         let mut packets = Vec::new();
         loop {
@@ -194,6 +203,7 @@ impl FfmpegVideoEncoder {
 impl VideoEncoder for FfmpegVideoEncoder {
     type Packet = ff::Packet;
     fn encode(&mut self, video: &VideoFrame) -> Result<Vec<ff::Packet>> {
+        let convert_started = std::time::Instant::now();
         video.validate()?;
         let (width, height) = (self.inner.width(), self.inner.height());
         let scale = (width as f64 / video.width as f64).min(height as f64 / video.height as f64);
@@ -265,8 +275,14 @@ impl VideoEncoder for FfmpegVideoEncoder {
             output.set_kind(ff::picture::Type::I);
             self.next_keyframe = video.pts_us + self.gop_us;
         }
+        self.convert_time.record(convert_started.elapsed());
+        let submit_started = std::time::Instant::now();
         self.inner.send_frame(output)?;
-        self.drain()
+        self.submit_time.record(submit_started.elapsed());
+        let drain_started = std::time::Instant::now();
+        let result = self.drain();
+        self.drain_time.record(drain_started.elapsed());
+        result
     }
     fn flush(&mut self) -> Result<Vec<ff::Packet>> {
         self.inner.send_eof()?;

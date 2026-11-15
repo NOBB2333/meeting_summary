@@ -13,3 +13,7 @@ pub use audio::*;
 
 mod meeting;
 pub use meeting::*;
+mod meeting_rename;
+pub use meeting_rename::*;
+mod meeting_migration;
+pub use meeting_migration::*;

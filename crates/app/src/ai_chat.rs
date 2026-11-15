@@ -358,7 +358,11 @@ mod tests {
     fn saved_document_without_turns_is_readable_and_round_navigation_keeps_full_text() {
         let text = "历史长段落。".repeat(3000);
         let history = opencap_asr::MinutesHistory {
+            extra: Default::default(),
+            exported_version: None,
+            export_warning: None,
             versions: vec![opencap_asr::MinutesVersion {
+                extra: Default::default(),
                 number: 1,
                 created_unix: 0,
                 instruction: "旧文档".into(),
@@ -382,6 +386,7 @@ mod tests {
         let mut history = opencap_asr::MinutesHistory::default();
         for i in 0..250 {
             history.conversation.push(opencap_asr::MinutesTurn {
+                extra: Default::default(),
                 request: format!("修改要求 {i}"),
                 reply: format!("修订正文 {i}"),
             });
@@ -400,6 +405,7 @@ mod tests {
         assert_eq!(anchor.item_ix, 12);
         assert_eq!(anchor.offset_in_item, px(18.));
         history.conversation.push(opencap_asr::MinutesTurn {
+            extra: Default::default(),
             request: "下一轮".into(),
             reply: "完整正文".into(),
         });
@@ -411,7 +417,11 @@ mod tests {
     #[test]
     fn generated_documents_and_questions_show_full_replies_in_chat() {
         let history = opencap_asr::MinutesHistory {
+            extra: Default::default(),
+            exported_version: None,
+            export_warning: None,
             versions: vec![opencap_asr::MinutesVersion {
+                extra: Default::default(),
                 number: 1,
                 created_unix: 0,
                 instruction: "初稿".into(),
@@ -419,6 +429,7 @@ mod tests {
                 elapsed_seconds: None,
             }],
             conversation: vec![opencap_asr::MinutesTurn {
+                extra: Default::default(),
                 request: "标准会议纪要正文：模板要求\n用户补充要求：请简短一些".into(),
                 reply: "# 正文\n预算不能增加。".into(),
             }],

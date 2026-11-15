@@ -6,8 +6,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (-not $Output) {
-    $Output = Join-Path (Split-Path -Parent $PSScriptRoot) "target/verify/windows-performance/$Scenario.json"
+    $runId = [Guid]::NewGuid().ToString('N')
+    $Output = Join-Path (Split-Path -Parent $PSScriptRoot) "target/verify/windows-performance/$Scenario-$runId.json"
 }
+if (Test-Path -LiteralPath $Output) { throw "输出路径已存在，不会覆盖：$Output" }
 # Observe only. Change the scenario manually in the app before starting this script.
 # CPU is normalized to all logical processors, matching the app's meter.
 $cores = [Environment]::ProcessorCount
@@ -24,7 +26,9 @@ while ($watch.Elapsed.TotalSeconds -lt $Seconds) {
         if ($previous.ContainsKey($process.Id)) {
             $last = $previous[$process.Id]
             $interval = $timestamp - $last.Time
-            if ($interval -gt 0) { $cpu = [Math]::Round(100 * ($cpuSeconds - $last.Cpu) / $interval / $cores, 2) }
+            # A PID can be reused while sampling; never report a negative CPU
+            # delta from a different process as a measurement.
+            if ($interval -gt 0 -and $cpuSeconds -ge $last.Cpu) { $cpu = [Math]::Round(100 * ($cpuSeconds - $last.Cpu) / $interval / $cores, 2) }
         }
         $previous[$process.Id] = @{ Time = $timestamp; Cpu = $cpuSeconds }
         [pscustomobject]@{
@@ -50,7 +54,11 @@ if ($RecordingReport) {
     $saved = Get-Content -LiteralPath $RecordingReport -Raw | ConvertFrom-Json
     $report = [pscustomobject]@{
         Encoder = $saved.stats.encoder; Width = $saved.encoder_details.width; Height = $saved.encoder_details.height
-        Fps = $saved.stats.fps; DroppedFrames = $saved.stats.dropped_frames
+        FrameRateValid = $saved.frame_rate_valid
+        Fps = if ($saved.frame_rate_valid -eq $true) { $saved.stats.fps } else { $null }
+        BitrateValid = $saved.bitrate_valid
+        BitrateKbps = if ($saved.bitrate_valid -eq $true) { $saved.stats.bitrate_kbps } else { $null }
+        DroppedFrames = $saved.stats.dropped_frames
         RealtimeTranscription = $saved.config.realtime_transcription
         ContextRevision = $saved.config.transcription_context_revision
         RecordingPreview = $saved.config.show_recording_preview
@@ -58,6 +66,7 @@ if ($RecordingReport) {
         MaxFps = $saved.config.max_fps
         AudioOnly = $saved.config.audio_only
         PerformanceSamples = $saved.performance_samples
+        PerformanceSamplesDiscarded = $saved.performance_samples_discarded
     }
 }
 $platformInfo = [pscustomobject]@{
@@ -73,5 +82,10 @@ $data = [pscustomobject]@{
 }
 $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Output))
 [IO.Directory]::CreateDirectory($directory) | Out-Null
-$data | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Output -Encoding UTF8
+$json = $data | ConvertTo-Json -Depth 8
+$stream = [IO.File]::Open($Output, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try {
+    $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
+    try { $writer.Write($json); $writer.Flush() } finally { $writer.Dispose() }
+} finally { $stream.Dispose() }
 Write-Host "Saved local performance report: $Output"

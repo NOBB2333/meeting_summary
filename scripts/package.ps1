@@ -55,6 +55,21 @@ foreach ($exe in @('opencap.exe', 'opencap-bench.exe', 'opencap-transcribe.exe')
 }
 . "$PSScriptRoot/runtime.ps1"
 Copy-OpenCapRuntime -Destination $stage
+foreach ($exe in @('opencap.exe', 'opencap-bench.exe', 'opencap-transcribe.exe')) {
+    # Release GUI executables may not have a usable stdout handle. Wait for
+    # an explicit exit status instead of relying on a console pipeline.
+    $identityProcess = Start-Process -FilePath (Join-Path $stage $exe) -ArgumentList '--is-production-build' -PassThru
+    if (!$identityProcess.WaitForExit(10000)) {
+        $identityProcess.Kill()
+        $identityProcess.WaitForExit()
+        throw "程序未及时返回构建身份，可能是旧产物：$exe"
+    }
+    # 42 is the dedicated production identity response; a legacy program
+    # that ignores unknown arguments and exits normally must not pass.
+    if ($identityProcess.ExitCode -ne 42) {
+        throw "拒绝将非正式版或无法确认身份的程序打入正式包：$exe"
+    }
+}
 Copy-Item README.md, LICENSE, THIRD_PARTY.md $stage
 Copy-Item LICENSES "$stage/LICENSES" -Recurse
 Copy-Item docs "$stage/docs" -Recurse

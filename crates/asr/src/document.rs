@@ -315,6 +315,7 @@ mod tests {
         let transcript = crate::Transcript {
             complete: true,
             segments: vec![crate::Segment {
+                extra: Default::default(),
                 id: 7,
                 revision: 1,
                 start_ms: 1200,
@@ -325,6 +326,7 @@ mod tests {
                 review: None,
             }],
             speaker_turns: vec![crate::SpeakerTurn {
+                extra: Default::default(),
                 start_ms: 1200,
                 end_ms: 2400,
                 speaker: 2,

@@ -28,10 +28,21 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def is_prerelease(tag):
+    return bool(re.search(r"-(?:rc|beta|alpha)\.?\d+$", tag))
+
+
 def check_version(tag, root=ROOT):
-    match = re.fullmatch(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?", tag)
-    require(match, "Use a version tag such as v1.2 or v1.2.1")
-    version = ".".join(part or "0" for part in match.groups())
+    # Release candidates keep the numeric application version (3.0.0) so macOS
+    # bundle versions and Windows resources stay valid; the tag carries the
+    # prerelease suffix and publish marks the GitHub release as prerelease.
+    match = re.fullmatch(
+        r"v(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?"
+        r"(?:-(rc|beta|alpha)\.?(0|[1-9]\d*))?",
+        tag,
+    )
+    require(match, "Use a version tag such as v1.2, v1.2.1 or v1.2-rc.1")
+    version = ".".join(part or "0" for part in match.groups()[:3])
     cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
     section = re.search(r"(?ms)^\[workspace\.package\]\s*\n(.*?)(?=^\[|\Z)", cargo)
     actual = re.search(r'^version\s*=\s*"([^"]+)"', section[1], re.M) if section else None
@@ -259,7 +270,7 @@ def publish(tag, output):
     # GitHub otherwise detaches drafts from their tags during metadata updates.
     details = {"tag_name": tag, "name": f"OpenCap {tag}",
                "body": (output / "release-notes.md").read_text(encoding="utf-8"),
-               "draft": True, "prerelease": False}
+               "draft": True, "prerelease": is_prerelease(tag)}
     if release:
         require({row["name"] for row in release["assets"]} <= {path.name for path in paths},
                 "Draft contains unexpected assets; refusing to overwrite them")
@@ -280,7 +291,8 @@ def publish(tag, output):
                 raise
             time.sleep(5)
     release = api(f'{endpoint}/releases/{release["id"]}', "PATCH",
-                  {"tag_name": tag, "draft": False, "make_latest": "true"})
+                  {"tag_name": tag, "draft": False,
+                   "make_latest": "false" if is_prerelease(tag) else "true"})
     require(not release["draft"] and release["tag_name"] == tag, "Release was not published under its version tag")
     print(release["html_url"])
     if os.environ.get("GITHUB_STEP_SUMMARY"):

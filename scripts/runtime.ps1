@@ -1,6 +1,6 @@
 function Get-OpenCapFfmpegRuntimeNames {
-    # Include swresample, which avcodec imports even when the app does not use it directly.
-    @('avcodec-63.dll', 'avformat-63.dll', 'avutil-61.dll', 'swresample-7.dll', 'swscale-10.dll')
+    # Playback uses avfilter for pitch-preserving tempo; codec and filter also import swresample.
+    @('avcodec-63.dll', 'avformat-63.dll', 'avfilter-12.dll', 'avutil-61.dll', 'swresample-7.dll', 'swscale-10.dll')
 }
 
 function Get-OpenCapRuntimeNames {

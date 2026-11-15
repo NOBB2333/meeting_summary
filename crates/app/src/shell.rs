@@ -7,7 +7,9 @@ impl Recorder {
             && !self.settings
             && matches!(
                 self.meeting_page,
-                workspace::MeetingPage::Minutes | workspace::MeetingPage::Transcript
+                workspace::MeetingPage::Library
+                    | workspace::MeetingPage::Minutes
+                    | workspace::MeetingPage::Transcript
             )
         {
             return None; // Bounded document panes show their own progress without shifting the reader.
@@ -144,7 +146,7 @@ impl Recorder {
                                 div()
                                     .text_lg()
                                     .font_weight(FontWeight::BOLD)
-                                    .child("OpenCap"),
+                                    .child(app_name()),
                             )
                             .child(label("会议记录工作台")),
                     ),
@@ -195,12 +197,9 @@ impl Recorder {
                         if let Some(s) = &this.session {
                             s.command(RecordingCommand::Stop);
                         }
-                        if !this.active() {
-                            cx.quit();
-                        }
                     })),
             )
-            .child(label(concat!("OpenCap ", env!("CARGO_PKG_VERSION"))).px_3())
+            .child(label(format!("{} {}", app_name(), env!("CARGO_PKG_VERSION"))).px_3())
     }
 
     fn recording_status(&self) -> &'static str {
@@ -380,11 +379,7 @@ impl Recorder {
                         .danger()
                         .h(px(44.))
                         .min_w(px(144.))
-                        .disabled(
-                            transitioning
-                                || (!active
-                                    && (self.transcription_busy() || self.recovering.is_some())),
-                        )
+                        .disabled(transitioning || (!active && self.recovering.is_some()))
                         .on_click(cx.listener(|this, _, _, cx| {
                             if this.mode == 2
                                 && !matches!(this.config.target, CaptureTarget::Region { .. })
@@ -476,19 +471,51 @@ impl Render for Recorder {
             });
         }
         self.sync_notes(window, cx);
+        self.sync_transcript_history(cx);
         self.sync_ai_view(window, cx);
+        #[cfg(feature = "internal-player")]
+        self.sync_player_slider(window, cx);
+        #[cfg(feature = "online-speaker")]
+        let online_editable = self.online_speakers.as_ref().is_some_and(|controller| {
+            controller.applies_to(self.transcript_output.as_ref(), &self.transcript)
+        });
+        #[cfg(not(feature = "online-speaker"))]
+        let online_editable = false;
+        #[cfg(feature = "internal-player")]
+        let split_position = (self.player_base == self.transcript_output)
+            .then(|| {
+                self.player_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.position_ms)
+            })
+            .flatten();
+        #[cfg(not(feature = "internal-player"))]
+        let split_position = None;
+        if self.transcript_new_document {
+            self.speaker_compare_version = None;
+            self.speaker_compare_page = 0;
+        }
         self.speakers_view.update(cx, |view, cx| {
             view.replace(
                 &self.transcript,
                 self.transcript_new_document,
-                self.active() || self.transcription_busy(),
+                self.transcript_dirty,
+                self.active() || self.transcript_write_busy(),
+                online_editable,
+                split_position,
                 window,
                 cx,
             )
         });
         if self.transcript_dirty {
+            let task_running = self.asr.as_ref().is_some_and(|asr| !asr.finished());
             self.transcript_view.update(cx, |view, cx| {
-                view.replace(&self.transcript, self.transcript_new_document, cx)
+                view.replace(
+                    &self.transcript,
+                    self.transcript_new_document,
+                    task_running,
+                    cx,
+                )
             });
             self.transcript_dirty = false;
             self.transcript_new_document = false;
@@ -504,13 +531,18 @@ impl Render for Recorder {
         } else if self.transcription_tab {
             self.meeting_workspace(width, f32::from(window.viewport_size().height), cx)
         } else {
-            self.recording_view(width, cx)
+            self.recording_view(width, f32::from(window.viewport_size().height), cx)
         };
+        // The library is a bounded two-pane workspace: its list/detail panes
+        // use `h_full` and must not be placed inside the page scroll, where an
+        // indefinite height collapses them to zero.
         let bounded_document = self.transcription_tab
             && !self.settings
             && matches!(
                 self.meeting_page,
-                workspace::MeetingPage::Minutes | workspace::MeetingPage::Transcript
+                workspace::MeetingPage::Library
+                    | workspace::MeetingPage::Minutes
+                    | workspace::MeetingPage::Transcript
             );
         let page_content = if bounded_document {
             div().size_full().min_h(px(0.)).px_4().py_2().child(content)

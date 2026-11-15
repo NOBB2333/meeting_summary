@@ -6,3 +6,6 @@
 *.recording.json
 .DS_Store
 __pycache__/
+
+# Codegraph local index
+.codegraph/

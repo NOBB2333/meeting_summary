@@ -3,7 +3,11 @@ use super::*;
 
 impl Recorder {
     pub(crate) fn request_transcript_correction(&mut self, cx: &mut Context<Self>) {
-        if self.active() || self.transcription_busy() || !self.transcript.complete {
+        if self.active()
+            || self.transcript_write_busy()
+            || self.transcript.primary_save_pending
+            || !self.transcript.is_complete()
+        {
             self.transcription_status = "请等待当前任务完成，再校正全文".into();
             cx.notify();
             return;
@@ -29,6 +33,15 @@ impl Recorder {
         if !key.is_empty() || (config.is_local() && config.provider == AiProvider::Ollama) {
             self.start_transcript_correction(config, key, instruction);
         } else {
+            let base = self.transcript_output.clone();
+            let baseline = match serde_json::to_vec(&self.transcript) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.ai.status = format!("无法核对当前逐字稿：{error}");
+                    cx.notify();
+                    return;
+                }
+            };
             self.ai.credentials_busy = true;
             self.ai.status = "正在读取全文校正的 AI 凭据…".into();
             let task = cx.read_credentials(&config.credential_id());
@@ -36,6 +49,27 @@ impl Recorder {
                 let result = task.await;
                 let _ = entity.update(cx, |this, cx| {
                     this.ai.credentials_busy = false;
+                    if this.quit_pending
+                        || this.active()
+                        || this.transcript_write_busy()
+                        || this.transcript.primary_save_pending
+                        || this.transcript_output != base
+                        || !super::super::transcription::transcript_matches_snapshot(
+                            &this.transcript,
+                            &baseline,
+                        )
+                        || !this.ai_config_from_inputs(cx).is_ok_and(|current| {
+                            current.credential_id() == config.credential_id()
+                                && current.model == config.model
+                                && current.background == config.background
+                                && current.deep_reasoning == config.deep_reasoning
+                        })
+                    {
+                        this.ai.status =
+                            "读取凭据期间会议或逐字稿已变化，请重新发起全文校正。".into();
+                        cx.notify();
+                        return;
+                    }
                     match result {
                         Ok(Some((_, bytes))) => match String::from_utf8(bytes) {
                             Ok(key) => this.start_transcript_correction(config, key, instruction),
@@ -58,8 +92,26 @@ impl Recorder {
         cx.notify();
     }
     fn start_transcript_correction(&mut self, config: AiConfig, key: String, instruction: String) {
+        if self.quit_pending
+            || self.active()
+            || self.transcript_write_busy()
+            || self.transcript.primary_save_pending
+            || !self.transcript.is_complete()
+        {
+            self.ai.status = "当前任务尚未结束或逐字稿尚未保存，请稍后重试全文校正。".into();
+            return;
+        }
         let Some(output) = self.transcript_output.clone() else {
             self.ai.status = "没有可保存的转写文件".into();
+            return;
+        };
+        let Some(expected) = self
+            .transcript_disk_baseline
+            .as_ref()
+            .filter(|(base, _)| base == &output)
+            .map(|(_, digest)| digest.clone())
+        else {
+            self.ai.status = "逐字稿缺少可靠磁盘基线；请重新加载后再校正。".into();
             return;
         };
         let transcript = self.transcript.clone();
@@ -74,7 +126,7 @@ impl Recorder {
         self.ai.status = "正在校正转写全文 · 原始识别文字保留，完成后同步文件".into();
         self.transcription_status = self.ai.status.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(opencap_asr::correct_transcript(
+            let _ = tx.send(opencap_asr::correct_transcript_guarded(
                 &transcript,
                 &config,
                 &key,
@@ -82,6 +134,7 @@ impl Recorder {
                 &instruction,
                 &output,
                 &cancelled,
+                &expected,
                 |event| {
                     let _ = event_tx.send(event);
                 },
@@ -89,10 +142,20 @@ impl Recorder {
         });
     }
     pub(crate) fn restore_transcript_original(&mut self, cx: &mut Context<Self>) {
-        if self.active() || self.transcription_busy() {
+        if self.active() || self.transcript_write_busy() || self.transcript.primary_save_pending {
             return;
         }
         let Some(output) = self.transcript_output.clone() else {
+            return;
+        };
+        let Some(expected) = self
+            .transcript_disk_baseline
+            .as_ref()
+            .filter(|(base, _)| base == &output)
+            .map(|(_, digest)| digest.clone())
+        else {
+            self.ai.status = "逐字稿缺少可靠磁盘基线；请重新加载后再恢复原文。".into();
+            cx.notify();
             return;
         };
         let transcript = self.transcript.clone();
@@ -101,7 +164,7 @@ impl Recorder {
         self.ai_clock.start();
         self.ai.status = "正在恢复原始识别文字并同步文件…".into();
         std::thread::spawn(move || {
-            let _ = tx.send(transcript.restore_recognized_text(&output));
+            let _ = tx.send(transcript.restore_recognized_text_guarded(&output, &expected));
         });
         cx.notify();
     }

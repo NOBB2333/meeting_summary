@@ -1,3 +1,4 @@
+mod audio_state;
 #[cfg(any(windows, test))]
 mod readback_queue;
 #[cfg(windows)]

@@ -234,7 +234,13 @@ pub fn task_progress(
                             "当前阶段无法可靠估计剩余时间".into()
                         }
                     },
-                    |d| format!("估计剩余 {}", task::duration_text(d)),
+                    |d| {
+                        if d < std::time::Duration::from_secs(1) {
+                            "估计剩余不到 1 秒".into()
+                        } else {
+                            format!("估计剩余 {}", task::duration_text(d))
+                        }
+                    },
                 ))),
         )
 }

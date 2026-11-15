@@ -198,7 +198,7 @@ unsafe fn controls_loop(
             hIcon: app_icon(false)?,
             ..Default::default()
         };
-        let tip: Vec<u16> = "OpenCap".encode_utf16().collect();
+        let tip: Vec<u16> = opencap_core::app_name().encode_utf16().collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
         if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
             let _ = state
@@ -269,7 +269,14 @@ unsafe extern "system" fn window_proc(
                         && let Ok(menu) = CreatePopupMenu()
                     {
                         for (id, label) in [
-                            (1, "打开 OpenCap"),
+                            (
+                                1,
+                                if opencap_core::is_dev_profile() {
+                                    "打开 OpenCap Dev"
+                                } else {
+                                    "打开 OpenCap"
+                                },
+                            ),
                             (2, "开始 / 停止录制"),
                             (3, "暂停 / 继续"),
                             (4, "打开录制目录"),

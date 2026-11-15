@@ -34,6 +34,7 @@ class ReleaseTests(unittest.TestCase):
         notes = self.root / "docs/releases/v1.2.md"
         notes.parent.mkdir(parents=True)
         notes.write_text("OpenCap v1.2")
+        (self.root / "docs/releases/v1.2-rc.1.md").write_text("OpenCap v1.2-rc.1")
 
     def publish_fixture(self):
         records = []
@@ -63,7 +64,8 @@ class ReleaseTests(unittest.TestCase):
     def test_tag_and_all_versions_must_agree(self):
         self.version_fixture()
         self.assertEqual(release.check_version("v1.2", self.root), "1.2.0")
-        for tag in ("main", "v1.02", "1.2", "v1.2-beta", "v1.3"):
+        self.assertEqual(release.check_version("v1.2-rc.1", self.root), "1.2.0")
+        for tag in ("main", "v1.02", "1.2", "v1.2-beta", "v1.2-rc", "v1.3"):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 release.check_version(tag, self.root)
         path = self.root / "crates/app/resources/Info.plist"
@@ -72,6 +74,12 @@ class ReleaseTests(unittest.TestCase):
         path.write_bytes(plistlib.dumps(info))
         with self.assertRaisesRegex(ValueError, "macOS bundle"):
             release.check_version("v1.2", self.root)
+
+    def test_prerelease_tags_mark_the_github_release_as_prerelease(self):
+        self.assertTrue(release.is_prerelease("v3.0-rc.1"))
+        self.assertTrue(release.is_prerelease("v3.0-beta2"))
+        self.assertFalse(release.is_prerelease("v3.0"))
+        self.assertFalse(release.is_prerelease("v3.0.1"))
 
     def test_lockfile_cannot_keep_old_app_version(self):
         self.version_fixture()

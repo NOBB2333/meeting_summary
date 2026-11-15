@@ -3,6 +3,8 @@ name = "opencap-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+[features]
+dev-profile = []
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
@@ -10,3 +12,13 @@ serde_json.workspace = true
 parking_lot.workspace = true
 crossbeam-channel.workspace = true
 directories = "6"
+uuid = { version = "=1.27.0", features = ["v4"] }
+same-file = "1"
+sha2 = "0.10"
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

@@ -12,7 +12,7 @@ RUN --mount=type=cache,id=opencap-buster-apt-${TARGETARCH},target=/var/cache/apt
     apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl xz-utils build-essential clang libclang-dev cmake pkg-config \
     nasm python3 git patchelf binutils \
-    libx264-dev libpulse-dev pulseaudio pulseaudio-utils \
+    libx264-dev libpulse-dev libasound2-dev libasound2-plugins pulseaudio pulseaudio-utils \
     libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev \
     libxcb-xkb-dev libxkbcommon-x11-dev libxrandr-dev libxfixes-dev libxi-dev \
     libxinerama-dev libxcursor-dev libxrender-dev libxcomposite-dev libxdamage-dev \

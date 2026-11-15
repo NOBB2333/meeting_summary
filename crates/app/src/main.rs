@@ -2,7 +2,14 @@
 extern crate gpui_kit as gpui;
 mod ai;
 mod ai_chat;
+mod live_notes;
+#[cfg(feature = "online-speaker")]
+mod online_speakers;
+#[cfg(feature = "internal-player")]
+mod player;
 mod recording;
+mod search;
+mod semantic;
 mod settings;
 mod shell;
 #[cfg(feature = "ui-smoke")]
@@ -22,7 +29,7 @@ use gpui::component::{
 };
 use gpui::{prelude::*, *};
 use opencap_core::*;
-use opencap_media::{RecordingCommand, RecordingSession};
+use opencap_media::{AudioSubscription, RecordingCommand, RecordingSession};
 use opencap_platform::{DesktopControls, ShellEvent};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{collections::HashMap, path::PathBuf, rc::Rc, time::Duration};
@@ -50,6 +57,14 @@ struct Recorder {
     quit_pending: bool,
     recoverables: Vec<PathBuf>,
     recovering: Option<crossbeam_channel::Receiver<anyhow::Result<PathBuf>>>,
+    #[allow(clippy::type_complexity)]
+    audio_export_job: Option<(
+        PathBuf,
+        crossbeam_channel::Receiver<anyhow::Result<(PathBuf, bool)>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicU8>,
+    )>,
+    audio_export_stage_seen: u8,
     previews: HashMap<isize, Rc<opencap_platform::WindowPreview>>,
     indicator: Option<opencap_platform::CaptureIndicator>,
     indicator_failed: bool,
@@ -63,20 +78,34 @@ struct Recorder {
     preview_image: Option<std::sync::Arc<RenderImage>>,
     preview_pts: i64,
     monitor: Option<opencap_platform::AudioMonitor>,
-    monitor_peaks: (f32, f32),
+    monitor_maintenance_at: std::time::Instant,
+    monitor_levels: (AudioRouteLevels, AudioRouteLevels),
     transcription_tab: bool,
     asr: Option<opencap_asr::AsrSession>,
     asr_live: bool,
+    revision_runtime: Option<opencap_asr::RevisionRuntimeState>,
+    revision_failure: Option<String>,
+    recording_without_live_due_to_task: bool,
     asr_processed_ms: Option<u64>,
     asr_models: opencap_asr::ModelAvailability,
     transcript: opencap_asr::Transcript,
     transcript_output: Option<PathBuf>,
+    transcript_disk_baseline: Option<(PathBuf, String)>,
+    transcript_load_generation: u64,
+    transcript_load_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    transcript_load_workers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(feature = "online-speaker")]
+    word_timing_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(feature = "online-speaker")]
+    word_timing_status: String,
     transcription_status: String,
     transcription_progress: f64,
     transcription_clock: task::TaskClock,
     speaker_clock: task::TaskClock,
     ai_clock: task::TaskClock,
     speaker_threads: usize,
+    speaker_compare_version: Option<String>,
+    speaker_compare_page: usize,
     transcript_view: Entity<transcript_view::TranscriptView>,
     speakers_view: Entity<speakers::SpeakersView>,
     voice_busy: bool,
@@ -84,28 +113,147 @@ struct Recorder {
     transcript_new_document: bool,
     task_display_second: u64,
     preparing_model: Option<crossbeam_channel::Receiver<transcription::PrepareEvent>>,
-    pending_backfill: Option<PathBuf>,
+    prepare_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Source, original meeting, run ID and exact visible transcript at scheduling.
+    pending_backfill: Option<(PathBuf, PathBuf, String, Vec<u8>)>,
+    backfill_checking: bool,
     summary_task: Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::MinutesHistory>>>,
+    summary_task_base: Option<PathBuf>,
     summary_text: String,
+    live_notes: Option<live_notes::Controller>,
+    live_notes_status: String,
+    live_archive_preview: Option<(PathBuf, String)>,
+    live_archive_loading: bool,
+    live_notes_credentials_busy: bool,
+    live_notes_preparing: bool,
+    live_notes_prepare_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "online-speaker")]
+    online_speakers: Option<online_speakers::Controller>,
+    #[cfg(feature = "online-speaker")]
+    online_speaker_status: String,
+    #[cfg(feature = "online-speaker")]
+    backfill_speaker_history: Option<Vec<opencap_asr::SpeakerAnalysisVersion>>,
+    #[cfg(feature = "online-speaker")]
+    pending_speaker_sync: bool,
+    live_note_edit_input: Entity<InputState>,
+    #[cfg(feature = "internal-player")]
+    player: Option<opencap_media::PlaybackSession>,
+    #[cfg(feature = "internal-player")]
+    player_base: Option<PathBuf>,
+    #[cfg(feature = "internal-player")]
+    player_media: Option<PathBuf>,
+    #[cfg(feature = "internal-player")]
+    player_snapshot: Option<opencap_media::PlaybackSnapshot>,
+    #[cfg(feature = "internal-player")]
+    player_image: Option<std::sync::Arc<RenderImage>>,
+    #[cfg(feature = "internal-player")]
+    player_clear_image: bool,
+    #[cfg(feature = "internal-player")]
+    pending_player: Option<(PathBuf, PathBuf, player::PlayerRequest)>,
+    #[cfg(feature = "internal-player")]
+    player_start_pending: bool,
+    #[cfg(feature = "internal-player")]
+    player_selection_anchor: Option<u64>,
+    #[cfg(feature = "internal-player")]
+    player_selection: Option<(u64, u64)>,
+    #[cfg(feature = "internal-player")]
+    player_selection_snapshot: Vec<(u64, u64, u64, u64, String)>,
+    #[cfg(feature = "internal-player")]
+    player_selection_run: Option<Option<String>>,
+    #[cfg(feature = "internal-player")]
+    player_slider: Entity<gpui::component::slider::SliderState>,
+    #[cfg(feature = "internal-player")]
+    player_drag_preview: Option<u64>,
+    #[cfg(feature = "internal-player")]
+    player_keyboard_focus: FocusHandle,
+    #[cfg(feature = "internal-player")]
+    player_waveform: Option<opencap_asr::Waveform>,
+    #[cfg(feature = "internal-player")]
+    player_waveform_jobs: Vec<player::WaveformJob>,
+    #[cfg(feature = "internal-player")]
+    player_waveform_status: String,
     ai: ai::AiWorkspace,
     hotwords_input: Entity<InputState>,
     speaker_count: Entity<InputState>,
     speaker_threshold: Entity<InputState>,
     speaker_task: Option<crossbeam_channel::Receiver<anyhow::Result<opencap_asr::Transcript>>>,
     transcript_sync: Option<crossbeam_channel::Receiver<opencap_asr::Transcript>>,
+    historical_checking: bool,
+    historical_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     text_document: Option<Entity<text_document::TextDocument>>,
     speaker_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     meeting_page: workspace::MeetingPage,
     meetings: Vec<workspace::MeetingFile>,
+    meeting_list_page: usize,
+    meeting_selected_base: Option<PathBuf>,
+    meeting_rows_scroll: ScrollHandle,
+    meeting_list_focus: FocusHandle,
+    meeting_detail_scroll: ScrollHandle,
+    meeting_scan: Option<crossbeam_channel::Receiver<workspace::MeetingScan>>,
+    meeting_scan_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    meeting_scan_again: bool,
+    meeting_scan_extra: std::collections::BTreeSet<PathBuf>,
+    pending_legacy_imports: Vec<workspace::PendingImport>,
+    pending_legacy_import_page: usize,
+    meeting_search_input: Entity<InputState>,
+    meeting_search_query: Option<String>,
+    meeting_search_result: Option<search::SearchResult>,
+    meeting_search_task: Option<crossbeam_channel::Receiver<anyhow::Result<search::SearchResult>>>,
+    meeting_search_filters: search::SearchFilters,
+    meeting_filter_open: bool,
+    meeting_filter_recording_date: bool,
+    meeting_filter_source: Option<String>,
+    meeting_filter_status: Option<String>,
+    meeting_filter_from: Entity<InputState>,
+    meeting_filter_to: Entity<InputState>,
+    meeting_filter_min: Entity<InputState>,
+    meeting_filter_max: Entity<InputState>,
+    meeting_filter_tag: Entity<InputState>,
+    meeting_filter_speaker: Entity<InputState>,
+    semantic_model_input: Entity<InputState>,
+    semantic_enabled: bool,
+    semantic_status: String,
+    semantic_task: Option<crossbeam_channel::Receiver<semantic::SemanticEvent>>,
+    semantic_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    semantic_search_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    semantic_task_model: Option<String>,
+    meeting_tags_input: Entity<InputState>,
+    meeting_tags_base: Option<PathBuf>,
+    meeting_tags_baseline: Option<Vec<String>>,
+    meeting_tags_identity: Option<Option<String>>,
     rename_base: Option<PathBuf>,
+    rename_title_baseline: Option<Option<String>>,
+    rename_identity: Option<Option<String>>,
+    rename_files: bool,
+    rename_migration: Option<bool>,
+    rename_job: Option<workspace::EntityRename>,
+    relink_busy: bool,
+    relink_prompt_generation: u64,
+    relink_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     rename_input: Entity<InputState>,
     meeting_title: String,
     speaker_panel_open: bool,
+    transcript_media_tab: bool,
     transcript_tools_open: bool,
+    transcript_history_page: usize,
+    transcript_history_loaded_base: Option<PathBuf>,
+    transcript_history_loading_base: Option<PathBuf>,
+    transcript_history_files: Vec<PathBuf>,
+    transcript_history_unavailable: std::collections::HashSet<PathBuf>,
+    transcript_history_error: Option<String>,
+    transcript_history_epoch: u64,
     notes: Entity<gpui::component::input::TextareaState>,
     notes_status: String,
     notes_base: Option<PathBuf>,
     notes_saved: String,
+    notes_exists: bool,
+    notes_load_failed: bool,
+    notes_recovery: Option<String>,
+    notes_recovery_busy: bool,
+    notes_reload_busy: bool,
+    notes_initial_load_pending: bool,
+    notes_reload_result: Option<workspace::NotesReload>,
+    notes_index_pending: Option<std::time::Instant>,
     recording_registered: bool,
 }
 #[cfg(target_os = "macos")]
@@ -179,6 +327,7 @@ impl Recorder {
                 ..Default::default()
             };
         }
+        cx.set_reduce_motion(config.reduce_motion);
         let hwnd = native_handle(window);
         opencap_platform::set_app_icon(hwnd, false);
         if !std::env::args().any(|a| a == "--preview") {
@@ -189,11 +338,16 @@ impl Recorder {
                 .map_err(|e| message = format!("托盘/快捷键不可用：{e}"))
                 .ok();
         let tray_available = controls.as_ref().is_some_and(|c| c.has_tray());
+        let close_entity = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             if tray_available {
                 opencap_platform::show_native_window(hwnd, false);
             } else {
-                cx.quit();
+                let _ = close_entity.update(cx, |this, cx| {
+                    this.quit_pending = true;
+                    this.request_recording_stop();
+                    cx.notify();
+                });
             }
             false
         });
@@ -204,6 +358,27 @@ impl Recorder {
                 if entity.update(cx, |this, cx| this.poll(cx)).is_err() {
                     break;
                 }
+            }
+        })
+        .detach();
+        cx.spawn(async move |entity, cx| {
+            loop {
+                let Ok(delay) = entity.update(cx, |this, cx| {
+                    this.poll_audio_levels(cx);
+                    #[allow(unused_mut)]
+                    let mut needs_fast = this.active() || this.monitor.is_some();
+                    #[cfg(feature = "internal-player")]
+                    {
+                        if this.poll_player(cx) {
+                            cx.notify();
+                        }
+                        needs_fast |= this.player.is_some();
+                    }
+                    if needs_fast { 50 } else { 250 }
+                }) else {
+                    break;
+                };
+                futures_timer::Delay::new(Duration::from_millis(delay)).await;
             }
         })
         .detach();
@@ -250,13 +425,13 @@ impl Recorder {
                 .placeholder("阈值")
                 .default_value("0.9")
         });
-        let meetings = workspace::discover(&config.output_dir);
         let notes = cx.new(|cx| {
             gpui::component::input::TextareaState::new(window, cx)
                 .placeholder("记录自己的备注、补充信息或会后想法，内容自动保存到本机。")
                 .auto_grow(10, 20)
         });
-        Self {
+        let semantic_model = config.semantic_embedding_model.clone().unwrap_or_default();
+        let mut recorder = Self {
             config,
             targets,
             devices,
@@ -277,6 +452,8 @@ impl Recorder {
             quit_pending: false,
             recoverables,
             recovering: None,
+            audio_export_job: None,
+            audio_export_stage_seen: 0,
             previews: HashMap::new(),
             indicator: None,
             indicator_failed: false,
@@ -290,20 +467,36 @@ impl Recorder {
             preview_image: None,
             preview_pts: 0,
             monitor: None,
-            monitor_peaks: (0.0, 0.0),
+            monitor_maintenance_at: std::time::Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .unwrap_or_else(std::time::Instant::now),
+            monitor_levels: (AudioRouteLevels::default(), AudioRouteLevels::default()),
             transcription_tab: !cfg!(feature = "ui-smoke"),
             asr: None,
             asr_live: false,
+            revision_runtime: None,
+            revision_failure: None,
+            recording_without_live_due_to_task: false,
             asr_processed_ms: None,
             asr_models: opencap_asr::ModelAvailability::inspect(&opencap_asr::model_root()),
             transcript: opencap_asr::Transcript::default(),
             transcript_output: None,
+            transcript_disk_baseline: None,
+            transcript_load_generation: 0,
+            transcript_load_cancel: None,
+            transcript_load_workers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(feature = "online-speaker")]
+            word_timing_cancel: None,
+            #[cfg(feature = "online-speaker")]
+            word_timing_status: String::new(),
             transcription_status: "等待录制或导入文件".into(),
             transcription_progress: 0.0,
             transcription_clock: task::TaskClock::default(),
             speaker_clock: task::TaskClock::default(),
             ai_clock: task::TaskClock::default(),
             speaker_threads: 2,
+            speaker_compare_version: None,
+            speaker_compare_page: 0,
             speakers_view: {
                 let view = cx.new(speakers::SpeakersView::new);
                 cx.subscribe(&view, |this, _, event, cx| this.edit_speaker(event, cx))
@@ -317,39 +510,241 @@ impl Recorder {
                     this.select_sentence_review(event, cx)
                 })
                 .detach();
+                #[cfg(feature = "internal-player")]
+                cx.subscribe(
+                    &view,
+                    |this, _, event: &transcript_view::PlaybackSeek, cx| {
+                        this.seek_player_from_row(event, cx)
+                    },
+                )
+                .detach();
+                #[cfg(feature = "internal-player")]
+                cx.subscribe(
+                    &view,
+                    |this, _, event: &transcript_view::PlaybackSelection, cx| {
+                        this.select_player_segment_from_row(&event.segment, cx)
+                    },
+                )
+                .detach();
+                #[cfg(feature = "internal-player")]
+                cx.subscribe(
+                    &view,
+                    |this, _, event: &transcript_view::PlaybackRangeSelection, cx| {
+                        this.select_player_range_from_rows(event, cx)
+                    },
+                )
+                .detach();
+                #[cfg(feature = "internal-player")]
+                cx.subscribe(
+                    &view,
+                    |this, _, event: &transcript_view::PlaybackTokenSeek, cx| {
+                        this.seek_player_from_token(event, cx)
+                    },
+                )
+                .detach();
+                #[cfg(feature = "internal-player")]
+                cx.subscribe(
+                    &view,
+                    |this, _, event: &transcript_view::PlaybackWordRange, cx| {
+                        this.play_aligned_word(event, cx)
+                    },
+                )
+                .detach();
                 view
             },
             transcript_dirty: true,
             transcript_new_document: true,
             task_display_second: 0,
             preparing_model: None,
+            prepare_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_backfill: None,
+            backfill_checking: false,
             summary_task: None,
+            summary_task_base: None,
             summary_text: String::new(),
+            live_notes: None,
+            live_notes_status: String::new(),
+            live_archive_preview: None,
+            live_archive_loading: false,
+            live_notes_credentials_busy: false,
+            live_notes_preparing: false,
+            live_notes_prepare_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            #[cfg(feature = "online-speaker")]
+            online_speakers: None,
+            #[cfg(feature = "online-speaker")]
+            online_speaker_status: String::new(),
+            #[cfg(feature = "online-speaker")]
+            backfill_speaker_history: None,
+            #[cfg(feature = "online-speaker")]
+            pending_speaker_sync: false,
+            live_note_edit_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("修改纪要条目")),
+            #[cfg(feature = "internal-player")]
+            player: None,
+            #[cfg(feature = "internal-player")]
+            player_base: None,
+            #[cfg(feature = "internal-player")]
+            player_media: None,
+            #[cfg(feature = "internal-player")]
+            player_snapshot: None,
+            #[cfg(feature = "internal-player")]
+            player_image: None,
+            #[cfg(feature = "internal-player")]
+            player_clear_image: false,
+            #[cfg(feature = "internal-player")]
+            pending_player: None,
+            #[cfg(feature = "internal-player")]
+            player_start_pending: false,
+            #[cfg(feature = "internal-player")]
+            player_selection_anchor: None,
+            #[cfg(feature = "internal-player")]
+            player_selection: None,
+            #[cfg(feature = "internal-player")]
+            player_selection_snapshot: Vec::new(),
+            #[cfg(feature = "internal-player")]
+            player_selection_run: None,
+            #[cfg(feature = "internal-player")]
+            player_slider: {
+                let slider = cx.new(|_| gpui::component::slider::SliderState::new().step(0.01));
+                cx.subscribe(&slider, |this, _, event, cx| {
+                    this.player_slider_event(event, cx)
+                })
+                .detach();
+                slider
+            },
+            #[cfg(feature = "internal-player")]
+            player_drag_preview: None,
+            #[cfg(feature = "internal-player")]
+            player_keyboard_focus: cx.focus_handle(),
+            #[cfg(feature = "internal-player")]
+            player_waveform: None,
+            #[cfg(feature = "internal-player")]
+            player_waveform_jobs: Vec::new(),
+            #[cfg(feature = "internal-player")]
+            player_waveform_status: String::new(),
             ai,
             hotwords_input,
             speaker_count,
             speaker_threshold,
             speaker_task: None,
             transcript_sync: None,
+            historical_checking: false,
+            historical_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             text_document: None,
             speaker_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             meeting_page: workspace::MeetingPage::Library,
-            meetings,
+            meetings: Vec::new(),
+            meeting_list_page: 0,
+            meeting_selected_base: None,
+            meeting_rows_scroll: ScrollHandle::new(),
+            meeting_list_focus: cx.focus_handle().tab_stop(true),
+            meeting_detail_scroll: ScrollHandle::new(),
+            meeting_scan: None,
+            meeting_scan_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            meeting_scan_again: false,
+            meeting_scan_extra: Default::default(),
+            pending_legacy_imports: Vec::new(),
+            pending_legacy_import_page: 0,
+            meeting_search_input: {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("搜索标题、逐字稿、纪要和笔记")
+                });
+                cx.subscribe(&input, |this, input, event, cx| {
+                    if matches!(event, gpui::component::input::InputEvent::PressEnter { .. }) {
+                        let query = input.read(cx).value().to_string();
+                        this.start_meeting_search(query);
+                        cx.notify();
+                    }
+                })
+                .detach();
+                input
+            },
+            meeting_search_query: None,
+            meeting_search_result: None,
+            meeting_search_task: None,
+            meeting_search_filters: Default::default(),
+            meeting_filter_open: false,
+            meeting_filter_recording_date: false,
+            meeting_filter_source: None,
+            meeting_filter_status: None,
+            meeting_filter_from: cx
+                .new(|cx| InputState::new(window, cx).placeholder("起始日期 YYYY-MM-DD")),
+            meeting_filter_to: cx
+                .new(|cx| InputState::new(window, cx).placeholder("结束日期 YYYY-MM-DD")),
+            meeting_filter_min: cx
+                .new(|cx| InputState::new(window, cx).placeholder("最短时长（分钟）")),
+            meeting_filter_max: cx
+                .new(|cx| InputState::new(window, cx).placeholder("最长时长（分钟）")),
+            meeting_filter_tag: cx
+                .new(|cx| InputState::new(window, cx).placeholder("标签（完整匹配）")),
+            meeting_filter_speaker: cx
+                .new(|cx| InputState::new(window, cx).placeholder("说话人姓名")),
+            semantic_model_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("已安装的本地嵌入模型名称")
+                    .default_value(semantic_model)
+            }),
+            semantic_enabled: false,
+            semantic_status: String::new(),
+            semantic_task: None,
+            semantic_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            semantic_search_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            semantic_task_model: None,
+            meeting_tags_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("用逗号分隔标签")),
+            meeting_tags_base: None,
+            meeting_tags_baseline: None,
+            meeting_tags_identity: None,
             rename_base: None,
+            rename_title_baseline: None,
+            rename_identity: None,
+            rename_files: false,
+            rename_migration: None,
+            rename_job: None,
+            relink_busy: false,
+            relink_prompt_generation: 0,
+            relink_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rename_input: cx.new(|cx| InputState::new(window, cx).placeholder("会议名称")),
             meeting_title: String::new(),
             speaker_panel_open: false,
+            transcript_media_tab: false,
             transcript_tools_open: false,
+            transcript_history_page: 0,
+            transcript_history_loaded_base: None,
+            transcript_history_loading_base: None,
+            transcript_history_files: Vec::new(),
+            transcript_history_unavailable: std::collections::HashSet::new(),
+            transcript_history_error: None,
+            transcript_history_epoch: 0,
             notes,
             notes_status: String::new(),
             notes_base: None,
             notes_saved: String::new(),
+            notes_exists: false,
+            notes_load_failed: false,
+            notes_recovery: None,
+            notes_recovery_busy: false,
+            notes_reload_busy: false,
+            notes_initial_load_pending: false,
+            notes_reload_result: None,
+            notes_index_pending: None,
             recording_registered: false,
-        }
+        };
+        recorder.refresh_meetings();
+        recorder
     }
     fn active(&self) -> bool {
         self.session.as_ref().is_some_and(|s| !s.finished())
+    }
+    fn request_recording_stop(&mut self) {
+        if self.active() && self.stats.state != RecordingState::Stopping {
+            if let Some(session) = &self.session {
+                session.command(RecordingCommand::Stop);
+            }
+            self.stats.state = RecordingState::Stopping;
+        }
     }
     fn save(&mut self) {
         #[cfg(feature = "ui-smoke")]
@@ -364,12 +759,28 @@ impl Recorder {
         if self.recovering.is_some() {
             return;
         }
+        if self.quit_pending {
+            self.message = "正在退出，请等待当前任务收尾。".into();
+            cx.notify();
+            return;
+        }
         if self.active() {
-            if let Some(s) = &self.session {
-                s.command(RecordingCommand::Stop);
-            }
-            self.stats.state = RecordingState::Stopping;
+            self.request_recording_stop();
         } else {
+            #[cfg(feature = "internal-player")]
+            if self.player_blocks_recording() {
+                self.message = "请先暂停或关闭内置播放，再开始录制，以免回放声音被录入。".into();
+                cx.notify();
+                return;
+            }
+            #[cfg(feature = "internal-player")]
+            self.cancel_waveform_jobs();
+            if self.asr.as_ref().is_some_and(|asr| asr.finished()) {
+                self.poll_transcription(cx, false);
+                #[cfg(feature = "online-speaker")]
+                self.poll_online_speakers();
+                self.poll_live_notes();
+            }
             if !self.config.audio_only && self.targets.is_empty() {
                 self.refresh_targets();
                 if self.targets.is_empty() {
@@ -396,6 +807,11 @@ impl Recorder {
                 cx.notify();
                 return;
             }
+            #[cfg(feature = "online-speaker")]
+            if let Some(cancelled) = &self.word_timing_cancel {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.word_timing_status = "开始录制，正在停止词时间任务；录制不会等待。".into();
+            }
             self.selecting = None;
             self.close_targets();
             self.audio_picker = None;
@@ -409,13 +825,108 @@ impl Recorder {
             }
             let mut recording = self.config.clone();
             recording.reserve_audio_track = true;
-            if self.transcription_busy() {
-                self.message = "请先完成或取消当前转录/纪要任务，再开始录制".into();
-                cx.notify();
-                return;
+            if self.semantic_task.is_some() {
+                self.semantic_cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.semantic_status =
+                    "录制优先：已请求停止语义索引，当前本地模型请求返回后结束。".into();
             }
-            let observer = self.start_live_asr();
-            match RecordingSession::start_observed(recording, observer) {
+            self.semantic_search_cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if self.semantic_enabled {
+                self.semantic_enabled = false;
+                self.semantic_status =
+                    "录制期间已切换为关键词搜索；结束后可重新启用混合搜索。".into();
+                if let Some(query) = self.meeting_search_query.clone() {
+                    self.start_meeting_search(query);
+                }
+            }
+            let unsaved_transcript = self.transcript.primary_save_pending;
+            let unsaved_minutes_draft = self.persist_minutes_draft(cx);
+            self.persist_notes(cx);
+            let unsaved_notes = self.notes_have_unsaved_work(cx);
+            let unsaved_live_notes = self
+                .live_notes
+                .as_ref()
+                .is_some_and(|notes| notes.has_unsaved_work());
+            let unsaved_tags = self.meeting_tags_base.is_some();
+            let unsaved_rename = self.rename_base.is_some();
+            // Only another transcript writer (or an unfinished previous
+            // document) can conflict with the new live transcript. Model
+            // downloads, AI minutes requests, scans and previews for another
+            // meeting stay independent; recording never waits for them.
+            let busy = self.transcript_write_busy()
+                || self.model_prepare_busy()
+                || unsaved_transcript
+                || unsaved_minutes_draft
+                || unsaved_notes
+                || unsaved_live_notes
+                || unsaved_tags
+                || unsaved_rename;
+            self.recording_without_live_due_to_task = busy;
+            let observer = if busy {
+                // Preserve the other meeting's in-flight state; recording has
+                // priority, but this version cannot share a single ASR slot.
+                if self.asr_live {
+                    if let Some(asr) = &mut self.asr {
+                        asr.finish_at((self.stats.duration_seconds * 1000.0) as u64);
+                    }
+                    self.asr_live = false;
+                }
+                self.message = if unsaved_transcript {
+                    "上一场逐字稿尚未保存；本次录制继续保存，实时转录暂不可用。"
+                } else if unsaved_minutes_draft {
+                    "上一场纪要草稿尚未保存；本次录制继续保存，实时转录暂不可用。"
+                } else if unsaved_notes {
+                    "上一场笔记尚未保存；本次录制继续保存，实时转录暂不可用。"
+                } else if unsaved_live_notes {
+                    "上一场增量纪要尚未保存；本次录制继续保存，实时转录暂不可用。"
+                } else if unsaved_tags {
+                    "上一场标签编辑尚未结束；本次录制继续保存，实时转录暂不可用。"
+                } else if unsaved_rename {
+                    "上一场名称编辑尚未结束；本次录制继续保存，实时转录暂不可用。"
+                } else {
+                    "识别、模型准备或另一项逐字稿写入仍在运行；本次录制继续保存，实时转录暂不可用，可在结束后补转。"
+                }.into();
+                None
+            } else {
+                self.start_live_asr()
+            };
+            #[cfg(feature = "online-speaker")]
+            let (observers, speaker_started) = {
+                let mut observers: Vec<_> = observer
+                    .into_iter()
+                    .map(|sender| AudioSubscription {
+                        source: AudioSource::MixedRecording,
+                        sender,
+                        consumer: opencap_media::AudioConsumer::Asr,
+                    })
+                    .collect();
+                let mut speaker_started = false;
+                if !observers.is_empty()
+                    && let Some(sender) = self.start_online_speakers()
+                {
+                    observers.push(AudioSubscription {
+                        source: AudioSource::MixedRecording,
+                        sender,
+                        consumer: opencap_media::AudioConsumer::OnlineSpeaker,
+                    });
+                    speaker_started = true;
+                } else if self.config.online_speakers && observers.is_empty() {
+                    self.online_speaker_status = "本场没有实时转录，暂不启动在线说话人。".into();
+                }
+                (observers, speaker_started)
+            };
+            #[cfg(not(feature = "online-speaker"))]
+            let observers: Vec<_> = observer
+                .into_iter()
+                .map(|sender| AudioSubscription {
+                    source: AudioSource::MixedRecording,
+                    sender,
+                    consumer: opencap_media::AudioConsumer::Asr,
+                })
+                .collect();
+            match RecordingSession::start_observed_sources(recording, observers) {
                 Ok(session) => {
                     session.enable_preview(
                         !self.config.audio_only && self.config.show_recording_preview,
@@ -426,16 +937,25 @@ impl Recorder {
                 }
                 Err(e) => {
                     self.message = format!("无法开始录制：{e:#}");
-                    if let Some(asr) = &mut self.asr {
+                    #[cfg(feature = "online-speaker")]
+                    if speaker_started && let Some(controller) = &mut self.online_speakers {
+                        controller.cancel("录制未开始，在线说话人已停止。");
+                    }
+                    if !busy && let Some(asr) = &mut self.asr {
                         asr.cancel();
                     }
-                    self.asr_live = false;
+                    if !busy {
+                        self.asr_live = false;
+                    }
                 }
             }
         }
         cx.notify();
     }
     fn toggle_pause(&mut self) {
+        if self.stats.state == RecordingState::Stopping {
+            return;
+        }
         if let Some(s) = &self.session {
             match s.stats().state {
                 RecordingState::Recording => s.command(RecordingCommand::Pause),
@@ -458,9 +978,29 @@ impl Recorder {
             needs_render = true;
         }
         self.persist_notes(cx);
+        if self
+            .notes_index_pending
+            .is_some_and(|time| time.elapsed() >= Duration::from_secs(1))
+        {
+            self.notes_index_pending = None;
+            self.refresh_meetings();
+        }
         needs_render |= self.persist_minutes_draft(cx);
-        needs_render |= self.poll_transcription();
+        needs_render |= self.poll_transcription(cx, true);
+        #[cfg(feature = "online-speaker")]
+        {
+            needs_render |= self.poll_online_speakers();
+        }
         needs_render |= self.poll_minutes_document();
+        needs_render |= self.poll_live_notes();
+        #[cfg(feature = "internal-player")]
+        {
+            needs_render |= self.poll_player(cx);
+        }
+        needs_render |= self.poll_entity_rename(cx);
+        needs_render |= self.poll_meeting_scan();
+        needs_render |= self.poll_meeting_search();
+        needs_render |= self.poll_semantic_index();
         let events: Vec<_> = self
             .controls
             .as_ref()
@@ -477,13 +1017,11 @@ impl Recorder {
                 }
                 ShellEvent::Quit => {
                     self.quit_pending = true;
-                    if let Some(s) = &self.session {
-                        s.command(RecordingCommand::Stop);
-                    }
+                    self.request_recording_stop();
                 }
                 ShellEvent::Locked => {
-                    if let Some(s) = &self.session {
-                        s.command(RecordingCommand::Stop);
+                    if self.active() {
+                        self.request_recording_stop();
                         self.message = "桌面已锁定，正在结束录制".into();
                     }
                 }
@@ -512,14 +1050,28 @@ impl Recorder {
                 }
             }
             let previous = self.stats.state;
-            let next_stats = session.stats();
+            let mut next_stats = session.stats();
+            if self.stats.state == RecordingState::Stopping
+                && !session.finished()
+                && matches!(
+                    next_stats.state,
+                    RecordingState::Starting | RecordingState::Recording | RecordingState::Paused
+                )
+            {
+                next_stats.state = RecordingState::Stopping;
+            }
             let stats_changed = next_stats.state != self.stats.state
                 || (next_stats.duration_seconds - self.stats.duration_seconds).abs() >= 0.2
                 || next_stats.bytes != self.stats.bytes
                 || next_stats.error != self.stats.error
                 || next_stats.audio_routing != self.stats.audio_routing
+                || next_stats.audio_routes != self.stats.audio_routes
                 || next_stats.system_peak != self.stats.system_peak
                 || next_stats.microphone_peak != self.stats.microphone_peak
+                || next_stats.system_rms != self.stats.system_rms
+                || next_stats.microphone_rms != self.stats.microphone_rms
+                || next_stats.system_input_rms != self.stats.system_input_rms
+                || next_stats.microphone_input_rms != self.stats.microphone_input_rms
                 || next_stats.warnings.len() != self.stats.warnings.len();
             self.stats = next_stats;
             if self.asr_live
@@ -529,8 +1081,23 @@ impl Recorder {
                     let media = transcription::final_recording_path(path);
                     let base = meeting_base(&media);
                     if self.transcript_output.as_ref() != Some(&base) {
-                        asr.set_output(media);
-                        self.transcript_output = Some(base);
+                        match asr.set_output(media) {
+                            Ok(()) => {
+                                #[cfg(feature = "online-speaker")]
+                                if let Some(controller) = &mut self.online_speakers
+                                    && controller.base.is_none()
+                                {
+                                    controller.base = Some(base.clone());
+                                }
+                                self.transcript_output = Some(base);
+                            }
+                            Err(error) => {
+                                asr.cancel();
+                                self.asr_live = false;
+                                self.transcription_status =
+                                    format!("无法锁定转录保存位置，录制继续：{error:#}");
+                            }
+                        }
                     }
                 }
                 if session.finished() {
@@ -631,50 +1198,285 @@ impl Recorder {
             && !self.settings
             && !self.transcription_tab
             && !self.active()
-            && !self.transcription_busy();
+            && !self.meeting_task_busy()
+            && (self.config.system_audio || self.config.microphone);
         if !wants_monitor {
             if self.monitor.take().is_some() {
-                self.monitor_peaks = (0.0, 0.0);
+                self.monitor_levels = (AudioRouteLevels::default(), AudioRouteLevels::default());
                 needs_render = true;
             }
         } else {
-            if self.monitor.is_none() {
+            if self.monitor.is_some()
+                && self.monitor_maintenance_at.elapsed() >= Duration::from_secs(5)
+            {
+                self.monitor_maintenance_at = std::time::Instant::now();
+                let routing = self.config.audio_routing();
+                let denoise = self.config.mic_denoise;
+                if self
+                    .monitor
+                    .as_mut()
+                    .is_some_and(|monitor| !monitor.maintain(&routing, denoise))
+                {
+                    self.monitor = None;
+                    self.monitor_levels =
+                        (AudioRouteLevels::default(), AudioRouteLevels::default());
+                    self.message = "电平监测线程已退出，将自动重试。".into();
+                    needs_render = true;
+                }
+            }
+            if self.monitor.is_none()
+                && self.monitor_maintenance_at.elapsed() >= Duration::from_secs(5)
+            {
+                self.monitor_maintenance_at = std::time::Instant::now();
                 match opencap_platform::start_audio_monitor(
                     &self.config.audio_routing(),
                     self.config.mic_denoise,
                 ) {
-                    Ok(monitor) => self.monitor = Some(monitor),
+                    Ok(monitor) => {
+                        self.monitor_maintenance_at = std::time::Instant::now();
+                        self.monitor = Some(monitor);
+                    }
                     Err(e) => {
-                        self.config.monitor_levels = false;
-                        self.message = format!("实时电平检测不可用：{e}");
-                        self.save();
+                        self.message = format!("实时电平检测暂不可用，将自动重试：{e}");
+                        needs_render = true;
                     }
                 }
             }
-            if let Some(monitor) = &self.monitor {
-                if let Some(warning) = monitor.take_warning() {
-                    self.message = warning;
-                    needs_render = true;
-                }
-                let peaks = monitor.peaks();
-                if (peaks.0 - self.monitor_peaks.0).abs() > 0.004
-                    || (peaks.1 - self.monitor_peaks.1).abs() > 0.004
-                {
-                    self.monitor_peaks = peaks;
-                    needs_render = true;
-                }
+            if let Some(monitor) = &self.monitor
+                && let Some(warning) = monitor.take_warning()
+            {
+                self.message = warning;
+                needs_render = true;
             }
         }
-        if let Some(result) = self.recovering.as_ref().and_then(|r| r.try_recv().ok()) {
+        let recovery_result = self.recovering.as_ref().and_then(|r| match r.try_recv() {
+            Ok(result) => Some(result),
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Some(Err(anyhow::anyhow!("恢复任务异常结束")))
+            }
+        });
+        if let Some(result) = recovery_result {
             needs_render = true;
             self.recovering = None;
+            if result.is_err() && self.quit_pending {
+                self.quit_pending = false;
+                opencap_platform::show_native_window(self.hwnd, true);
+            }
             self.message = match result {
                 Ok(p) => format!("已恢复到 {}；原临时文件已保留", p.display()),
                 Err(e) => format!("恢复失败，原文件已保留：{e:#}"),
             };
         }
+        if let Some((_, _, _, stage)) = &self.audio_export_job {
+            let current = stage.load(std::sync::atomic::Ordering::Acquire);
+            if current != self.audio_export_stage_seen {
+                self.audio_export_stage_seen = current;
+                needs_render = true;
+            }
+        }
+        let audio_export_result =
+            self.audio_export_job
+                .as_ref()
+                .and_then(|(base, rx, _, _)| match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(crossbeam_channel::TryRecvError::Empty) => None,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        Some(Err(anyhow::anyhow!(
+                            "音频导出线程异常结束；请检查目标 {} 及会议文件夹中的暂存文件",
+                            base.with_extension("m4a").display()
+                        )))
+                    }
+                });
+        if let Some(result) = audio_export_result {
+            if result.is_err() && self.quit_pending {
+                self.quit_pending = false;
+                opencap_platform::show_native_window(self.hwnd, true);
+            }
+            if let Some((base, _, _, _)) = self.audio_export_job.take() {
+                self.meeting_scan_extra.insert(base);
+                self.refresh_meetings();
+            }
+            self.message = match result {
+                Ok((path, verified)) => format!(
+                    "独立音频已导出：{}{}",
+                    path.display(),
+                    if verified {
+                        ""
+                    } else {
+                        "；原录屏缺少历史指纹，内容身份无法核实。"
+                    }
+                ),
+                Err(error) => format!("独立音频导出未完成：{error:#}"),
+            };
+            needs_render = true;
+        }
         if self.quit_pending && !self.active() {
-            cx.quit();
+            if let Some((_, _, cancel, _)) = &self.audio_export_job {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.cancel_migration_for_quit();
+            if self.live_notes_preparing {
+                self.live_notes_prepare_cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            if self.meeting_scan.is_some() {
+                self.meeting_scan_cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.meeting_scan_again = false;
+            }
+            if self.semantic_task.is_some() {
+                self.semantic_cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.semantic_search_cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if self.relink_busy {
+                self.relink_cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if self.preparing_model.is_some() {
+                self.prepare_cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(cancel) = self.transcript_load_cancel.take() {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.transcript_load_generation = self.transcript_load_generation.wrapping_add(1);
+            }
+            let unsaved_notes = self
+                .live_notes
+                .as_ref()
+                .is_some_and(|notes| notes.has_unsaved_work());
+            let notes_settling = self
+                .live_notes
+                .as_ref()
+                .is_some_and(|notes| notes.settlement_pending());
+            let notes_need_attention = self
+                .live_notes
+                .as_ref()
+                .is_some_and(|notes| notes.settlement_needs_attention());
+            self.persist_notes(cx);
+            let unsaved_regular_notes =
+                self.notes_have_unsaved_work(cx) && !self.notes_recovery_busy;
+            let unsaved_minutes_draft = self.persist_minutes_draft(cx);
+            // A worker can enqueue its terminal event after this frame's
+            // poll and exit before this check. Drain that event next frame
+            // before deciding whether any result still needs saving.
+            let finishing_tasks = self
+                .asr
+                .as_ref()
+                .is_some_and(|asr| !asr.finished() || !asr.events.is_empty())
+                || self.preparing_model.is_some()
+                || self.summary_task.is_some()
+                || self.ai.document_task.is_some()
+                || self.ai.correction_task.is_some()
+                || self.speaker_task.is_some()
+                || self.voice_busy
+                || self.transcript_sync.is_some()
+                || self.historical_checking
+                || self.live_archive_loading
+                || self.live_notes_preparing
+                || self.relink_busy
+                || self.rename_job.is_some()
+                || self.backfill_checking
+                || self.ai.draft_recovery_busy
+                || self.notes_recovery_busy;
+            let finishing_tasks = finishing_tasks
+                || self.semantic_task.is_some()
+                || self.meeting_scan.is_some()
+                || self.recovering.is_some()
+                || self.audio_export_job.is_some();
+            let unsaved_transcript = self.transcript.primary_save_pending && !finishing_tasks;
+            let unsaved_tags = self.meeting_tags_base.is_some();
+            let unsaved_rename = self.rename_base.is_some();
+            let unsaved_speaker_drafts =
+                !finishing_tasks && self.speakers_view.read(cx).has_unsaved_drafts(cx);
+            #[cfg(feature = "online-speaker")]
+            let unsaved_speakers = self
+                .online_speakers
+                .as_ref()
+                .is_some_and(|speaker| speaker.has_unsaved_work());
+            #[cfg(feature = "online-speaker")]
+            let speaker_awaiting_identity = self
+                .online_speakers
+                .as_ref()
+                .is_some_and(|speaker| speaker.awaiting_identity());
+            #[cfg(feature = "online-speaker")]
+            let speaker_needs_attention = self
+                .online_speakers
+                .as_ref()
+                .is_some_and(|speaker| speaker.settlement_needs_attention());
+            #[cfg(not(feature = "online-speaker"))]
+            let unsaved_speakers = false;
+            #[cfg(not(feature = "online-speaker"))]
+            let speaker_awaiting_identity = false;
+            #[cfg(not(feature = "online-speaker"))]
+            let speaker_needs_attention = false;
+            if unsaved_notes
+                || speaker_needs_attention
+                || unsaved_regular_notes
+                || unsaved_minutes_draft
+                || notes_need_attention
+                || unsaved_transcript
+                || unsaved_speaker_drafts
+                || unsaved_tags
+                || unsaved_rename
+            {
+                self.quit_pending = false;
+                self.message = if speaker_needs_attention && speaker_awaiting_identity {
+                    "未绑定身份的说话人结果尚未保存到恢复目录；请检查状态并等待重试。"
+                } else if speaker_needs_attention {
+                    "在线说话人结果尚未保存；请检查状态并等待自动重试后再退出。"
+                } else if unsaved_regular_notes || unsaved_minutes_draft {
+                    "笔记或纪要草稿尚未保存；请检查会议目录并重试。"
+                } else if unsaved_tags {
+                    "标签编辑尚未结束；请返回对应会议保存或取消后再退出。"
+                } else if unsaved_rename {
+                    "会议名称编辑尚未结束；请返回对应会议保存或取消后再退出。"
+                } else if unsaved_transcript {
+                    "逐字稿主文件尚未保存；请在逐字稿页面重试同步后退出。"
+                } else if unsaved_speaker_drafts {
+                    self.settings = false;
+                    self.transcription_tab = true;
+                    self.meeting_page = workspace::MeetingPage::Transcript;
+                    self.transcript_media_tab = false;
+                    self.speaker_panel_open = true;
+                    self.text_document = None;
+                    "说话人面板有仅存在内存的姓名草稿；请保存、复制并移除后再退出。"
+                } else if notes_need_attention {
+                    "增量纪要收尾需要处理；请检查状态、重试或停止更新后再退出。"
+                } else {
+                    "增量纪要有未保存的编辑或结果；请先保存、重试或取消编辑。"
+                }
+                .into();
+                opencap_platform::show_native_window(self.hwnd, true);
+                needs_render = true;
+            } else if finishing_tasks || notes_settling || unsaved_speakers {
+                let message = if speaker_awaiting_identity {
+                    "正在等待说话人收尾；未绑定的结果将保存到恢复目录后退出。"
+                } else if self.preparing_model.is_some() {
+                    "正在取消模型下载，等待当前网络读取和临时文件清理后退出。"
+                } else if self.rename_job.is_some() {
+                    "正在等待会议文件操作结束；如有迁移，已请求取消。"
+                } else if self.semantic_task.is_some() {
+                    "正在停止语义索引；等待当前本地模型请求结束后退出。"
+                } else if self.meeting_scan.is_some() {
+                    "正在停止会议扫描，等待当前文件读取或索引事务结束后退出。"
+                } else if self.recovering.is_some() {
+                    "正在等待录制文件恢复完成后退出。"
+                } else if self.audio_export_job.is_some() {
+                    "正在等待独立音频导出完成后退出。"
+                } else {
+                    "正在等待转写、说话人和纪要任务收尾；完成后将退出。可在任务页面取消不需要的工作。"
+                };
+                if self.message != message {
+                    self.message = message.into();
+                    opencap_platform::show_native_window(self.hwnd, true);
+                    needs_render = true;
+                }
+            } else {
+                cx.quit();
+            }
         }
         self.sync_indicator();
         if needs_render
@@ -688,6 +1490,65 @@ impl Recorder {
             let _ = window.update(cx, |_, _, cx| cx.notify());
         }
         if needs_render {
+            cx.notify();
+        }
+    }
+    fn poll_audio_levels(&mut self, cx: &mut Context<Self>) {
+        let next = if self.active() {
+            self.session.as_ref().map(RecordingSession::audio_levels)
+        } else {
+            self.monitor.as_ref().map(|monitor| monitor.levels())
+        };
+        let Some(next) = next else { return };
+        let previous = if self.active() {
+            (
+                AudioRouteLevels {
+                    input: AudioLevel {
+                        rms: self.stats.system_input_rms,
+                        peak: self.stats.system_input_peak,
+                    },
+                    processed: AudioLevel {
+                        rms: self.stats.system_rms,
+                        peak: self.stats.system_peak,
+                    },
+                },
+                AudioRouteLevels {
+                    input: AudioLevel {
+                        rms: self.stats.microphone_input_rms,
+                        peak: self.stats.microphone_input_peak,
+                    },
+                    processed: AudioLevel {
+                        rms: self.stats.microphone_rms,
+                        peak: self.stats.microphone_peak,
+                    },
+                },
+            )
+        } else {
+            self.monitor_levels
+        };
+        if self.active() {
+            self.stats.system_rms = next.0.processed.rms;
+            self.stats.system_peak = next.0.processed.peak;
+            self.stats.system_input_rms = next.0.input.rms;
+            self.stats.system_input_peak = next.0.input.peak;
+            self.stats.microphone_rms = next.1.processed.rms;
+            self.stats.microphone_peak = next.1.processed.peak;
+            self.stats.microphone_input_rms = next.1.input.rms;
+            self.stats.microphone_input_peak = next.1.input.peak;
+        } else {
+            self.monitor_levels = next;
+        }
+        let changed = |a: AudioLevel, b: AudioLevel| {
+            (level_bar(a.rms) - level_bar(b.rms)).abs() > 0.002
+                || (level_bar(a.peak) - level_bar(b.peak)).abs() > 0.002
+                || (level_bar(a.rms) == 0. && level_bar(b.rms) != 0.)
+                || (level_bar(a.peak) == 0. && level_bar(b.peak) != 0.)
+        };
+        if changed(previous.0.input, next.0.input)
+            || changed(previous.0.processed, next.0.processed)
+            || changed(previous.1.input, next.1.input)
+            || changed(previous.1.processed, next.1.processed)
+        {
             cx.notify();
         }
     }
@@ -814,6 +1675,12 @@ impl Recorder {
         self.apply_audio(previous);
     }
     fn apply_audio(&mut self, previous: RecordingConfig) {
+        if self.stats.state == RecordingState::Stopping && self.active() {
+            self.monitor = None;
+            self.message = "录制正在停止，音频设置将用于下一次录制。".into();
+            self.save();
+            return;
+        }
         if self.active()
             && let Some(session) = &self.session
             && let Err(e) = session.set_audio(self.config.audio_routing())
@@ -876,13 +1743,18 @@ impl Recorder {
         } else {
             &self.config.microphone_device
         };
-        id.as_ref()
-            .and_then(|id| self.devices.iter().find(|d| &d.id == id))
-            .map(|d| d.name.clone())
-            .unwrap_or_else(|| "系统默认设备".into())
+        match id {
+            None => "系统默认设备（实际设备未确认）".into(),
+            Some(id) => self
+                .devices
+                .iter()
+                .find(|d| d.kind == kind && &d.id == id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| format!("已选设备不可用：{id}")),
+        }
     }
     fn recover(&mut self) {
-        if self.active() || self.recovering.is_some() {
+        if self.active() || self.quit_pending || self.recovering.is_some() {
             return;
         }
         let Some(input) = self.recoverables.first().cloned() else {
@@ -891,16 +1763,22 @@ impl Recorder {
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.recovering = Some(rx);
         self.message = "正在恢复录制…".into();
-        std::thread::spawn(move || {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let extension = input.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
-            let output = input.with_file_name(format!("Recovered-{stamp}.{extension}"));
-            let result = opencap_media::recover_file(&input, &output).map(|_| output);
-            let _ = tx.send(result);
-        });
+        if let Err(error) = std::thread::Builder::new()
+            .name("opencap-recording-recovery".into())
+            .spawn(move || {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let extension = input.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+                let output = input.with_file_name(format!("Recovered-{stamp}.{extension}"));
+                let result = opencap_media::recover_file(&input, &output).map(|_| output);
+                let _ = tx.send(result);
+            })
+        {
+            self.recovering = None;
+            self.message = format!("无法启动恢复任务，原临时文件保留，可重试：{error}");
+        }
     }
     fn choose_folder(&mut self, cx: &mut Context<Self>) {
         if self.active() {
@@ -999,9 +1877,7 @@ impl Render for Floating {
                     .danger()
                     .on_click(move |_, _, cx| {
                         let _ = stop.update(cx, |r, _| {
-                            if let Some(s) = &r.session {
-                                s.command(RecordingCommand::Stop);
-                            }
+                            r.request_recording_stop();
                         });
                     }),
             )
@@ -1049,6 +1925,14 @@ impl Render for Floating {
     }
 }
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--is-production-build"))
+    {
+        std::process::exit(if is_dev_profile() { 43 } else { 42 });
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--build-identity")) {
+        println!("{}", app_name());
+        return;
+    }
     #[cfg(windows)]
     {
         let mut args = std::env::args_os().skip(1);
@@ -1063,6 +1947,13 @@ fn main() {
                 eprintln!("OpenCap file handler: {error:#}");
             }
             std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+    }
+    #[cfg(windows)]
+    if is_dev_profile() {
+        let result = unsafe { opencap_platform::set_developer_app_identity() };
+        if let Err(error) = result {
+            eprintln!("无法设置开发版 Windows 身份：{error}");
         }
     }
     struct StderrLogger;
@@ -1108,7 +1999,7 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("OpenCap".into()),
+                        title: Some(app_name().into()),
                         ..Default::default()
                     }),
                     is_resizable: true,

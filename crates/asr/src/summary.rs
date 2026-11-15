@@ -8,6 +8,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+const WORD_EXPORT_HASH: &str = "_opencap_current_word_sha256";
+const WORD_PENDING_HASH: &str = "_opencap_pending_word_sha256";
+const WORD_LAST_BACKUP: &str = "_opencap_last_word_backup";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AiProvider {
     Ollama,
@@ -98,7 +102,8 @@ impl AiConfig {
     }
     pub fn credential_id(&self) -> String {
         format!(
-            "OpenCap AI {} {}",
+            "{} AI {} {}",
+            opencap_core::app_name(),
             self.provider.label(),
             self.base_url.trim().trim_end_matches('/')
         )
@@ -118,13 +123,23 @@ fn is_loopback(url: &reqwest::Url) -> bool {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MinutesHistory {
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub versions: Vec<MinutesVersion>,
     #[serde(default)]
     pub conversation: Vec<MinutesTurn>,
+    /// The latest version for which all derived files were generated. Older
+    /// histories have no marker and can be re-exported on request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_warning: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinutesVersion {
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     pub number: u64,
     pub created_unix: u64,
     pub instruction: String,
@@ -134,6 +149,8 @@ pub struct MinutesVersion {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinutesTurn {
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     pub request: String,
     pub reply: String,
 }
@@ -142,19 +159,57 @@ impl MinutesHistory {
         self.versions.last().map_or("", |v| v.markdown.as_str())
     }
     pub fn load(base: &Path) -> Result<Self> {
+        use std::io::Read;
+        fn read_limited(path: &Path) -> Result<Vec<u8>> {
+            const LIMIT: u64 = 64 * 1024 * 1024;
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)?
+                .take(LIMIT + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= LIMIT,
+                "纪要文件超过 64 MiB；原文件保留"
+            );
+            Ok(bytes)
+        }
         let path = base.with_extension("summary.history.json");
-        if path.exists() {
-            Ok(serde_json::from_slice(&std::fs::read(path)?)?)
-        } else if base.with_extension("summary.md").exists() {
+        let history_present = match std::fs::metadata(&path) {
+            Ok(metadata) => {
+                anyhow::ensure!(metadata.is_file(), "纪要历史不是普通文件");
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let markdown_path = base.with_extension("summary.md");
+        let markdown_present = if history_present {
+            false
+        } else {
+            match std::fs::metadata(&markdown_path) {
+                Ok(metadata) => {
+                    anyhow::ensure!(metadata.is_file(), "纪要正文不是普通文件");
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if history_present {
+            Ok(serde_json::from_slice(&read_limited(&path)?)?)
+        } else if markdown_present {
             Ok(Self {
+                extra: Default::default(),
                 versions: vec![MinutesVersion {
+                    extra: Default::default(),
                     number: 1,
                     created_unix: 0,
                     instruction: "载入已有纪要".into(),
-                    markdown: std::fs::read_to_string(base.with_extension("summary.md"))?,
+                    markdown: String::from_utf8(read_limited(&markdown_path)?)?,
                     elapsed_seconds: None,
                 }],
                 conversation: vec![],
+                exported_version: None,
+                export_warning: None,
             })
         } else {
             Ok(Self::default())
@@ -164,11 +219,16 @@ impl MinutesHistory {
     pub fn save_revision(&self, base: &Path, markdown: &str, instruction: &str) -> Result<Self> {
         anyhow::ensure!(!markdown.trim().is_empty(), "纪要正文不能为空");
         anyhow::ensure!(markdown.len() <= 2_000_000, "纪要正文过长");
+        let _activity = opencap_core::managed_meeting_activity(base)?;
+        let _guard = opencap_core::meeting_metadata_guard(base)?;
+        ensure_history_current(base, self)?;
         if markdown == self.latest() {
             return Ok(self.clone());
         }
         let mut next = self.clone();
+        next.refresh_export_evidence(base)?;
         next.versions.push(MinutesVersion {
+            extra: Default::default(),
             number: next.versions.last().map_or(1, |v| v.number + 1),
             created_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             instruction: instruction.into(),
@@ -178,29 +238,420 @@ impl MinutesHistory {
         next.save(base, true)?;
         Ok(next)
     }
-    fn save(&self, base: &Path, include_document: bool) -> Result<()> {
+    /// The history is the authoritative text. Derived Markdown and Word files
+    /// can be rebuilt without submitting the meeting to the AI service again.
+    fn save(&mut self, base: &Path, include_document: bool) -> Result<()> {
+        let _meeting_activity = opencap_core::managed_meeting_activity(base)?;
         if let Some(parent) = base.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Generate everything before publication. History is the commit point and is
-        // written last, so a locked Word file cannot publish a false saved revision.
-        let history = serde_json::to_vec_pretty(self)?;
-        if include_document && let Some(v) = self.versions.last() {
-            let word = crate::minutes_docx(&v.markdown)?;
-            atomic_write(
-                &base.with_extension(format!("summary.v{:03}.docx", v.number)),
-                &word,
-            )?;
-            atomic_write(
-                &base.with_extension(format!("summary.v{:03}.md", v.number)),
-                v.markdown.as_bytes(),
-            )?;
-            atomic_write(&base.with_extension("summary.docx"), &word)?;
-            atomic_write(&base.with_extension("summary.md"), v.markdown.as_bytes())?;
+        if include_document && !self.versions.is_empty() {
+            self.export_warning = Some("正文已保存，派生文件尚未全部导出".into());
         }
-        atomic_write(&base.with_extension("summary.history.json"), &history)?;
+        atomic_write(
+            &base.with_extension("summary.history.json"),
+            &serde_json::to_vec_pretty(self)?,
+        )?;
+        if include_document && !self.versions.is_empty() {
+            self.export_derived(base);
+        }
         Ok(())
     }
+
+    pub fn exports_pending(&self) -> bool {
+        self.versions
+            .last()
+            .is_some_and(|v| self.exported_version != Some(v.number))
+            || self.export_warning.is_some()
+    }
+    pub fn last_word_backup_path(&self, base: &Path) -> Option<std::path::PathBuf> {
+        let suffix = self.extra.get(WORD_LAST_BACKUP)?.as_str()?;
+        let id = suffix
+            .strip_prefix("summary.word-backup-")?
+            .strip_suffix(".docx")?;
+        let bytes = id.as_bytes();
+        if bytes.len() != 36
+            || !bytes.iter().enumerate().all(|(index, byte)| {
+                if [8, 13, 18, 23].contains(&index) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+        {
+            return None;
+        }
+        Some(base.with_extension(suffix))
+    }
+
+    /// Retry locally from committed text; never call the AI provider again.
+    pub fn retry_exports(mut self, base: &Path) -> Result<Self> {
+        let _meeting_activity = opencap_core::managed_meeting_activity(base)?;
+        let _guard = opencap_core::meeting_metadata_guard(base)?;
+        ensure_history_current(base, &self)?;
+        self.refresh_export_evidence(base)?;
+        anyhow::ensure!(!self.versions.is_empty(), "没有可导出的纪要正文");
+        self.export_derived(base);
+        Ok(self)
+    }
+
+    /// Explicit user action: preserve the exact current Word file before
+    /// allowing it to be replaced by a new export from the saved history.
+    pub fn backup_word_and_retry(mut self, base: &Path) -> Result<Self> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        const LIMIT: u64 = 64 * 1024 * 1024;
+        let _activity = opencap_core::managed_meeting_activity(base)?;
+        let _guard = opencap_core::meeting_metadata_guard(base)?;
+        ensure_history_current(base, &self)?;
+        self.refresh_export_evidence(base)?;
+        anyhow::ensure!(!self.versions.is_empty(), "没有可导出的纪要正文");
+        let source = base.with_extension("summary.docx");
+        let path_metadata = std::fs::symlink_metadata(&source).context("无法读取当前 Word")?;
+        anyhow::ensure!(
+            path_metadata.is_file() && !path_metadata.file_type().is_symlink(),
+            "当前 Word 不是普通文件"
+        );
+        let mut file = std::fs::File::open(&source)?;
+        let before = file.metadata()?;
+        anyhow::ensure!(
+            before.is_file() && before.len() <= LIMIT,
+            "当前 Word 不是普通文件或超过 64 MiB"
+        );
+        let identity = same_file::Handle::from_file(file.try_clone()?)?;
+        let mut bytes = Vec::new();
+        (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        let current_path = std::fs::symlink_metadata(&source)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= LIMIT
+                && before.len() == bytes.len() as u64
+                && before.len() == after.len()
+                && before.modified().ok() == after.modified().ok()
+                && current_path.is_file()
+                && !current_path.file_type().is_symlink()
+                && identity == same_file::Handle::from_path(&source)?,
+            "备份期间 Word 发生变化，未覆盖"
+        );
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let backup_suffix = format!("summary.word-backup-{}.docx", opencap_core::new_stable_id());
+        let backup = base.with_extension(&backup_suffix);
+        opencap_core::atomic_create_bytes(&backup, &bytes).with_context(|| {
+            format!(
+                "Word 备份未确认完成；如有文件请检查 {}，原文件未覆盖",
+                backup.display()
+            )
+        })?;
+        let copied = opencap_core::fingerprint_media(&backup, None)
+            .with_context(|| format!("无法核对 Word 备份 {}；原文件未覆盖", backup.display()))?;
+        anyhow::ensure!(
+            copied.size_bytes == bytes.len() as u64 && copied.sha256 == digest,
+            "Word 备份校验失败；文件保留在 {}，原文件未覆盖",
+            backup.display()
+        );
+        let registered = backup.file_name().context("备份文件名无效")?;
+        opencap_core::register_meeting_asset(
+            base,
+            "minutes_word_backup",
+            opencap_core::AssetOwnership::Managed,
+            Path::new(registered),
+        )
+        .with_context(|| {
+            format!(
+                "Word 副本已保存至 {}，但资产登记失败；原文件未覆盖",
+                backup.display()
+            )
+        })?;
+        let current_path = std::fs::symlink_metadata(&source)?;
+        anyhow::ensure!(
+            current_path.is_file()
+                && !current_path.file_type().is_symlink()
+                && identity == same_file::Handle::from_path(&source)?
+                && opencap_core::fingerprint_media(&source, None)?.sha256 == digest
+                && identity == same_file::Handle::from_path(&source)?,
+            "备份后 Word 已变化；副本保留在 {}，当前文件未覆盖",
+            backup.display()
+        );
+        // Do not keep source handles alive while replacing the current Word;
+        // some Windows file systems reject replacement while a handle is open.
+        drop(identity);
+        drop(file);
+        self.extra.insert(WORD_EXPORT_HASH.into(), digest.into());
+        self.extra.remove(WORD_PENDING_HASH);
+        self.extra
+            .insert(WORD_LAST_BACKUP.into(), backup_suffix.into());
+        self.export_warning = Some("已备份原 Word；等待重新导出".into());
+        atomic_write(
+            &base.with_extension("summary.history.json"),
+            &serde_json::to_vec_pretty(&self)?,
+        )
+        .with_context(|| {
+            format!(
+                "Word 副本已保存至 {}，但备份状态未记录；原文件未覆盖",
+                backup.display()
+            )
+        })?;
+        self.export_derived(base);
+        Ok(self)
+    }
+
+    fn export_derived(&mut self, base: &Path) {
+        fn write_current_word(
+            history: &mut MinutesHistory,
+            base: &Path,
+            bytes: &[u8],
+        ) -> Result<std::path::PathBuf> {
+            use sha2::{Digest, Sha256};
+            let path = base.with_extension("summary.docx");
+            let existing = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    anyhow::ensure!(
+                        metadata.is_file() && !metadata.file_type().is_symlink(),
+                        "Word 文件不是普通文件，已保留：{}",
+                        path.display()
+                    );
+                    anyhow::ensure!(
+                        metadata.len() <= 64 * 1024 * 1024,
+                        "Word 文件过大，已保留：{}",
+                        path.display()
+                    );
+                    Some(opencap_core::fingerprint_media(&path, None)?.sha256)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("无法核对 Word {}", path.display()));
+                }
+            };
+            let desired = format!("{:x}", Sha256::digest(bytes));
+            if let Some(actual) = existing.as_deref() {
+                let recorded = [WORD_EXPORT_HASH, WORD_PENDING_HASH]
+                    .into_iter()
+                    .any(|key| {
+                        history.extra.get(key).and_then(|value| value.as_str()) == Some(actual)
+                    });
+                anyhow::ensure!(
+                    recorded || actual == desired,
+                    "Word 文件未能确认是上次导出的内容，已保留；请先导入并另存或移走后重试：{}",
+                    path.display()
+                );
+                // A prior interrupted publication may have left the current
+                // file matching only the pending hash. Preserve that trusted
+                // predecessor before replacing the pending hash with a new
+                // attempt, so another interruption remains recoverable.
+                history
+                    .extra
+                    .insert(WORD_EXPORT_HASH.into(), actual.to_owned().into());
+            }
+            // Persist the intended hash first. If publication or its final
+            // bookkeeping is interrupted, a retry can recognize either the
+            // prior file or exactly this pending output.
+            history
+                .extra
+                .insert(WORD_PENDING_HASH.into(), desired.clone().into());
+            history.export_warning = Some("正文已保存，Word 文件正在发布或等待核对".into());
+            atomic_write(
+                &base.with_extension("summary.history.json"),
+                &serde_json::to_vec_pretty(history)?,
+            )?;
+            atomic_write(&path, bytes)
+                .with_context(|| format!("无法发布 Word {}", path.display()))?;
+            history
+                .extra
+                .insert(WORD_EXPORT_HASH.into(), desired.into());
+            history.extra.remove(WORD_PENDING_HASH);
+            Ok(path)
+        }
+        fn check_markdown<'a>(path: &Path, known: impl Iterator<Item = &'a [u8]>) -> Result<()> {
+            use std::io::Read;
+            const LIMIT: u64 = 64 * 1024 * 1024;
+            let mut file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("无法核对 {}", path.display()));
+                }
+            };
+            let before = file.metadata()?;
+            anyhow::ensure!(
+                before.is_file() && before.len() <= LIMIT,
+                "纪要文件不是普通文件或过大：{}",
+                path.display()
+            );
+            let identity = same_file::Handle::from_file(file.try_clone()?)?;
+            let mut bytes = Vec::new();
+            (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+            let after = file.metadata()?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= LIMIT
+                    && before.len() == bytes.len() as u64
+                    && before.len() == after.len()
+                    && before.modified().ok() == after.modified().ok()
+                    && identity == same_file::Handle::from_path(path)?,
+                "纪要文件在核对期间发生变化：{}",
+                path.display()
+            );
+            anyhow::ensure!(
+                known.into_iter().any(|version| version == bytes.as_slice()),
+                "纪要文件与已保存历史不一致，已保留；请先导入或另存：{}",
+                path.display()
+            );
+            Ok(())
+        }
+        fn write_derived(
+            path: std::path::PathBuf,
+            bytes: &[u8],
+            preserve: bool,
+        ) -> Result<std::path::PathBuf> {
+            if !(preserve && path.is_file()) {
+                atomic_write(&path, bytes).with_context(|| format!("{}", path.display()))?;
+            }
+            Ok(path)
+        }
+        fn collect(
+            result: Result<std::path::PathBuf>,
+            written: &mut Vec<std::path::PathBuf>,
+            errors: &mut Vec<String>,
+        ) {
+            match result {
+                Ok(path) => written.push(path),
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+        let mut errors = Vec::new();
+        let mut written = Vec::new();
+        // Version files are immutable once present. Missing older versions can
+        // be rebuilt after an earlier interrupted export without overwriting edits.
+        for version in &self.versions {
+            let markdown_path = base.with_extension(format!("summary.v{:03}.md", version.number));
+            collect(
+                check_markdown(&markdown_path, std::iter::once(version.markdown.as_bytes()))
+                    .and_then(|()| write_derived(markdown_path, version.markdown.as_bytes(), true)),
+                &mut written,
+                &mut errors,
+            );
+            match crate::minutes_docx(&version.markdown) {
+                Ok(word) => collect(
+                    write_derived(
+                        base.with_extension(format!("summary.v{:03}.docx", version.number)),
+                        &word,
+                        true,
+                    ),
+                    &mut written,
+                    &mut errors,
+                ),
+                Err(error) => errors.push(format!("生成 v{} Word：{error}", version.number)),
+            }
+        }
+        if let Some(markdown) = self.versions.last().map(|version| version.markdown.clone()) {
+            let markdown_path = base.with_extension("summary.md");
+            collect(
+                check_markdown(
+                    &markdown_path,
+                    self.versions
+                        .iter()
+                        .map(|version| version.markdown.as_bytes()),
+                )
+                .and_then(|()| write_derived(markdown_path, markdown.as_bytes(), false)),
+                &mut written,
+                &mut errors,
+            );
+            match crate::minutes_docx(&markdown) {
+                Ok(word) => collect(
+                    write_current_word(self, base, &word),
+                    &mut written,
+                    &mut errors,
+                ),
+                Err(error) => errors.push(format!("生成 Word：{error}")),
+            }
+        }
+        written.push(base.with_extension("summary.history.json"));
+        for path in written {
+            if let Some(name) = path.file_name()
+                && let Err(error) = opencap_core::register_meeting_asset(
+                    base,
+                    "minutes",
+                    opencap_core::AssetOwnership::Managed,
+                    Path::new(name),
+                )
+            {
+                errors.push(format!("登记 {}：{error}", path.display()));
+            }
+        }
+        let previous_exported = self.exported_version;
+        if errors.is_empty() {
+            self.exported_version = self.versions.last().map(|version| version.number);
+            self.export_warning = None;
+        } else {
+            self.export_warning = Some(format!(
+                "正文已保存；部分文件导出失败，可重试：{}",
+                errors.join("；")
+            ));
+        }
+        if let Err(error) = serde_json::to_vec_pretty(self)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| atomic_write(&base.with_extension("summary.history.json"), &bytes))
+        {
+            // The first write already committed the body with a pending marker.
+            self.exported_version = previous_exported;
+            self.export_warning = Some(format!("正文已保存；无法记录导出状态，请重试：{error}"));
+        }
+    }
+
+    fn refresh_export_evidence(&mut self, base: &Path) -> Result<()> {
+        let current = Self::load(base)?;
+        for key in [WORD_EXPORT_HASH, WORD_PENDING_HASH] {
+            if let Some(value) = current.extra.get(key) {
+                self.extra.insert(key.into(), value.clone());
+            } else {
+                self.extra.remove(key);
+            }
+        }
+        Ok(())
+    }
+}
+fn ensure_history_current(base: &Path, expected: &MinutesHistory) -> Result<()> {
+    let current = MinutesHistory::load(base)?;
+    let mut current = serde_json::to_value(current)?;
+    let mut expected = serde_json::to_value(expected)?;
+    // Export status is recoverable bookkeeping and may differ in memory if
+    // recording that status failed after the body was safely committed.
+    for value in [&mut current, &mut expected] {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("exported_version");
+            object.remove("export_warning");
+            object.remove(WORD_EXPORT_HASH);
+            object.remove(WORD_PENDING_HASH);
+        }
+    }
+    anyhow::ensure!(
+        current == expected,
+        "纪要历史已被其他操作修改；未覆盖，请重新载入后重试"
+    );
+    Ok(())
+}
+/// Preserve a completed but uncommitted AI result without replacing the
+/// current history. The file is explicitly a recovery copy, not a revision.
+fn save_minutes_recovery(
+    base: &Path,
+    history: &MinutesHistory,
+) -> Result<(std::path::PathBuf, Option<String>)> {
+    let path = base.with_extension(format!(
+        "summary.recovery-{}.json",
+        opencap_core::new_stable_id()
+    ));
+    let document = json!({ "kind": "uncommitted_minutes_result", "history": history });
+    opencap_core::atomic_create_bytes(&path, &serde_json::to_vec_pretty(&document)?)?;
+    let warning = path.file_name().and_then(|name| {
+        opencap_core::register_meeting_asset(
+            base,
+            "minutes_recovery",
+            opencap_core::AssetOwnership::Managed,
+            Path::new(name),
+        )
+        .err()
+        .map(|error| format!("资产登记失败：{error:#}"))
+    });
+    Ok((path, warning))
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MinutesAction {
@@ -298,11 +749,10 @@ pub fn edit_minutes_with_events(
     cancelled: &AtomicBool,
     mut event: impl FnMut(MinutesEvent),
 ) -> Result<MinutesHistory> {
+    let _meeting_activity = opencap_core::managed_meeting_activity(output)?;
+    let original_history = history.clone();
     let began = Instant::now();
-    anyhow::ensure!(
-        transcript.complete && !transcript.cancelled,
-        "请先完整完成转录"
-    );
+    anyhow::ensure!(transcript.is_complete(), "请先完整完成转录");
     config.validate()?;
     anyhow::ensure!(
         config.is_local() || !api_key.trim().is_empty(),
@@ -319,16 +769,21 @@ pub fn edit_minutes_with_events(
     let mut group_len = 0;
     let mut groups = Vec::new();
     let mut group = String::new();
+    let speakers = transcript.speaker_timeline();
     for s in transcript
         .segments
         .iter()
-        .filter(|s| s.finalized && !s.text.is_empty())
+        .filter(|s| s.is_confirmed() && !s.text.is_empty())
     {
         let line = format!(
             "[段{} {} {}] {}\n",
             s.id,
-            timestamp(s.start_ms, '.'),
-            transcript.speaker_label(s.start_ms, s.end_ms),
+            if s.end_ms > s.start_ms {
+                timestamp(s.start_ms, '.')
+            } else {
+                "时间不可用".into()
+            },
+            speakers.label(s.start_ms, s.end_ms),
             s.text
         );
         let line_len = line.chars().count();
@@ -426,6 +881,7 @@ pub fn edit_minutes_with_events(
             text.push_str(&transcript.speaker_index_markdown());
         }
         history.versions.push(MinutesVersion {
+            extra: Default::default(),
             number: history.versions.last().map_or(1, |v| v.number + 1),
             created_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             instruction: if instruction.trim().is_empty() {
@@ -438,6 +894,7 @@ pub fn edit_minutes_with_events(
         });
     }
     history.conversation.push(MinutesTurn {
+        extra: Default::default(),
         request: if instruction.trim().is_empty() {
             task.into()
         } else {
@@ -449,11 +906,32 @@ pub fn edit_minutes_with_events(
         if action == MinutesAction::Ask {
             "保存对话…"
         } else {
-            "生成 Word 文档并保存纪要版本…"
+            "先保存纪要正文，再生成 Word 文档…"
         }
         .into(),
     ));
-    history.save(output, action != MinutesAction::Ask)?;
+    let committed = (|| -> Result<()> {
+        let _guard = opencap_core::meeting_metadata_guard(output)?;
+        ensure_history_current(output, &original_history)?;
+        history.refresh_export_evidence(output)?;
+        history.save(output, action != MinutesAction::Ask)
+    })();
+    if let Err(error) = committed {
+        match save_minutes_recovery(output, &history) {
+            Ok((path, warning)) => {
+                let warning = warning
+                    .map(|value| format!("；{value}"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "纪要未提交：{error:#}；生成结果已另存至 {}{warning}",
+                    path.display()
+                );
+            }
+            Err(recovery) => anyhow::bail!(
+                "纪要未提交：{error:#}；恢复副本保存失败：{recovery:#}，请保留当前窗口中的生成内容"
+            ),
+        }
+    }
     Ok(history)
 }
 pub(super) fn check_cancel(cancelled: &AtomicBool) -> Result<()> {
@@ -526,7 +1004,12 @@ impl<'a> AiClient<'a> {
             }
         }
     }
-    fn generate(&self, system: &str, prompt: &str, cancelled: &AtomicBool) -> Result<String> {
+    pub(crate) fn generate(
+        &self,
+        system: &str,
+        prompt: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<String> {
         check_cancel(cancelled)?;
         let provider = self.config.provider;
         let body = self.body(system, prompt);
@@ -632,8 +1115,10 @@ impl<'a> AiClient<'a> {
     }
 }
 pub(super) fn parse_reply(provider: AiProvider, value: &Value) -> Result<String> {
+    // A successful Responses document may carry `"error": null`; only a
+    // non-null error object means the service refused the request.
     anyhow::ensure!(
-        value.get("error").is_none(),
+        value.get("error").is_none_or(Value::is_null),
         "AI 服务报告生成错误；已有纪要保留"
     );
     let text = match provider {
@@ -722,16 +1207,21 @@ pub fn summarize(transcript: &Transcript, model: Option<&str>, output: &Path) ->
         .latest()
         .to_string());
     }
-    anyhow::ensure!(transcript.complete, "请先完整完成转录");
+    anyhow::ensure!(transcript.is_complete(), "请先完整完成转录");
     let mut md = String::from(
         "# 转录摘录（未启用 AI 纪要）\n\n以下为已确认原文，尚未提取决策或待办。请配置 AI 后生成会议纪要。\n\n",
     );
-    for s in transcript.segments.iter().filter(|s| s.finalized) {
+    let speakers = transcript.speaker_timeline();
+    for s in transcript.segments.iter().filter(|s| s.is_confirmed()) {
         md.push_str(&format!(
             "- [段{} {} {}] {}\n",
             s.id,
-            timestamp(s.start_ms, '.'),
-            transcript.speaker_label(s.start_ms, s.end_ms),
+            if s.end_ms > s.start_ms {
+                timestamp(s.start_ms, '.')
+            } else {
+                "时间不可用".into()
+            },
+            speakers.label(s.start_ms, s.end_ms),
             s.text
         ));
     }
@@ -783,10 +1273,12 @@ pub(crate) mod tests {
                 .as_nanos()
         ));
         let base = dir.join("meeting");
+        std::fs::create_dir_all(&base).unwrap();
         let transcript = Transcript {
             complete: true,
             segments: (0..2)
                 .map(|id| crate::Segment {
+                    extra: Default::default(),
                     id,
                     revision: 1,
                     start_ms: id * 1000,
@@ -907,6 +1399,7 @@ pub(crate) mod tests {
         let transcript = Transcript {
             complete: true,
             segments: vec![crate::Segment {
+                extra: Default::default(),
                 id: 0,
                 revision: 1,
                 start_ms: 0,
@@ -993,17 +1486,27 @@ pub(crate) mod tests {
                 .contains("预算仍未定")
         );
         assert!(base.with_extension("summary.v001.docx").exists());
-        let saved = std::fs::read(base.with_extension("summary.history.json")).unwrap();
         std::fs::remove_file(base.with_extension("summary.docx")).unwrap();
         std::fs::create_dir(base.with_extension("summary.docx")).unwrap();
-        assert!(h.save_revision(&base, "# 不应发布", "失败写入").is_err());
-        assert_eq!(
-            std::fs::read(base.with_extension("summary.history.json")).unwrap(),
-            saved
-        );
+        let saved = h
+            .save_revision(&base, "# 正文仍要保存", "Word 写入失败")
+            .unwrap();
+        assert!(saved.exports_pending());
+        assert!(saved.export_warning.is_some());
+        let reopened = MinutesHistory::load(&base).unwrap();
+        assert_eq!(reopened.latest(), "# 正文仍要保存");
+        assert!(reopened.exports_pending());
         assert_eq!(
             std::fs::read_to_string(base.with_extension("summary.md")).unwrap(),
-            body
+            "# 正文仍要保存"
+        );
+        std::fs::remove_dir(base.with_extension("summary.docx")).unwrap();
+        let retried = reopened.retry_exports(&base).unwrap();
+        assert!(!retried.exports_pending());
+        assert!(
+            crate::read_minutes_document(&base.with_extension("summary.docx"))
+                .unwrap()
+                .contains("正文仍要保存")
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1022,6 +1525,7 @@ pub(crate) mod tests {
             complete: true,
             segments: (0..12)
                 .map(|i| crate::Segment {
+                    extra: Default::default(),
                     id: i,
                     revision: 1,
                     start_ms: i * 1000,
@@ -1033,6 +1537,7 @@ pub(crate) mod tests {
                 })
                 .collect(),
             speaker_turns: vec![crate::SpeakerTurn {
+                extra: Default::default(),
                 start_ms: 0,
                 end_ms: 12000,
                 speaker: 1,
@@ -1041,6 +1546,7 @@ pub(crate) mod tests {
         };
         let dir =
             std::env::temp_dir().join(format!("opencap-single-request-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("meeting")).unwrap();
         let history = edit_minutes(
             &transcript,
             &config,
@@ -1162,6 +1668,7 @@ pub(crate) mod tests {
         let transcript = Transcript {
             complete: true,
             segments: vec![crate::Segment {
+                extra: Default::default(),
                 id: 0,
                 revision: 1,
                 start_ms: 0,
@@ -1173,11 +1680,13 @@ pub(crate) mod tests {
             }],
             speaker_turns: vec![
                 crate::SpeakerTurn {
+                    extra: Default::default(),
                     start_ms: 0,
                     end_ms: 1000,
                     speaker: 1,
                 },
                 crate::SpeakerTurn {
+                    extra: Default::default(),
                     start_ms: 1000,
                     end_ms: 2000,
                     speaker: 2,
@@ -1259,6 +1768,7 @@ pub(crate) mod tests {
             let transcript = Transcript {
                 complete: true,
                 segments: vec![crate::Segment {
+                    extra: Default::default(),
                     id: 0,
                     revision: 1,
                     start_ms: 640,

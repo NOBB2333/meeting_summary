@@ -116,7 +116,7 @@ impl Recorder {
 
 impl Recorder {
     pub(crate) fn vocabulary_settings_view(&self, cx: &Context<Self>) -> Div {
-        let busy = self.active() || self.transcription_busy();
+        let busy = self.active() || self.minutes_task_busy() || self.ai.correction_task.is_some();
         div().flex().flex_col().gap_4()
             .child(ui::card().child(ui::section_title("全局专业词表", "保存一次，所有会议的全文校正与 AI 纪要共用"))
                 .child(label("每行一个标准词，或“误识别词 => 正确词”。可填写公司、人名、中英文缩写和行业术语。"))
@@ -127,12 +127,12 @@ impl Recorder {
                         this.ai.status = match this.save_minutes_format() { Ok(()) => "全局词表已保存，所有会议都会使用。".into(), Err(e) => e.to_string() }; cx.notify();
                     })))
                 .child(label("词表是大模型校对时的提示；不会把词表中的内容当作会议事实。打开逐字稿后可执行“AI 校正全文”。")))
-            .child(ui::card().child(ui::section_title("识别语言", "下次文件识别及实时整句校正生效"))
+            .child(ui::card().child(ui::section_title("识别语言", "下次 SenseVoice 文件识别或句段复核使用"))
                 .child(div().flex().flex_wrap().gap_2().children(TranscriptionLanguage::ALL.into_iter().map(|language| {
                     button(("asr-language", language as usize), language.label(), self.config.transcription_language == language).disabled(busy)
                         .on_click(cx.listener(move |this, _, _, cx| { this.config.transcription_language = language; this.save(); cx.notify(); }))
                 })))
-                .child(label("中英混说建议中文为主，纯英文选择英文；自动包含中英日韩粤。语言提示不能完全排除误判，历史文字可通过 AI 全文校正处理。")))
+                .child(label("SenseVoice 可请求中文、英文或自动；自动模式可能识别中英日韩粤，效果尚未验收。流式 Zipformer 和 Paraformer 当前不会接收此语言模式；语言设置不能保证识别语言正确。")))
             .child(ui::card().child(ui::section_title("流式中文热词", "只影响实时中文识别；英文专业词请放到上方全局词表"))
                 .child(Input::new(&self.hotwords_input).disabled(busy))
                 .child(button("apply-hotwords", "保存识别热词", false).disabled(busy)
@@ -140,7 +140,7 @@ impl Recorder {
             .child(label(self.ai.status.clone()))
     }
     pub(crate) fn template_settings_view(&self, cx: &Context<Self>) -> Div {
-        let busy = self.active() || self.transcription_busy();
+        let busy = self.active() || self.minutes_task_busy() || self.ai.correction_task.is_some();
         ui::card()
             .child(ui::section_title(
                 "全局纪要模板",

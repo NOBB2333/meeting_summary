@@ -1,9 +1,53 @@
 //! Document reading and tools occupy the same bounded pane, never stack beneath it.
 use super::*;
 
+fn minutes_recovery_files(base: &std::path::Path) -> Vec<PathBuf> {
+    let Some(name) = base.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{name}.summary.recovery-");
+    let folder = base.parent().unwrap_or(std::path::Path::new("."));
+    let mut files: Vec<_> = std::fs::read_dir(folder)
+        .ok()
+        .into_iter()
+        .flatten()
+        .take(5000)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|entry| {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            let Some(id) = name
+                .strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                return false;
+            };
+            let bytes = id.as_bytes();
+            bytes.len() == 36
+                && bytes.iter().enumerate().all(|(i, byte)| {
+                    if [8, 13, 18, 23].contains(&i) {
+                        *byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                })
+        })
+        .map(|entry| entry.path())
+        .collect();
+    files.sort_by(|a, b| {
+        let modified = |path: &PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        modified(b).cmp(&modified(a)).then_with(|| a.cmp(b))
+    });
+    files.truncate(20);
+    files
+}
+
 impl Recorder {
     pub(super) fn minutes_artifact_view(&self, cx: &Context<Self>) -> Div {
-        let busy = self.active() || self.transcription_busy();
+        let busy = self.active() || self.minutes_task_busy();
         let title = self
             .ai
             .file_preview
@@ -133,11 +177,14 @@ impl Recorder {
                     .disabled(busy || self.transcript_output.is_none() || selected_old)
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.ai.editing {
-                            if let Some(base) = &this.ai.editor_base {
-                                let _ =
-                                    std::fs::remove_file(base.with_extension("summary.draft.md"));
+                            if let Some(base) = this.ai.editor_base.clone()
+                                && let Err(error) = this.remove_minutes_draft_if_unchanged(&base)
+                            {
+                                this.ai.status = format!("当前编辑已放弃；其他草稿保留：{error:#}");
                             }
                             this.ai.draft_saved.clear();
+                            this.ai.draft_exists = false;
+                            this.ai.draft_recovery = None;
                         }
                         this.ai.editor.update(cx, |s, cx| {
                             s.set_value(this.summary_text.clone(), window, cx)
@@ -152,6 +199,14 @@ impl Recorder {
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, _, cx| this.save_manual_minutes(cx))),
                     )
+                    .child(
+                        button("save-minutes-draft-recovery", "另存恢复副本", false)
+                            .ghost()
+                            .disabled(busy)
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.save_minutes_draft_recovery(cx)),
+                            ),
+                    )
                 })
                 .when(!self.ai.editing, |d| {
                     d.child(
@@ -165,7 +220,10 @@ impl Recorder {
                                         .map(|n| format!("summary.v{n:03}.docx"))
                                         .unwrap_or_else(|| "summary.docx".into());
                                     let path = base.with_extension(extension);
-                                    if !path.exists() {
+                                    if !path.exists()
+                                        || (this.ai.artifact_version.is_none()
+                                            && this.ai.history.exports_pending())
+                                    {
                                         let text = this
                                             .ai
                                             .artifact_version
@@ -238,7 +296,7 @@ impl Recorder {
         )
     }
     fn minutes_document_tools(&self, cx: &Context<Self>) -> Stateful<Div> {
-        let busy = self.active() || self.transcription_busy();
+        let busy = self.active() || self.minutes_task_busy();
         let mut tools = div()
             .id("minutes-tools-scroll")
             .flex_1()
@@ -250,6 +308,7 @@ impl Recorder {
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
         if let Some(base) = &self.transcript_output {
             let word = base.with_extension("summary.docx");
+            let word_exists = word.is_file();
             let markdown = base.with_extension("summary.md");
             let folder = base
                 .parent()
@@ -264,7 +323,7 @@ impl Recorder {
                         .gap_2()
                         .child(
                             button("open-minutes", "打开 Word", false)
-                                .disabled(!word.exists())
+                                .disabled(!word_exists)
                                 .on_click(move |_, _, _| {
                                     let _ = opencap_platform::open_path(&word);
                                 }),
@@ -286,7 +345,60 @@ impl Recorder {
                     button("sync-minutes-file", "导入外部修改…", false)
                         .disabled(busy || self.ai.editing)
                         .on_click(cx.listener(|this, _, _, cx| this.import_minutes_file(cx))),
+                )
+                .child(
+                    button("retry-minutes-exports", "重试导出已保存正文", false)
+                        .disabled(busy || self.ai.editing || self.ai.history.versions.is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_minutes_exports(cx))),
                 );
+            tools = tools.when(word_exists && self.ai.history.exports_pending(), |d| {
+                d.child(label("如现有 Word 含需保留的修改，请先打开或导入核对。备份操作会保留原文件副本，再用已保存正文重试导出。"))
+                    .child(button("backup-word-retry", "备份现有 Word 并重试", false)
+                        .disabled(busy || self.ai.editing || self.ai.history.versions.is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| this.backup_word_and_retry_exports(cx))))
+            });
+            if let Some(backup) = self.ai.history.last_word_backup_path(base) {
+                tools = tools.child(label(format!(
+                    "最近 Word 备份：{}（可在会议文件夹查看）",
+                    backup.display()
+                )));
+            }
+            tools = tools.child(
+                button("reload-minutes-history", "重新载入已保存历史", false)
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.reload_minutes_history(cx))),
+            );
+            let recoveries = minutes_recovery_files(base);
+            if !recoveries.is_empty() {
+                tools = tools.child(label("未提交的纪要恢复副本 · 请先核对（最多显示 20 份）"));
+                for (index, path) in recoveries.into_iter().enumerate() {
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    tools = tools.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(label(name).flex_1().min_w(px(0.)).truncate())
+                            .child(
+                                button(("preview-minutes-recovery", index), "查看并复制", false)
+                                    .ghost()
+                                    .disabled(self.ai.editing)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.ai.file_preview = Some((
+                                            format!("纪要恢复副本 {}", index + 1),
+                                            this.create_text_document(path.clone(), window, cx),
+                                        ));
+                                        this.ai.document_tools_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+                }
+            }
         }
         tools = tools.child(label(format!(
             "保存的版本 · {}",
@@ -350,7 +462,7 @@ impl Recorder {
         }
         tools.child(
             button("regenerate-minutes", "按全局模板重新生成", false)
-                .disabled(busy || self.ai.editing || !self.transcript.complete)
+                .disabled(busy || self.ai.editing || !self.transcript.is_complete())
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.ai.document_tools_open = false;
                     this.request_minutes(MinutesAction::Generate, cx);

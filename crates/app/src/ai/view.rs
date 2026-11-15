@@ -13,8 +13,8 @@ impl Recorder {
         cx.notify();
     }
     pub(crate) fn minutes_view(&self, width: f32, height: f32, cx: &Context<Self>) -> Div {
-        let busy = self.active() || self.transcription_busy();
-        let ready = self.transcript.complete && !self.transcript.text().is_empty();
+        let busy = self.active() || self.minutes_task_busy();
+        let ready = self.transcript.is_complete() && !self.transcript.text().is_empty();
         let wide = width >= 860.;
         let short = height < 620.;
         let showing_document = self.ai.artifact_open && (wide || !self.ai.conversation_tab);
