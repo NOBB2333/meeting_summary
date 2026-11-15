@@ -30,6 +30,8 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Verify the audio filters used by playback without requiring an audio device.
+    PlaybackFilterProbe,
     /// Native WGC + WASAPI recording. Ctrl+C stops and finalizes the MP4.
     Record {
         #[command(flatten)]
@@ -177,6 +179,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
     match Cli::parse().command {
+        Command::PlaybackFilterProbe => {
+            opencap_media::verify_playback_filters()?;
+            println!("Playback audio filters are available.");
+        }
         Command::Sources => {
             for source in opencap_platform::targets()? {
                 println!(

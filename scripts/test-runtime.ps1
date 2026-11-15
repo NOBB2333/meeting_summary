@@ -98,6 +98,9 @@ try {
     Invoke-CleanBench 'version' @('--version')
     Invoke-CleanBench 'transcribe-help' @('--help') -Executable 'opencap-transcribe.exe'
     Invoke-CleanBench 'runtime-fixture' @('fixture', '--seconds', '5', '--width', '160', '--height', '90', '--codec', 'h264', '--encoder', 'libx264', '--output', (Join-Path $outputPath ('fixture-' + [Guid]::NewGuid().ToString('N'))))
+    # The recording fixture exercises the encoder; separately validate the
+    # filters used by pitch-preserving playback in the same clean environment.
+    Invoke-CleanBench 'playback-filter-probe' @('playback-filter-probe')
     $report.cli_passed = $true
     if (!$CliOnly) {
         $gui = Start-CleanProcess 'opencap.exe'
