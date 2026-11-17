@@ -445,6 +445,11 @@ pub fn reconcile_asset_fingerprint(transcript: &mut Transcript, base: &Path) -> 
 pub enum AsrEvent {
     Status(String),
     RevisionStatus(RevisionRuntimeState, Option<String>),
+    /// A missing punctuation model became available after recognition began.
+    PunctuationReady {
+        start_ms: u64,
+        fingerprint: opencap_core::MediaFingerprint,
+    },
     Started(TranscriptionRun),
     Segment(Segment),
     Progress(f64),
@@ -1112,6 +1117,17 @@ impl AsrSession {
                             punctuation_enabled && kind != ModelKind::Offline;
                         let allow_punctuation_model = historical.as_ref()
                             .is_none_or(|spec| spec.run.punctuation_effective == "ct_transformer");
+                        // For offline file processing, prepare punctuation before decoding;
+                        // live recording must never wait for a network download.
+                        if needs_punctuation_model && historical.is_none()
+                            && source.is_some() && !realtime
+                            && !crate::punctuation::installed_model_verified(&root, &worker_cancelled).unwrap_or(false) {
+                            let _ = tx.send(AsrEvent::Status("正在准备中英标点模型…".into()));
+                            if let Err(error) = crate::prepare_punctuation_cancellable(&root, &worker_cancelled, |_, _| {}) {
+                                crate::models::ensure_download_active(&worker_cancelled)?;
+                                let _ = tx.send(AsrEvent::Status(format!("标点模型下载失败，暂只能补句末标点：{error:#}")));
+                            }
+                        }
                         if let Some(expected) = historical.as_ref().and_then(|spec| spec.punctuation_hash.as_ref()) {
                             let before = opencap_core::fingerprint_media(
                                 &crate::punctuation::punctuation_model_path(&root), Some(&worker_cancelled))?;
@@ -1124,8 +1140,32 @@ impl AsrSession {
                             crate::models::ensure_download_active(&worker_cancelled)?;
                             result.ok()
                         } else { None };
+                        // A same-sized damaged cache is not a usable model. A
+                        // historical replay can still load its exact pinned hash.
+                        let allow_current_model = allow_punctuation_model && (historical.is_some()
+                            || punctuation_before.as_ref().is_some_and(crate::punctuation::punctuation_reference_match));
                         let punctuation = Arc::new(Punctuator::with_model_policy(
-                            &root, needs_punctuation_model, language, allow_punctuation_model));
+                            &root, needs_punctuation_model, language, allow_current_model));
+                        let mut punctuation_download = if needs_punctuation_model && historical.is_none()
+                            && !punctuation.has_model() && (source.is_none() || realtime) {
+                            let (result_tx, result_rx) = bounded(1);
+                            let download_root = root.clone();
+                            let download_cancelled = worker_cancelled.clone();
+                            thread::Builder::new().name("opencap-punctuation-download".into()).spawn(move || {
+                                let result = (|| -> Result<_> {
+                                    crate::prepare_punctuation_cancellable(&download_root, &download_cancelled, |_, _| {})?;
+                                    let path = crate::punctuation::punctuation_model_path(&download_root);
+                                    let before = opencap_core::fingerprint_media(&path, Some(&download_cancelled))?;
+                                    let model = Punctuator::load_model(&download_root)
+                                        .ok_or_else(|| anyhow::anyhow!("标点模型无法加载"))?;
+                                    let after = opencap_core::fingerprint_media(&path, Some(&download_cancelled))?;
+                                    anyhow::ensure!(before == after, "标点模型加载期间发生变化");
+                                    Ok((model, after))
+                                })();
+                                let _ = result_tx.send(result);
+                            })?;
+                            Some(result_rx)
+                        } else { None };
                         let punctuation_fingerprint = if punctuation.has_model() {
                             match opencap_core::fingerprint_media(&crate::punctuation::punctuation_model_path(&root), Some(&worker_cancelled)) {
                                 Ok(value) if punctuation_before.as_ref() == Some(&value) => Some(value),
@@ -1211,7 +1251,9 @@ impl AsrSession {
                             notices.push(
                                 if historical.is_some() && !allow_punctuation_model {
                                     "按历史方式仅补句末标点".into()
-                                } else { "标点模型未安装，仅补句末标点；可在设置下载中英标点模型".into() },
+                                } else if punctuation_download.is_some() {
+                                    "标点模型正在后台下载，实时出字继续；就绪后自动添加逗号".into()
+                                } else { "标点模型不可用，仅补句末标点；请在设置中重试下载".into() },
                             );
                         }
                         let status = if source.is_some() {
@@ -1402,6 +1444,27 @@ impl AsrSession {
                             let mut consume = |audio: Option<PcmAudio>,
                                                duration: Option<f64>|
                              -> Result<()> {
+                                if let Some(result) = punctuation_download.as_ref().and_then(|rx| match rx.try_recv() {
+                                    Ok(value) => Some(value),
+                                    Err(crossbeam_channel::TryRecvError::Empty) => None,
+                                    Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!("标点模型准备线程已退出"))),
+                                }) {
+                                    punctuation_download = None;
+                                    match result {
+                                        Ok((model, fingerprint)) => {
+                                            punctuation.install_model(model);
+                                            let start_ms = expected_us.unwrap_or(0).max(0) as u64 / 1000;
+                                            if let Some(run) = &mut transcript.run {
+                                                run.mark_late_punctuation(start_ms, &fingerprint);
+                                            }
+                                            let _ = tx.send(AsrEvent::PunctuationReady { start_ms, fingerprint });
+                                            let _ = tx.send(AsrEvent::Status("标点模型已就绪，后续实时文字将自动添加标点；之前内容可会后重转。".into()));
+                                        }
+                                        Err(error) => {
+                                            let _ = tx.send(AsrEvent::Status(format!("标点模型下载或加载失败，暂只能补句末标点；请检查网络并在设置中重试：{error:#}")));
+                                        }
+                                    }
+                                }
                                 engine.poll_corrections(&mut transcript, &tx);
                                 let Some(audio) = audio else { return Ok(()) };
                                 anyhow::ensure!(audio.sample_rate > 0 && audio.channels > 0

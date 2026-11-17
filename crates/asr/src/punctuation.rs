@@ -8,7 +8,7 @@ use sherpa_onnx::{OfflinePunctuation, OfflinePunctuationConfig};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::{RwLock, atomic::AtomicBool},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -39,6 +39,14 @@ pub fn punctuation_model_path(root: &Path) -> PathBuf {
 pub(crate) fn punctuation_reference_match(fingerprint: &opencap_core::MediaFingerprint) -> bool {
     fingerprint.size_bytes == MODEL.size && fingerprint.sha256 == MODEL.sha256
 }
+pub(crate) fn installed_model_verified(root: &Path, cancelled: &AtomicBool) -> Result<bool> {
+    if !punctuation_ready(root) {
+        return Ok(false);
+    }
+    let fingerprint =
+        opencap_core::fingerprint_media(&punctuation_model_path(root), Some(cancelled))?;
+    Ok(punctuation_reference_match(&fingerprint))
+}
 
 /// Install only an independently verified official model or byte-identical mirror.
 pub fn prepare_punctuation(root: &Path, progress: impl FnMut(u64, Option<u64>)) -> Result<PathBuf> {
@@ -56,7 +64,7 @@ pub fn prepare_punctuation_cancellable(
     {
         let _guard = crate::models::model_install_guard(root)?;
         crate::models::recover_model_install(root, DIR)?;
-        if punctuation_ready(root) {
+        if installed_model_verified(root, cancelled)? {
             return Ok(dest);
         }
     }
@@ -137,7 +145,7 @@ pub fn prepare_punctuation_cancellable(
         let _install_guard = crate::models::model_install_guard(root)?;
         ensure_download_active(cancelled)?;
         crate::models::recover_model_install(root, DIR)?;
-        if punctuation_ready(root) {
+        if installed_model_verified(root, cancelled)? {
             return Ok(dest);
         }
         if crate::models::model_path_exists(&dest)? {
@@ -176,7 +184,7 @@ pub fn prepare_punctuation_cancellable(
 
 /// Use only one model thread and invoke it at a limited rate on the ASR worker.
 pub(crate) struct Punctuator {
-    model: Option<OfflinePunctuation>,
+    model: RwLock<Option<OfflinePunctuation>>,
     enabled: bool,
     language: TranscriptionLanguage,
 }
@@ -191,35 +199,54 @@ impl Punctuator {
         language: TranscriptionLanguage,
         allow_model: bool,
     ) -> Self {
-        let model = if enabled && allow_model && punctuation_ready(root) {
-            let mut config = OfflinePunctuationConfig::default();
-            config.model.ct_transformer = Some(
-                root.join(DIR)
-                    .join(MODEL.name)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            OfflinePunctuation::create(&config)
+        let model = if enabled && allow_model {
+            Self::load_model(root)
         } else {
             None
         };
         Self {
-            model,
+            model: RwLock::new(model),
             enabled,
             language,
         }
     }
     pub fn has_model(&self) -> bool {
-        self.model.is_some()
+        self.model
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
-    fn predicted(&self, text: &str) -> Option<String> {
-        if !self.enabled || text.chars().count() > 200 || text.chars().any(is_punctuation) {
+    pub(crate) fn load_model(root: &Path) -> Option<OfflinePunctuation> {
+        if !punctuation_ready(root) {
             return None;
         }
-        let prediction = self.model.as_ref()?.add_punctuation(text)?;
-        let mut output = merge_punctuation(text, &prediction)?;
-        if self.language == TranscriptionLanguage::English
-            || (!text.chars().any(is_cjk) && text.chars().any(|c| c.is_ascii_alphabetic()))
+        let mut config = OfflinePunctuationConfig::default();
+        config.model.ct_transformer =
+            Some(punctuation_model_path(root).to_string_lossy().into_owned());
+        OfflinePunctuation::create(&config)
+    }
+    pub(crate) fn install_model(&self, model: OfflinePunctuation) {
+        *self.model.write().unwrap_or_else(|e| e.into_inner()) = Some(model);
+    }
+    fn predicted(&self, text: &str) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let guard = self.model.read().unwrap_or_else(|e| e.into_inner());
+        let model = guard.as_ref()?;
+        // The model is bounded to short contexts. Long uninterrupted speech
+        // must still get punctuation instead of silently falling back.
+        let mut output = String::new();
+        let mut start = 0;
+        for (offset, mark) in text.char_indices().filter(|(_, c)| is_punctuation(*c)) {
+            output.push_str(&predict_span(model, &text[start..offset], true)?);
+            output.push(mark);
+            start = offset + mark.len_utf8();
+        }
+        output.push_str(&predict_span(model, &text[start..], false)?);
+        if !text.chars().any(is_punctuation)
+            && (self.language == TranscriptionLanguage::English
+                || (!text.chars().any(is_cjk) && text.chars().any(|c| c.is_ascii_alphabetic())))
         {
             output = output
                 .chars()
@@ -254,6 +281,39 @@ impl Punctuator {
         }
         result
     }
+}
+
+fn predict_span(
+    model: &OfflinePunctuation,
+    text: &str,
+    before_existing_mark: bool,
+) -> Option<String> {
+    if text.trim().is_empty() {
+        return Some(text.to_owned());
+    }
+    let mut output = String::new();
+    let mut start = 0;
+    for (index, (offset, _)) in text.char_indices().enumerate() {
+        if index > 0 && index % 180 == 0 {
+            let input = &text[start..offset];
+            output.push_str(&merge_punctuation(input, &model.add_punctuation(input)?)?);
+            start = offset;
+        }
+    }
+    let input = &text[start..];
+    if !input.trim().is_empty() {
+        let predicted = merge_punctuation(input, &model.add_punctuation(input)?)?;
+        if before_existing_mark {
+            let trimmed = predicted.trim_end_matches(char::is_whitespace);
+            output.push_str(trimmed.trim_end_matches(is_punctuation));
+            output.push_str(&predicted[trimmed.len()..]);
+        } else {
+            output.push_str(&predicted);
+        }
+    } else {
+        output.push_str(input);
+    }
+    Some(output)
 }
 
 fn is_cjk(c: char) -> bool {
@@ -341,6 +401,22 @@ impl PartialPunctuation {
 mod tests {
     use super::*;
     #[test]
+    fn same_size_corrupt_cache_is_not_a_verified_model() {
+        let root = std::env::temp_dir().join(format!(
+            "opencap-punctuation-test-{}-{}",
+            std::process::id(),
+            opencap_core::new_stable_id()
+        ));
+        fs::create_dir_all(root.join(DIR)).unwrap();
+        fs::File::create(punctuation_model_path(&root))
+            .unwrap()
+            .set_len(MODEL.size)
+            .unwrap();
+        assert!(punctuation_ready(&root));
+        assert!(!installed_model_verified(&root, &AtomicBool::new(false)).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn content_check_rejects_changed_or_missing_words() {
         assert_eq!(
             merge_punctuation("大家好  this is OpenCap", "大家好，this is OpenCap。"),
@@ -409,6 +485,34 @@ mod tests {
         assert_eq!(
             merge_punctuation("how are you i am fine thank you", &english),
             Some(english.clone())
+        );
+        let with_existing = p.finish("我们都是木头人不会说话不会动。我们都是木头人不会说话不会动");
+        assert!(with_existing.matches('，').count() >= 2, "{with_existing}");
+        assert!(with_existing.contains('。'), "{with_existing}");
+        let long = "我们都是木头人不会说话不会动".repeat(15);
+        let long_result = p.finish(&long);
+        assert!(long_result.contains('，'), "long input lost punctuation");
+        assert_eq!(
+            long_result
+                .chars()
+                .filter(|c| !is_punctuation(*c))
+                .collect::<String>(),
+            long
+        );
+        // A live session can begin before the network download finishes. The
+        // shared punctuator must pick up the installed model without restarting.
+        let late = std::sync::Arc::new(Punctuator::new(
+            Path::new("/not-installed"),
+            true,
+            TranscriptionLanguage::Chinese,
+        ));
+        let observer = late.clone();
+        assert!(!observer.has_model());
+        late.install_model(Punctuator::load_model(&root).unwrap());
+        assert!(
+            observer
+                .finish("我们都是木头人不会说话不会动")
+                .contains('，')
         );
         eprintln!(
             "chinese={chinese}; english={english}; two calls={:?}",

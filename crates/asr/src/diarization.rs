@@ -80,6 +80,29 @@ pub fn distinguish_speakers_guarded(
     )
 }
 
+fn speaker_source_evidence(
+    run: Option<&crate::TranscriptionRun>,
+) -> Result<(Option<opencap_core::MediaFingerprint>, Option<u64>, bool)> {
+    let recorded = run
+        .and_then(|r| r.extra.get("input_media_fingerprint"))
+        .filter(|v| !v.is_null())
+        .cloned()
+        .map(serde_json::from_value::<opencap_core::MediaFingerprint>)
+        .transpose()
+        .context("识别运行的媒体指纹无效")?;
+    let stream = run
+        .and_then(|r| r.extra.get("input_audio"))
+        .and_then(|audio| audio.get("audio_stream_index"))
+        .filter(|v| !v.is_null())
+        .map(|v| v.as_u64().context("识别运行的音轨编号无效"))
+        .transpose()?;
+    let verified = run
+        .and_then(|r| r.extra.get("input_integrity"))
+        .and_then(|v| v.as_str())
+        == Some("hash_matched_before_and_after");
+    Ok((recorded, stream, verified))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn distinguish_speakers_inner(
     mut transcript: Transcript,
@@ -105,23 +128,8 @@ fn distinguish_speakers_inner(
         .as_ref()
         .context("转录稿没有原媒体路径，请重新导入原录音")?;
     anyhow::ensure!(source.is_file(), "原录音不在原路径，请重新导入音视频");
-    let run = transcript.run.as_ref();
-    let recorded_fingerprint = run
-        .and_then(|run| run.extra.get("input_media_fingerprint"))
-        .cloned()
-        .map(serde_json::from_value::<opencap_core::MediaFingerprint>)
-        .transpose()
-        .context("识别运行的媒体指纹无效")?;
-    let stream_value = run
-        .and_then(|run| run.extra.get("input_audio"))
-        .and_then(|audio| audio.get("audio_stream_index"));
-    let expected_stream = stream_value
-        .map(|value| value.as_u64().context("识别运行的音轨编号无效"))
-        .transpose()?;
-    let historical_verified = run
-        .and_then(|run| run.extra.get("input_integrity"))
-        .and_then(|value| value.as_str())
-        == Some("hash_matched_before_and_after");
+    let (recorded_fingerprint, expected_stream, historical_verified) =
+        speaker_source_evidence(transcript.run.as_ref())?;
     status("正在核对说话人分析输入媒体…".into());
     let before = opencap_core::fingerprint_media(source, Some(cancelled))?;
     if let Some(expected) = &recorded_fingerprint {
@@ -479,6 +487,25 @@ fn preserve_and_map_speakers(transcript: &mut Transcript, new_turns: &mut [Speak
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_null_source_evidence_is_unknown_not_invalid() {
+        let mut run: crate::TranscriptionRun = serde_json::from_value(serde_json::json!({
+            "run_id":"legacy", "started_unix_ms":0, "application_version":"old", "backend":"sherpa",
+            "runtime_version":"old", "model_id":"model", "provider":"cpu", "threads":1,
+            "requested_language":"zh", "requested_hotwords":"", "punctuation_requested":true,
+            "punctuation_effective":"model_native", "revision_scheduled":false,
+            "input_kind":"recording", "state":"completed", "input_media_fingerprint":null,
+            "input_audio":{"audio_stream_index":null}
+        }))
+        .unwrap();
+        let (fingerprint, stream, verified) = speaker_source_evidence(Some(&run)).unwrap();
+        assert!(fingerprint.is_none() && stream.is_none() && !verified);
+        run.extra.insert(
+            "input_audio".into(),
+            serde_json::json!({"audio_stream_index":"bad"}),
+        );
+        assert!(speaker_source_evidence(Some(&run)).is_err());
+    }
     #[test]
     fn turn_change_does_not_attribute_whole_utterance_to_one_person() {
         let t = Transcript {

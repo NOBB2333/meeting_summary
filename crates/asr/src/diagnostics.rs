@@ -136,6 +136,7 @@ fn saved_run_status(run: &crate::TranscriptionRun) -> serde_json::Value {
     let punctuation = match run.punctuation_effective.as_str() {
         "model_native" => "model_native",
         "ct_transformer" => "ct_transformer",
+        "ct_transformer_partial" => "ct_transformer_partial",
         "sentence_end_fallback" => "sentence_end_fallback",
         "disabled" => "disabled",
         _ => "other_or_unknown",

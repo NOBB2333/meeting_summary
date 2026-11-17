@@ -892,6 +892,9 @@ pub fn desktop_controls(record: &str, pause: &str) -> Result<DesktopControls> {
         _sender: sender,
     })
 }
+pub fn desktop_controls_strict(record: &str, pause: &str) -> Result<DesktopControls> {
+    desktop_controls(record, pause)
+}
 pub fn set_app_icon(_: isize, recording: bool) {
     unsafe { oc_app_icon(recording) };
 }

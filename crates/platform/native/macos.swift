@@ -454,10 +454,22 @@ final class DesktopMenu: NSObject {
         }, 1, &type, pointer, &handler)
         guard status == noErr else { throw NativeError("注册快捷键处理器失败") }
         let functionKeys: [UInt32] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90]
+        let characterKeys: [String: UInt32] = [
+            "a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5, "h": 4,
+            "i": 34, "j": 38, "k": 40, "l": 37, "m": 46, "n": 45, "o": 31, "p": 35,
+            "q": 12, "r": 15, "s": 1, "t": 17, "u": 32, "v": 9, "w": 13, "x": 7, "y": 16, "z": 6,
+            "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25
+        ]
         for (name, id) in [("record", UInt32(1)), ("pause", UInt32(2))] {
             let text = a[name] as? String ?? ""
             let parts = text.lowercased().split(separator: "+").map(String.init)
-            guard let fn = parts.last, fn.hasPrefix("f"), let number = Int(fn.dropFirst()), (1...20).contains(number) else { throw NativeError("快捷键需包含 F1–F20") }
+            guard let last = parts.last else { throw NativeError("快捷键缺少按键") }
+            let code: UInt32
+            if last.hasPrefix("f"), let number = Int(last.dropFirst()), (1...20).contains(number) {
+                code = functionKeys[number - 1]
+            } else if let character = characterKeys[last] {
+                code = character
+            } else { throw NativeError("快捷键支持字母、数字或 F1–F20") }
             var modifiers: UInt32 = 0
             for part in parts.dropLast() {
                 switch part {
@@ -469,7 +481,7 @@ final class DesktopMenu: NSObject {
                 }
             }
             var key: EventHotKeyRef?
-            let result = RegisterEventHotKey(functionKeys[number - 1], modifiers, EventHotKeyID(signature: 0x4F434150, id: id), GetApplicationEventTarget(), 0, &key)
+            let result = RegisterEventHotKey(code, modifiers, EventHotKeyID(signature: 0x4F434150, id: id), GetApplicationEventTarget(), 0, &key)
             guard result == noErr, let key = key else { throw NativeError("快捷键 \(text) 被其他应用占用，请切换组合") }
             keys.append(key)
         }

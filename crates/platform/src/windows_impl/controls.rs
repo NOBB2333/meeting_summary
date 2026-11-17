@@ -116,12 +116,18 @@ unsafe fn update_tray_icon(hwnd: HWND, recording: bool) {
     }
 }
 pub fn desktop_controls(record: &str, pause: &str) -> Result<DesktopControls> {
+    create_desktop_controls(record, pause, false)
+}
+pub fn desktop_controls_strict(record: &str, pause: &str) -> Result<DesktopControls> {
+    create_desktop_controls(record, pause, true)
+}
+fn create_desktop_controls(record: &str, pause: &str, strict: bool) -> Result<DesktopControls> {
     let (tx, rx) = bounded(32);
     let (ready_tx, ready_rx) = bounded(1);
     let keys = [parse_hotkey(record)?, parse_hotkey(pause)?];
     anyhow::ensure!(keys[0] != keys[1], "录制与暂停快捷键不能相同");
     let worker = thread::spawn(move || {
-        let result = unsafe { controls_loop(tx, ready_tx.clone(), keys) };
+        let result = unsafe { controls_loop(tx, ready_tx.clone(), keys, strict) };
         if let Err(e) = result {
             let _ = ready_tx.try_send(Err(format!("{e:#}")));
         }
@@ -164,6 +170,7 @@ unsafe fn controls_loop(
     sender: Sender<ShellEvent>,
     ready: Sender<std::result::Result<isize, String>>,
     keys: [(u32, u32); 2],
+    strict: bool,
 ) -> Result<()> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -207,8 +214,16 @@ unsafe fn controls_loop(
         }
         for (i, (mods, key)) in keys.into_iter().enumerate() {
             if RegisterHotKey(Some(hwnd), i as i32 + 1, HOT_KEY_MODIFIERS(mods), key).is_err() {
+                if strict {
+                    for registered in 1..=i as i32 {
+                        let _ = UnregisterHotKey(Some(hwnd), registered);
+                    }
+                    let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+                    let _ = DestroyWindow(hwnd);
+                    anyhow::bail!("快捷键 {} 被其他程序占用，请更换组合", i + 1);
+                }
                 let _ = state.sender.try_send(ShellEvent::Warning(format!(
-                    "快捷键 {} 被其他程序占用，请修改设置",
+                    "快捷键 {} 被其他程序占用，请更换组合",
                     i + 1
                 )));
             }

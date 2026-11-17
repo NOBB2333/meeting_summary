@@ -1876,6 +1876,15 @@ impl Recorder {
                             s
                         };
                 }
+                AsrEvent::PunctuationReady {
+                    start_ms,
+                    fingerprint,
+                } => {
+                    if let Some(run) = &mut self.transcript.run {
+                        run.mark_late_punctuation(start_ms, &fingerprint);
+                    }
+                    self.asr_models = opencap_asr::ModelAvailability::inspect(&model_root());
+                }
                 AsrEvent::RevisionStatus(state, reason) => {
                     if self
                         .transcript
@@ -2546,7 +2555,14 @@ impl Recorder {
                     };
                 }
                 Err(e) => {
-                    self.transcription_status = format!("说话人分析未完成；已有稿件保留：{e:#}")
+                    self.transcription_status = if self.transcript.speaker_count() > 0 {
+                        format!(
+                            "本次重新分析未完成，已有 {} 组结果保留：{e:#}",
+                            self.transcript.speaker_count()
+                        )
+                    } else {
+                        format!("说话人分析未完成；已有稿件保留：{e:#}")
+                    }
                 }
             }
         }
@@ -3068,6 +3084,16 @@ impl Recorder {
                 "实时逐字稿",
                 "滚动查看历史，回到最新后继续跟随",
             ))
+            .when(
+                self.active() && !self.transcription_status.is_empty(),
+                |d| {
+                    d.child(
+                        label(self.transcription_status.clone())
+                            .max_h(px(36.))
+                            .overflow_hidden(),
+                    )
+                },
+            )
             .when(
                 self.active() && self.recording_without_live_due_to_task,
                 |d| d.child(label("本场实时文字暂不可用，录制结束后可补转。")),
@@ -4191,7 +4217,13 @@ impl Recorder {
             .child(ui::section_title("说话人分析", "会后在本机完成，可选步骤"))
             .child(label("首次需下载约 41 MB 模型；下载完成后直接在本机使用。"))
             .child(ui::badge(
-                if speakers == 0 {
+                if self.speaker_task.is_some() {
+                    if speakers == 0 {
+                        "正在分析".into()
+                    } else {
+                        format!("正在重新分析 · 已有 {speakers} 组")
+                    }
+                } else if speakers == 0 {
                     "尚未分析".into()
                 } else {
                     format!("已识别 {speakers} 组")
@@ -4861,10 +4893,10 @@ impl Recorder {
                 .child(button("punctuation-toggle", if self.config.transcription_punctuation { "自动标点：开启" } else { "自动标点：关闭" }, self.config.transcription_punctuation)
                     .disabled(busy)
                     .on_click(cx.listener(|this,_,_,cx| { this.config.transcription_punctuation = !this.config.transcription_punctuation; this.save(); cx.notify(); })))
-                .child(button("download-punctuation", if self.asr_models.punctuation { "中英标点模型 · 已安装" } else { "下载中英标点模型 · 约 65–76 MB" }, false)
-                    .disabled(busy || self.asr_models.punctuation)
+                .child(button("download-punctuation", if self.asr_models.punctuation { "检查 / 修复标点模型" } else { "下载中英标点模型 · 约 65–76 MB" }, false)
+                    .disabled(busy)
                     .on_click(cx.listener(|this,_,_,cx| { this.prepare_punctuation_model(); cx.notify(); }))))
-            .child(label("自动标点在本机运行：流式文字定期补标点，停顿和二遍结果再次处理；未安装模型时只补句末标点。模型可能判断错误，可关闭。"))
+            .child(label("自动标点在本机运行。缺少模型时会后台下载，实时文字继续显示；就绪后自动添加逗号等标点。下载失败可在此重试。"))
             .when(self.preparing_model.is_some() || self.transcription_status.starts_with("下载失败") || self.transcription_status.ends_with("已就绪"), |d| d.child(label(self.transcription_status.clone())))
             .when(self.preparing_model.is_some(), |d| {
                 let estimate = self.transcription_clock.remaining().map_or_else(

@@ -102,6 +102,7 @@ impl Recorder {
                         .enumerate()
                         .map(|(i, text)| {
                             button(("mode", i), text, self.mode == i)
+                                .flex_1()
                                 .ghost()
                                 .when(self.mode == i, |b| b.bg(rgb(SOFT)).text_color(rgb(ACCENT)))
                                 .disabled(self.active())
@@ -373,7 +374,9 @@ impl Recorder {
                         .hover(|s| s.bg(rgb(SOFT)))
                         .child(
                             div()
-                                .h(px(92.))
+                                .h(px(
+                                    ((width / columns as f32 - 28.) * 9. / 16.).clamp(140., 260.)
+                                ))
                                 .w_full()
                                 .overflow_hidden()
                                 .bg(rgb(0x090a0c))
@@ -450,7 +453,7 @@ impl Recorder {
             )
             .child(
                 div()
-                    .h(px(205.))
+                    .h(px(280.))
                     .flex_shrink_0()
                     .child(widgets::contained_scrollable(
                         "target-list",

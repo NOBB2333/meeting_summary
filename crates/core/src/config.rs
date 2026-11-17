@@ -148,6 +148,8 @@ pub struct RecordingConfig {
     pub separate_audio: bool,
     /// Apply the built-in voice chain (high-pass, noise gate, compressor) to the microphone.
     pub mic_denoise: bool,
+    /// Amplification of captured system audio before mixing; 1.0 preserves the source level.
+    pub system_audio_gain: f32,
     /// Meter the selected devices while nothing is being recorded.
     pub monitor_levels: bool,
     pub realtime_transcription: bool,
@@ -225,6 +227,7 @@ impl Default for RecordingConfig {
             reserve_audio_track: false,
             separate_audio: true,
             mic_denoise: true,
+            system_audio_gain: 1.0,
             monitor_levels: false,
             realtime_transcription: true,
             transcription_hotwords: "录屏,语音转录,会议纪要,实时字幕".into(),
@@ -327,6 +330,10 @@ impl RecordingConfig {
         }
     }
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.system_audio_gain.is_finite() && (1.0..=3.0).contains(&self.system_audio_gain),
+            "系统声音增益应为 100%–300%"
+        );
         anyhow::ensure!(
             (1..=60).contains(&self.max_fps),
             "FPS must be between 1 and 60"

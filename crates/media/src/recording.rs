@@ -21,6 +21,7 @@ pub enum RecordingCommand {
     Stop,
     SetAudio(AudioRouting),
     SetMicDenoise(bool),
+    SetSystemGain(f32),
     SetLevelMeter(bool),
 }
 pub struct RecordingSession {
@@ -267,6 +268,15 @@ struct MicChain {
     last_end_us: Option<i64>,
     last_generation: u64,
 }
+
+fn condition_audio(mic: &mut MicChain, chunk: &mut AudioChunk, system_gain: f32) {
+    mic.apply(chunk);
+    if chunk.kind == AudioKind::System && system_gain > 1.0 {
+        for sample in &mut chunk.samples {
+            *sample = crate::mixer::soft_limit(*sample * system_gain);
+        }
+    }
+}
 impl MicChain {
     fn new(config: &RecordingConfig) -> Self {
         Self {
@@ -386,6 +396,7 @@ fn run(
     let mut audio = opencap_platform::start_audio(&config, clock.clone(), audio_tx, warn_tx);
     let mut routing = config.audio_routing();
     let mut mic = MicChain::new(&config);
+    let mut system_gain = config.system_audio_gain;
     let mut audio_changes = Vec::new();
     let mut boundary_discarded_audio_chunks = 0u64;
     let mut boundary_discarded_audio_frames = 0u64;
@@ -472,7 +483,7 @@ fn run(
                                 .saturating_add((chunk.samples.len() / 2) as u64);
                             continue;
                         }
-                        mic.apply(&mut chunk);
+                        condition_audio(&mut mic, &mut chunk, system_gain);
                         rebase_audio(&mut chunk, video_epoch);
                         writer.audio(chunk);
                     }
@@ -545,6 +556,11 @@ fn run(
                     mic.enabled = enabled;
                     mic.reset();
                 }
+                RecordingCommand::SetSystemGain(gain) => {
+                    if gain.is_finite() && (1.0..=3.0).contains(&gain) {
+                        system_gain = gain;
+                    }
+                }
                 RecordingCommand::SetAudio(next) => {
                     if writer.audio_cursor_us().is_none() {
                         stats
@@ -568,7 +584,7 @@ fn run(
                             && chunk.generation == clock.snapshot().2
                             && !clock.is_paused()
                         {
-                            mic.apply(&mut chunk);
+                            condition_audio(&mut mic, &mut chunk, system_gain);
                             rebase_audio(&mut chunk, video_epoch);
                             writer.audio(chunk);
                         }
@@ -662,7 +678,7 @@ fn run(
             if level_meter_enabled {
                 inputs[index].update(&chunk.samples, Instant::now());
             }
-            mic.apply(&mut chunk);
+            condition_audio(&mut mic, &mut chunk, system_gain);
             if level_meter_enabled {
                 meters[index].update(&chunk.samples, Instant::now());
             }
@@ -922,7 +938,7 @@ fn run(
                 boundary_discarded_audio_frames.saturating_add((chunk.samples.len() / 2) as u64);
             continue;
         }
-        mic.apply(&mut chunk);
+        condition_audio(&mut mic, &mut chunk, system_gain);
         rebase_audio(&mut chunk, video_epoch);
         writer.audio(chunk);
     }
@@ -1069,6 +1085,31 @@ fn container_av_offset(path: &Path) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn system_gain_changes_only_system_route_and_limits_peaks() {
+        let config = RecordingConfig {
+            mic_denoise: false,
+            ..RecordingConfig::default()
+        };
+        let mut mic = MicChain::new(&config);
+        let mut system = AudioChunk {
+            kind: AudioKind::System,
+            pts_us: 0,
+            generation: 0,
+            samples: vec![0.1, 0.1, 0.8, 0.8],
+        };
+        condition_audio(&mut mic, &mut system, 2.0);
+        assert!((system.samples[0] - 0.2).abs() < 1e-6);
+        assert!(system.samples[2] < 1.0 && system.samples[2] > 0.8);
+        let mut microphone = AudioChunk {
+            kind: AudioKind::Microphone,
+            pts_us: 0,
+            generation: 0,
+            samples: vec![0.1, 0.1],
+        };
+        condition_audio(&mut mic, &mut microphone, 2.0);
+        assert_eq!(microphone.samples, vec![0.1, 0.1]);
+    }
 
     #[test]
     fn work_wait_wakes_for_control_without_consuming_it() {

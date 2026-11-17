@@ -63,6 +63,8 @@ struct Recorder {
     session: Option<RecordingSession>,
     stats: RecordingStats,
     controls: Option<DesktopControls>,
+    hotkey_focus: FocusHandle,
+    hotkey_capture: Option<settings::HotkeyCapture>,
     hwnd: isize,
     window_icon_recording: bool,
     floating: Option<WindowHandle<gpui::base::Root>>,
@@ -349,6 +351,11 @@ impl Recorder {
         if matches!(config.target, CaptureTarget::Window(_)) {
             config.target = CaptureTarget::Window(0);
         }
+        // A region from a previous session should not unexpectedly bring up a
+        // selection window when the global record shortcut is pressed.
+        if let CaptureTarget::Region { monitor, .. } = config.target {
+            config.target = CaptureTarget::Monitor(monitor);
+        }
         #[cfg(feature = "ui-smoke")]
         if let Some(path) = smoke::isolated_dir() {
             config = RecordingConfig {
@@ -443,6 +450,14 @@ impl Recorder {
             }
         };
         let ai = ai::AiWorkspace::new(window, cx);
+        let hotkey_focus = cx.focus_handle();
+        cx.on_blur(&hotkey_focus, window, |this, _, cx| {
+            if this.hotkey_capture.take().is_some() {
+                this.restore_hotkeys();
+                cx.notify();
+            }
+        })
+        .detach();
         let hotwords_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("中文术语，用逗号分隔")
@@ -471,6 +486,8 @@ impl Recorder {
             session: None,
             stats: RecordingStats::default(),
             controls,
+            hotkey_focus,
+            hotkey_capture: None,
             hwnd,
             window_icon_recording: false,
             floating: None,

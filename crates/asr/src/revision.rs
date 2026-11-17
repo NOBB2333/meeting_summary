@@ -14,6 +14,7 @@ use std::{
 };
 
 pub(crate) const MAX_REVISION_SAMPLES: usize = 30 * 16000;
+const REVISION_QUEUE_CAPACITY: usize = 8;
 
 struct Job {
     segment: Segment,
@@ -185,9 +186,10 @@ impl Reviser {
         F: FnOnce() -> D + Send + 'static,
         D: FnMut(&[f32]) -> Option<RevisionDecode>,
     {
-        // At most one active decode and two waiting sentences. If slower than
-        // speech, retain native streaming text instead of blocking or growing RAM.
-        let (requests, rx) = bounded::<Job>(2);
+        // Model initialization may take several seconds. Keep a small bounded
+        // burst of completed sentences (at most ~15 MiB PCM) without delaying
+        // live text; sustained overload still retains the original transcript.
+        let (requests, rx) = bounded::<Job>(REVISION_QUEUE_CAPACITY);
         let (tx, results) = unbounded();
         let stopped = cancelled.clone();
         thread::Builder::new()
@@ -507,20 +509,20 @@ mod tests {
         assert!(reviser.submit(&first, vec![0.0; 16000]));
         transcript.apply(first);
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
-        for id in 1..=2 {
+        for id in 1..=REVISION_QUEUE_CAPACITY as u64 {
             let segment = sentence(id);
             assert!(reviser.submit(&segment, vec![0.0; 16000]));
             transcript.apply(segment);
         }
-        let mut next = sentence(3);
+        let mut next = sentence(REVISION_QUEUE_CAPACITY as u64 + 1);
         assert!(!reviser.submit(&next, vec![0.0; 16000]));
         next.finalized = true;
         next.correcting = false;
         assert!(transcript.apply(next));
         assert!(!reviser.poll(&mut transcript, &events));
-        assert_eq!(transcript.segments.len(), 4);
+        assert_eq!(transcript.segments.len(), REVISION_QUEUE_CAPACITY + 2);
         // The next sentence is already visible while the first decode is held.
-        for _ in 0..3 {
+        for _ in 0..=REVISION_QUEUE_CAPACITY {
             release.send(()).unwrap();
         }
         reviser.finish(&mut transcript, &events);
@@ -531,8 +533,11 @@ mod tests {
                 .all(|s| s.finalized && !s.correcting)
         );
         assert_eq!(transcript.segments[0].text, "公司的录屏");
-        assert_eq!(transcript.segments[3].text, "公司的陆平");
-        assert_eq!(rx.try_iter().count(), 3);
+        assert_eq!(
+            transcript.segments[REVISION_QUEUE_CAPACITY + 1].text,
+            "公司的陆平"
+        );
+        assert_eq!(rx.try_iter().count(), REVISION_QUEUE_CAPACITY + 1);
     }
 
     #[test]

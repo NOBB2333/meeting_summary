@@ -153,6 +153,27 @@ pub struct TranscriptionRun {
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+impl TranscriptionRun {
+    /// Record that early text used the fallback before the model became ready.
+    pub fn mark_late_punctuation(
+        &mut self,
+        start_ms: u64,
+        fingerprint: &opencap_core::MediaFingerprint,
+    ) {
+        self.punctuation_effective = "ct_transformer_partial".into();
+        self.extra
+            .insert("punctuation_started_ms".into(), start_ms.into());
+        self.extra.insert(
+            "punctuation_fingerprint_verification".into(),
+            "before_after_load_matched".into(),
+        );
+        self.extra.insert(
+            "punctuation_fingerprint".into(),
+            serde_json::json!(fingerprint),
+        );
+    }
+}
+
 /// An exact mapping of backend token *starts* to UTF-8 byte ranges. This is
 /// not forced alignment and says nothing about when the token stops sounding.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -174,6 +174,9 @@ pub fn desktop_controls(record: &str, pause: &str) -> Result<DesktopControls> {
         worker: Some(worker),
     })
 }
+pub fn desktop_controls_strict(record: &str, pause: &str) -> Result<DesktopControls> {
+    desktop_controls(record, pause)
+}
 pub fn set_app_icon(id: isize, recording: bool) {
     let result = (|| -> Result<()> {
         let (c, _) = connect()?;

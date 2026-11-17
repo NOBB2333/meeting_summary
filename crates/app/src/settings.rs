@@ -8,7 +8,105 @@ pub(super) enum SettingsPage {
     Recording,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum HotkeyCapture {
+    Record,
+    Pause,
+}
+
+fn shortcut_from_key(key: &Keystroke) -> Option<String> {
+    let m = key.modifiers;
+    if m.function || !(m.control || m.alt || m.shift || m.platform) {
+        return None;
+    }
+    let value = key.key.to_ascii_lowercase();
+    let supported = value.len() == 1 && value.as_bytes()[0].is_ascii_alphanumeric()
+        || value
+            .strip_prefix('f')
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_some_and(|n| (1..=12).contains(&n));
+    if !supported {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if m.control {
+        parts.push("Ctrl".to_string());
+    }
+    if m.alt {
+        parts.push("Alt".to_string());
+    }
+    if m.shift {
+        parts.push("Shift".to_string());
+    }
+    if m.platform {
+        parts.push(
+            if cfg!(target_os = "macos") {
+                "Cmd"
+            } else {
+                "Win"
+            }
+            .to_string(),
+        );
+    }
+    parts.push(value.to_ascii_uppercase());
+    Some(parts.join("+"))
+}
+
 impl Recorder {
+    pub(super) fn restore_hotkeys(&mut self) {
+        match opencap_platform::desktop_controls(
+            &self.config.hotkey_record,
+            &self.config.hotkey_pause,
+        ) {
+            Ok(controls) => self.controls = Some(controls),
+            Err(error) => self.message = format!("无法恢复快捷键：{error:#}"),
+        }
+    }
+    fn capture_hotkey(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(which) = self.hotkey_capture else {
+            return;
+        };
+        if event.is_held {
+            return;
+        }
+        cx.stop_propagation();
+        if event.keystroke.key == "escape" {
+            self.hotkey_capture = None;
+            self.restore_hotkeys();
+            self.message = "已取消修改快捷键".into();
+            cx.notify();
+            return;
+        }
+        let Some(shortcut) = shortcut_from_key(&event.keystroke) else {
+            self.message = "请按修饰键加字母、数字或 F1–F12；Esc 取消。".into();
+            cx.notify();
+            return;
+        };
+        let (record, pause) = match which {
+            HotkeyCapture::Record => (shortcut.clone(), self.config.hotkey_pause.clone()),
+            HotkeyCapture::Pause => (self.config.hotkey_record.clone(), shortcut.clone()),
+        };
+        if record == pause {
+            self.message = "录制和暂停快捷键不能相同，请重新按键。".into();
+            cx.notify();
+            return;
+        }
+        self.hotkey_capture = None;
+        match opencap_platform::desktop_controls_strict(&record, &pause) {
+            Ok(controls) => {
+                self.controls = Some(controls);
+                self.config.hotkey_record = record;
+                self.config.hotkey_pause = pause;
+                self.message = format!("快捷键已设置为 {shortcut}");
+                self.save();
+            }
+            Err(error) => {
+                self.restore_hotkeys();
+                self.message = format!("快捷键未设置，已保留原组合：{error:#}");
+            }
+        }
+        cx.notify();
+    }
     pub(super) fn settings_view(&self, _width: f32, cx: &Context<Self>) -> Div {
         let pages = [
             (SettingsPage::Ai, "AI 服务", "协议、地址、模型和密钥"),
@@ -216,7 +314,7 @@ impl Recorder {
     }
     fn audio_settings(&self, cx: &Context<Self>) -> Div {
         ui::card().child(ui::section_title("声音", "输入处理与音频规格"))
-            .child(ui::setting_row("麦克风降噪", "减少持续底噪，让发言更清晰", button(
+            .child(ui::setting_row("麦克风降噪与人声增强", "处理麦克风底噪并自动调整人声；不处理系统声音", button(
                     "mic-denoise",
                     if self.config.mic_denoise {
                         "开启"
@@ -236,6 +334,19 @@ impl Recorder {
                     this.save();
                     cx.notify();
                 })),))
+            .child(ui::setting_row("系统声音增益", "对方声音偏小时调高；请配合电平检测，过高可能失真", button(
+                    "system-audio-gain", format!("{:.0}%", self.config.system_audio_gain * 100.), false)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.config.system_audio_gain = if this.config.system_audio_gain < 1.25 { 1.5 }
+                        else if this.config.system_audio_gain < 1.75 { 2.0 }
+                        else if this.config.system_audio_gain < 2.5 { 3.0 } else { 1.0 };
+                    if let Some(session) = &this.session {
+                        session.command(RecordingCommand::SetSystemGain(this.config.system_audio_gain));
+                    }
+                    this.save();
+                    cx.notify();
+                })),))
+            .child(label("回声消除由会议软件或音频设备处理；建议使用耳机，并确认会议软件的输出设备与系统声音来源一致。"))
             .child(ui::setting_row("实时电平检测", "录制前或录制中检查系统声音与麦克风", button(
                     "monitor-levels",
                     if self.config.monitor_levels {
@@ -541,24 +652,37 @@ impl Recorder {
                 "降低最大 FPS 会减少实际采集次数，适合性能较低的电脑；自适应帧率主要减少编码次数。",
             ))
     }
-    fn storage_settings(&self, cx: &Context<Self>) -> Div {
+    fn storage_settings(&self, cx: &Context<Self>) -> impl IntoElement {
         ui::card()
+            .id("storage-shortcut-settings")
+            .track_focus(&self.hotkey_focus)
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, _, cx| this.capture_hotkey(event, cx)),
+            )
             .child(ui::section_title("保存与快捷键", "输出文件与操作入口"))
             .child(
-                label(self.config.output_dir.to_string_lossy().into_owned())
-                    .min_w(px(0.))
-                    .truncate(),
-            )
-            .child(
-                button("save-folder", "更改保存根目录", false)
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_folder(cx))),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .w_full()
+                    .child(
+                        label(self.config.output_dir.to_string_lossy().into_owned())
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate(),
+                    )
+                    .child(
+                        button("save-folder", "更改目录", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_folder(cx))),
+                    ),
             )
             .child(label(
                 "每场新会议单独建一个文件夹，集中保存录音、逐字稿、纪要和笔记。",
             ))
             .child(ui::setting_row(
                 "保存独立音频",
-                "同时保存同名 M4A 文件，下次录制生效",
+                "视频录制结束后额外保存同名 M4A；仅录音本身即为 M4A",
                 button(
                     "separate-audio",
                     if self.config.separate_audio {
@@ -578,34 +702,69 @@ impl Recorder {
                 })),
             ))
             .child(label(
-                "独立音频与视频同名，停止后保存；开关在下次录制生效。",
+                "字幕：录制中可查看实时文字；转录完成后自动保存同名 SRT 字幕，可在逐字稿中打开。",
             ))
-            .child(
-                button("hotkeys", "切换快捷键组合", false)
-                    .disabled(self.active())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if !this.active() {
-                            let alt = this.config.hotkey_record == "Ctrl+Alt+F9";
-                            this.config.hotkey_record =
-                                if alt { "Ctrl+Shift+F9" } else { "Ctrl+Alt+F9" }.into();
-                            this.config.hotkey_pause = if alt {
-                                "Ctrl+Shift+F10"
+            .children(
+                [
+                    (
+                        HotkeyCapture::Record,
+                        "开始 / 停止录制",
+                        self.config.hotkey_record.clone(),
+                    ),
+                    (
+                        HotkeyCapture::Pause,
+                        "暂停 / 继续",
+                        self.config.hotkey_pause.clone(),
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (which, title, shortcut))| {
+                    let waiting = self.hotkey_capture == Some(which);
+                    ui::setting_row(
+                        title,
+                        "点击后按下新的组合键，Esc 取消",
+                        button(
+                            ("hotkey-edit", index),
+                            if waiting {
+                                "请按组合键…".to_string()
                             } else {
-                                "Ctrl+Alt+F10"
-                            }
-                            .into();
-                            this.controls = None;
-                            match opencap_platform::desktop_controls(
-                                &this.config.hotkey_record,
-                                &this.config.hotkey_pause,
-                            ) {
-                                Ok(c) => this.controls = Some(c),
-                                Err(e) => this.message = e.to_string(),
-                            };
-                            this.save();
-                        }
-                        cx.notify();
-                    })),
+                                shortcut
+                            },
+                            waiting,
+                        )
+                        .disabled(self.active())
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                if !this.active() {
+                                    this.controls = None;
+                                    this.hotkey_capture = Some(which);
+                                    this.hotkey_focus.focus(window, cx);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    )
+                }),
             )
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::shortcut_from_key;
+    use gpui::Keystroke;
+    #[test]
+    fn shortcut_capture_requires_a_modifier_and_supports_common_keys() {
+        assert_eq!(
+            shortcut_from_key(&Keystroke::parse("ctrl-alt-f9").unwrap()).as_deref(),
+            Some("Ctrl+Alt+F9")
+        );
+        assert_eq!(
+            shortcut_from_key(&Keystroke::parse("ctrl-shift-r").unwrap()).as_deref(),
+            Some("Ctrl+Shift+R")
+        );
+        assert!(shortcut_from_key(&Keystroke::parse("a").unwrap()).is_none());
+        assert!(shortcut_from_key(&Keystroke::parse("ctrl-f13").unwrap()).is_none());
     }
 }
