@@ -346,7 +346,7 @@ impl Recorder {
                     this.save();
                     cx.notify();
                 })),))
-            .child(label("回声消除由会议软件或音频设备处理；建议使用耳机，并确认会议软件的输出设备与系统声音来源一致。"))
+            .child(label("录制音轨暂不提供回声消除；会议软件的处理未必作用于本应用采集的麦克风。建议使用耳机，并确认系统声音来源与会议输出设备一致。"))
             .child(ui::setting_row("实时电平检测", "录制前或录制中检查系统声音与麦克风", button(
                     "monitor-levels",
                     if self.config.monitor_levels {
